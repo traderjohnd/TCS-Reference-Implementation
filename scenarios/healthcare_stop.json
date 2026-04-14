@@ -1,0 +1,27 @@
+{
+  "subject_id": "cds-warfarin-001",
+  "subject_type": "recommendation",
+  "policy_profile": "clinical-cds-samed-v2",
+  "dimension_scores": {
+    "B": 0.92,
+    "A": 0.88,
+    "C": 0.31,
+    "K": 0.84
+  },
+  "sub_factor_scores": {
+    "C": {"C1": 0.90, "C2": 0.85, "C3": 0.00, "C4": 0.88, "C5": 0.00}
+  },
+  "context_metadata": {
+    "n_gaps": 0,
+    "context_age_hours": 0.1,
+    "novelty_score": 0.05,
+    "days_since_review": 2,
+    "is_policy_sensitive": false,
+    "blocking_context": "warfarin_clarithromycin_GI_bleed"
+  },
+  "elapsed_hours": 0.0,
+  "is_valid": 1,
+  "invalidation_event": null,
+  "evaluation_time": "2026-04-07T15:00:00Z",
+  "evaluation_note": "Warfarin + clarithromycin + active GI bleed history"
+}

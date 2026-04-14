@@ -1,0 +1,36 @@
+# Claude Code internal files
+.claude/
+CLAUDE.md
+
+# Internal planning and spec documents
+PHASE_2_PLAN.md
+TCS_Claude_Code_Context_Package/
+TCS_Adaptive_Governance_Position_Paper.docx
+TCS_Modular_Governance_Architecture_v3.docx
+TCS_Phase3_Build_Specification.docx
+
+# Databases
+data/tcs.db
+data/tcs.db-shm
+data/tcs.db-wal
+demo.sqlite
+*.db
+*.db-shm
+*.db-wal
+
+# Standalone dashboard (replaced by frontend/)
+dashboard/index.html
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Environment
+.env
+.venv/
+venv/
+
+# OS files
+.DS_Store

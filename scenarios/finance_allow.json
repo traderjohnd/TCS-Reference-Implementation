@@ -1,0 +1,23 @@
+{
+  "subject_id": "recommendation-7781",
+  "subject_type": "recommendation",
+  "policy_profile": "fin-high-risk-suitability-v3",
+  "dimension_scores": {
+    "B": 0.94,
+    "A": 0.90,
+    "C": 0.92,
+    "K": 0.83
+  },
+  "context_metadata": {
+    "n_gaps": 0,
+    "context_age_hours": 0.5,
+    "novelty_score": 0.10,
+    "days_since_review": 1,
+    "is_policy_sensitive": true
+  },
+  "elapsed_hours": 0.0,
+  "is_valid": 1,
+  "invalidation_event": null,
+  "evaluation_time": "2026-04-07T15:00:00Z",
+  "evaluation_note": "Clean suitability recommendation with policy-sensitive position"
+}

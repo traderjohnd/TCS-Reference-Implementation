@@ -1,0 +1,23 @@
+{
+  "subject_id": "recommendation-7783",
+  "subject_type": "recommendation",
+  "policy_profile": "fin-high-risk-suitability-v3",
+  "dimension_scores": {
+    "B": 0.95,
+    "A": 0.95,
+    "C": 0.95,
+    "K": 0.95
+  },
+  "context_metadata": {
+    "n_gaps": 0,
+    "context_age_hours": 0.1,
+    "novelty_score": 0.0,
+    "days_since_review": 1,
+    "is_policy_sensitive": false
+  },
+  "elapsed_hours": 2.0,
+  "is_valid": 0,
+  "invalidation_event": "model_version_change",
+  "evaluation_time": "2026-04-07T15:00:00Z",
+  "evaluation_note": "Advisory model retrained since this TC was issued"
+}

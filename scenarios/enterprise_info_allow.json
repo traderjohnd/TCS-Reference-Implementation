@@ -1,0 +1,23 @@
+{
+  "subject_id": "summary-draft-001",
+  "subject_type": "model_output",
+  "policy_profile": "enterprise-info-standard-v1",
+  "dimension_scores": {
+    "B": 0.88,
+    "A": 0.82,
+    "C": 0.85,
+    "K": 0.45
+  },
+  "context_metadata": {
+    "n_gaps": 0,
+    "context_age_hours": 0.5,
+    "novelty_score": 0.10,
+    "days_since_review": 5,
+    "is_policy_sensitive": false
+  },
+  "elapsed_hours": 0.0,
+  "is_valid": 1,
+  "invalidation_event": null,
+  "evaluation_time": "2026-04-07T15:00:00Z",
+  "evaluation_note": "Internal summarization with low U (not gated at r1/a1)"
+}

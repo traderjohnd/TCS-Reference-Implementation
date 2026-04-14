@@ -1,0 +1,44 @@
+{
+  "description": "Two consecutive Trust Certificates demonstrating hash chain integrity. Each tc_hash is the SHA-256 of the TC content excluding the audit_integrity layer. The second TC links to the first via previous_tc_hash.",
+  "chain_id": "chain-whitepaper-verification",
+  "verification_method": "SHA-256 of JSON-serialized TC content (sort_keys=True, compact separators) excluding audit_integrity layer",
+  "certificates": [
+    {
+      "certificate_id": "0630cf49-8f9e-4b7a-83e7-9e2e319ec060",
+      "subject_id": "chain-verify-001",
+      "risk_tier": "r3",
+      "action_class": "a4",
+      "tis_raw": 0.9075,
+      "tis_adj": 0.8806,
+      "tis_current": 0.8806,
+      "decision": "Allow",
+      "lifecycle_state": "admissible",
+      "tc_hash": "4ddf09921791efb0e3ffb09bbed024de7d8483294953f7b5c076798728aece9e",
+      "previous_tc_hash": null,
+      "chain_sequence": 1,
+      "hash_algorithm": "sha256",
+      "integrity_verified": true
+    },
+    {
+      "certificate_id": "c277091e-bdd7-4740-8246-88e5137c61c0",
+      "subject_id": "chain-verify-002",
+      "risk_tier": "r3",
+      "action_class": "a4",
+      "tis_raw": 0.88,
+      "tis_adj": 0.8705,
+      "tis_current": 0.0,
+      "decision": "Hold",
+      "lifecycle_state": "computed",
+      "tc_hash": "a4f49f181b716ac3f67413ef6fecfee5a5ed799ee8aa7eb91a9e4a920ce9d0de",
+      "previous_tc_hash": "4ddf09921791efb0e3ffb09bbed024de7d8483294953f7b5c076798728aece9e",
+      "chain_sequence": 2,
+      "hash_algorithm": "sha256",
+      "integrity_verified": true
+    }
+  ],
+  "chain_verification_result": {
+    "chain_intact": true,
+    "tc2_previous_hash_matches_tc1_hash": true,
+    "sequence_continuous": true
+  }
+}

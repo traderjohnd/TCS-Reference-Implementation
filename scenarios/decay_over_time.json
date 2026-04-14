@@ -1,0 +1,23 @@
+{
+  "subject_id": "recommendation-7784",
+  "subject_type": "recommendation",
+  "policy_profile": "fin-high-risk-suitability-v3",
+  "dimension_scores": {
+    "B": 0.95,
+    "A": 0.92,
+    "C": 0.94,
+    "K": 0.88
+  },
+  "context_metadata": {
+    "n_gaps": 0,
+    "context_age_hours": 0.1,
+    "novelty_score": 0.05,
+    "days_since_review": 1,
+    "is_policy_sensitive": false
+  },
+  "elapsed_hours_variants": [0.0, 5.0, 13.86, 20.0],
+  "is_valid": 1,
+  "invalidation_event": null,
+  "evaluation_time": "2026-04-07T15:00:00Z",
+  "evaluation_note": "Same subject evaluated at 4 elapsed times to show decay progression"
+}
