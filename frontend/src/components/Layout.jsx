@@ -6,6 +6,7 @@ const NAV_ITEMS = [
   { path: '/connections', label: 'Connections', view: 'connections' },
   { path: '/policy', label: 'Policy Controls', view: 'policy' },
   { path: '/chat', label: 'Governed Chat', view: 'chat' },
+  { path: '/replay', label: 'Artifacts & Replay', view: 'replay' },
   { path: '/overview', label: 'Trust Overview', view: 'overview' },
   { path: '/decisions', label: 'Live Decisions', view: 'decisions' },
   { path: '/drift', label: 'Drift Monitoring', view: 'drift' },

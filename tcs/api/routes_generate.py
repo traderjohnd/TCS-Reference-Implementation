@@ -294,6 +294,57 @@ def post_generate(body: GenerateRequest, request: Request) -> GenerateResponse:
     )
 
 
+@router.get("/artifacts")
+def list_artifacts(
+    request: Request,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """
+    List recent artifacts (most recent first).
+
+    Returns slim summaries so the UI artifact picker stays fast
+    even with large stores. Each entry carries enough metadata
+    to render a row (generation_mode + prompt/draft preview +
+    timestamp) and the artifact_id for drill-down.
+
+    Phase 5 Slice 5.6 addition — the frontend Governance Replay
+    view uses this to populate its artifact picker.
+    """
+    store = _artifact_store(request)
+    if limit <= 0 or limit > 500:
+        limit = 50
+    artifacts = store.list_artifacts(limit=limit)
+
+    def _iso(dt) -> str:
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _preview(a) -> str:
+        # For LLM modes the prompt is the meaningful preview text.
+        # For human_composed the draft (raw_output) is the message
+        # being sent — that's what reviewers need to see.
+        if a.generation_mode == "human_composed":
+            return (a.raw_output or "")[:160]
+        return (a.prompt or a.raw_output or "")[:160]
+
+    return {
+        "count": len(artifacts),
+        "artifacts": [
+            {
+                "artifact_id": a.artifact_id,
+                "created_at": _iso(a.created_at),
+                "generation_mode": a.generation_mode,
+                "provider": a.provider,
+                "model": a.model,
+                "preview": _preview(a),
+                "has_workflow_trace": a.workflow_trace is not None,
+                "has_retrieved_sources": bool(a.retrieved_sources),
+                "generation_error": a.generation_error,
+            }
+            for a in artifacts
+        ],
+    }
+
+
 @router.get("/artifacts/{artifact_id}")
 def get_artifact(artifact_id: str, request: Request) -> Dict[str, Any]:
     """
