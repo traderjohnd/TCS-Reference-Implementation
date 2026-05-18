@@ -48,6 +48,7 @@ from tcs.api.routes_standards import router as standards_router
 from tcs.api.routes_admin import router as admin_router
 from tcs.api.routes_auth import router as auth_router
 from tcs.api.routes_query import router as query_router
+from tcs.api.routes_generate import router as generate_router
 from tcs.api.routes_connections import router as connections_router
 from tcs.api.routes_archive import router as archive_router
 
@@ -136,6 +137,14 @@ def create_app(
     app.state.owns_store = owns_store
     app.state.rbac_enabled = False  # off by default for backward compat
 
+    # Phase 5: ArtifactStore for /v2/generate and /v2/artifacts/*.
+    # Shares the same SQLite connection as the CertificateStore so
+    # response_artifacts and governance_evaluations live in the same
+    # db file as trust_certificates. The schema is additive — see
+    # tcs/persistence/db.py.
+    from tcs.artifacts.store import ArtifactStore
+    app.state.artifact_store = ArtifactStore(conn=store._conn)
+
     # Allow the dashboard to call the API from the browser
     app.add_middleware(
         CORSMiddleware,
@@ -195,6 +204,7 @@ def create_app(
     app.include_router(admin_router, prefix="/v2", tags=["admin"])
     app.include_router(auth_router, prefix="/v2", tags=["auth"])
     app.include_router(query_router, prefix="/v2", tags=["query"])
+    app.include_router(generate_router, prefix="/v2", tags=["generation"])
     app.include_router(connections_router, prefix="/v2", tags=["connections"])
     app.include_router(archive_router, prefix="/v2", tags=["archives"])
 
