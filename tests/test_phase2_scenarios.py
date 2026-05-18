@@ -96,6 +96,11 @@ class TestScenario09AttributionGate:
     """
 
     def test_hold_decision(self, interceptor, store):
+        # Under paper-aligned ladder, kappa is a remediability floor:
+        # a gate-fail Hold requires S_base >= kappa=0.90. The default
+        # scoring here produces S_base ~0.899 (just under), which would
+        # Stop. Pin B/C slightly higher so a real HOLD is exercised
+        # while still failing the A gate (n_gaps=2 -> A=0.86 < 0.93).
         out = RAGOutput(
             query="Give a suitability recommendation",
             retrieved_chunks=[
@@ -109,6 +114,7 @@ class TestScenario09AttributionGate:
             ],
             candidate_answer="Recommend X.",
             subject_id="s9-attribution-gate",
+            extra_metadata={"B_score": 1.00, "C_score": 1.00},
         )
         req = _ct4_adapter().adapt(out)
         # n_gaps = 2 flows through from the adapter
@@ -142,6 +148,12 @@ class TestScenario10LowSimilarity:
     """
 
     def test_hold_decision(self, interceptor, store):
+        # Under paper-aligned ladder, kappa is a remediability floor:
+        # a gate-fail Hold requires S_base >= kappa=0.90. Default
+        # scoring here drops K via the low-similarity penalty but
+        # leaves S_base just below 0.90 -> would Stop. Pin B/C
+        # slightly higher so a real HOLD is exercised while K still
+        # fails its gate.
         out = RAGOutput(
             query="Recommend something",
             retrieved_chunks=[
@@ -154,6 +166,7 @@ class TestScenario10LowSimilarity:
             ],
             candidate_answer="Recommend Y.",
             subject_id="s10-low-sim",
+            extra_metadata={"B_score": 1.00, "C_score": 1.00},
         )
         req = _ct4_adapter().adapt(out)
         # Adapter surfaces the k penalty signal
@@ -426,7 +439,11 @@ class TestScenario16EnforcementHold:
     """
 
     def test_hold_returns_withheld_response(self, interceptor, store):
-        # Two attribution gaps -> Hold at CT-4
+        # Two attribution gaps -> Hold at CT-4.
+        # Under paper-aligned ladder, kappa is a remediability floor:
+        # a gate-fail Hold requires S_base >= kappa=0.90. Pin B/C
+        # slightly higher via extra_metadata so a real HOLD is
+        # exercised.
         out = RAGOutput(
             query="Give a recommendation",
             retrieved_chunks=[
@@ -440,6 +457,7 @@ class TestScenario16EnforcementHold:
             ],
             candidate_answer="Recommend X.",
             subject_id="s16-enforcement-hold",
+            extra_metadata={"B_score": 1.00, "C_score": 1.00},
         )
         req = _ct4_adapter().adapt(out)
         resp = interceptor.govern(req)
@@ -463,7 +481,14 @@ class TestScenario17ChainUncertainty:
     3-agent chain, each U=0.88.
     use_chain_uncertainty = True in ResolvedTISProfile.
     U_chain = 1 - prod(U_i) = 1 - (0.88^3) = 1 - 0.6815 = 0.3185
-    U gate at r3 requires 0.80; 0.3185 < 0.80 -> gate fails -> Hold.
+    K gate at r3 requires 0.80; 0.3185 < 0.80 -> gate fails.
+
+    Under the paper-aligned ladder kappa is a remediability floor:
+    a gate fail with S_base < kappa maps to STOP (irremediable), not
+    HOLD. With base fin-r3-a4 weights (B=0.30, A=0.25, C=0.30, K=0.15)
+    and K=0.3185, even B=A=C=1.0 yields S_base=0.30+0.25+0.30+0.0478
+    = 0.898 < kappa=0.90, so the chain-collapsed K is too degraded
+    to remediate. Scenario flipped from Hold -> Stop accordingly.
     """
 
     def test_chain_uncertainty_formula(self):
@@ -492,7 +517,8 @@ class TestScenario17ChainUncertainty:
         req = _base_rag_adapter().adapt(out)
         resp = interceptor.govern(req)
 
-        assert resp.decision == "Hold"
+        # Paper-aligned: chain-collapsed K with low S_base -> Stop.
+        assert resp.decision == "Stop"
         assert resp.blocked is True
         assert resp.certificate_id is not None
 
@@ -506,3 +532,62 @@ class TestScenario17ChainUncertainty:
         assert tc.component_scores["K"] == pytest.approx(0.3185, abs=1e-4)
         # U failed its gate
         assert tc.gate_results["K"] == "fail"
+
+
+# --------------------------------------------------------------------------- #
+# Regression: CT-8 triggers chain uncertainty, CT-11 does NOT                  #
+# --------------------------------------------------------------------------- #
+
+class TestCT8VsCT11ChainScope:
+    """
+    Regression guard for the BACK migration. The chain uncertainty
+    formula belongs to CT-8 (agent chain) only. CT-11 (AI-generated
+    attribution) is its own connection type with its own weight
+    modifier vector — it does NOT inherit chain math.
+
+    If AI-generated content appears inside an agent chain workflow, the
+    workflow graph captures both the CT-8 chain context and the per-hop
+    CT-11 nodes — the chain math belongs to the CT-8 context.
+    """
+
+    def test_ct8_enables_chain_uncertainty(self):
+        from tcs.governed_context import resolve_policy_profile
+        from tcs.policy_profiles import load_profile
+
+        base = load_profile("fin-high-risk-suitability-v3")
+        resolved = resolve_policy_profile(
+            base, "CT-8", chain_u_scores=[0.90, 0.90, 0.90]
+        )
+
+        assert resolved.use_chain_uncertainty is True
+        assert resolved.chain_depth == 3
+        assert resolved.chain_u_scores == [0.90, 0.90, 0.90]
+
+    def test_ct11_does_not_enable_chain_uncertainty(self):
+        from tcs.governed_context import resolve_policy_profile
+        from tcs.policy_profiles import load_profile
+
+        base = load_profile("fin-high-risk-suitability-v3")
+        resolved = resolve_policy_profile(base, "CT-11")
+
+        assert resolved.use_chain_uncertainty is False
+        assert resolved.chain_depth == 0
+        assert resolved.chain_u_scores == []
+
+    def test_ct11_ignores_chain_u_scores_if_passed(self):
+        """
+        Even if chain_u_scores are supplied (as could happen if a caller
+        misinterprets the CT-11 contract), the resolver must NOT enable
+        chain uncertainty for CT-11. Chain math belongs to CT-8 only.
+        """
+        from tcs.governed_context import resolve_policy_profile
+        from tcs.policy_profiles import load_profile
+
+        base = load_profile("fin-high-risk-suitability-v3")
+        resolved = resolve_policy_profile(
+            base, "CT-11", chain_u_scores=[0.50, 0.50]
+        )
+
+        assert resolved.use_chain_uncertainty is False
+        assert resolved.chain_depth == 0
+        assert resolved.chain_u_scores == []

@@ -107,6 +107,114 @@ def clear_active_pack() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Composed-pack registration (Slice 4 — standards composer integration)        #
+# --------------------------------------------------------------------------- #
+
+def register_composed_pack(composed: Any, *, name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Register a ComposedProfile as a deployable pack.
+
+    The composed pack:
+      - Uses ``composed-<hash16>`` as its pack_id (deterministic
+        across same inputs — same composition always lands on the
+        same id regardless of display name)
+      - Carries the composer_metadata so the deployment can be
+        reconstructed for audit (industry, sub_industry, use_case,
+        standards, risk_tier, action_class, composition_rules_version,
+        composed_at, profile_hash)
+      - Honors the existing Pack contract (pack_id, name, version,
+        description, regulatory_references, profile_config,
+        fail_behavior, etc.) so the existing list_packs / deploy_pack
+        flow works unchanged.
+
+    Calling register_composed_pack with the same inputs twice yields
+    the same pack_id (the hash is deterministic) and updates the
+    in-memory entry idempotently. The display ``name`` MAY differ
+    between calls (last-write-wins).
+
+    Parameters
+    ----------
+    composed
+        A ``tcs.standards.composer.ComposedProfile`` instance.
+    name
+        Optional human-readable display name. Used in the Available
+        Packs list and Active Profile section. Defaults to an
+        auto-generated descriptive label when None.
+
+    Returns
+    -------
+    dict
+        The registered pack dict.
+    """
+    from tcs.standards.composer import ComposedProfile, composed_pack_id
+
+    if not isinstance(composed, ComposedProfile):
+        raise TypeError(
+            "register_composed_pack expects a ComposedProfile instance"
+        )
+
+    pack_id = composed_pack_id(composed.profile_hash)
+    meta = composed.composer_metadata
+    standards_list = ", ".join(meta.get("standards", []))
+
+    if name and str(name).strip():
+        display_name = str(name).strip()
+    else:
+        display_name = (
+            f"Composed: {meta.get('industry')} · {meta.get('sub_industry')} · "
+            f"{meta.get('use_case')} ({standards_list or 'no standards'})"
+        )
+
+    pack: Dict[str, Any] = {
+        "pack_id": pack_id,
+        "name": display_name,
+        "version": "1.0.0",
+        "description": (
+            f"Standards-composed pack. Industry={meta.get('industry')}, "
+            f"sub_industry={meta.get('sub_industry')}, use_case={meta.get('use_case')}, "
+            f"risk_tier={meta.get('risk_tier')}, action_class={meta.get('action_class')}, "
+            f"composition_rules={meta.get('composition_rules_version')}. "
+            "Adjustments per standard are governance interpretations, not "
+            "claims that the underlying regulations mathematically require "
+            "the specific TCS parameter values."
+        ),
+        "regulatory_references": list(composed.regulatory_references),
+        "profile_config": dict(composed.profile_config),
+        "adaptation_floors": {},
+        "tc_required_fields": [],
+        "audit_export_format": "standards_composed_v1",
+        "fail_behavior": "fail_closed",
+        # Composer metadata — required for full audit reconstruction.
+        "composer_metadata": dict(meta),
+        "composer_contributions": [c.to_dict() for c in composed.contributions],
+        "required_controls": list(composed.required_controls),
+        "hard_prohibitions": list(composed.hard_prohibitions),
+        "profile_hash": composed.profile_hash,
+        "is_composed_pack": True,
+    }
+    PACKS[pack_id] = pack
+    return pack
+
+
+def unregister_composed_pack(pack_id: str) -> bool:
+    """
+    Remove a composed pack from the registry. Returns True if removed.
+
+    Safety: refuses to remove non-composed (built-in) packs.
+    """
+    global _active_pack
+    pack = PACKS.get(pack_id)
+    if pack is None:
+        return False
+    if not pack.get("is_composed_pack"):
+        raise ValueError(f"refusing to unregister built-in pack {pack_id!r}")
+    if _active_pack == pack_id:
+        _active_pack = None
+    del PACKS[pack_id]
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Pack validation                                                              #
 # --------------------------------------------------------------------------- #
 

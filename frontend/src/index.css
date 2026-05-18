@@ -1,1 +1,140 @@
 @import "tailwindcss";
+
+/* ================================================================
+   Light Theme Overrides
+   When .light-theme is on <html>, remap all dark Tailwind utilities
+   to light equivalents. This avoids touching every component file.
+   ================================================================ */
+
+/* --- Backgrounds --- */
+.light-theme .bg-gray-950  { background-color: #f8fafc !important; } /* slate-50 */
+.light-theme .bg-gray-900  { background-color: #ffffff !important; }
+.light-theme .bg-gray-800  { background-color: #f1f5f9 !important; } /* slate-100 */
+.light-theme .bg-gray-800\/50  { background-color: rgba(241,245,249,0.7) !important; }
+.light-theme .bg-gray-800\/30  { background-color: rgba(241,245,249,0.5) !important; }
+
+/* Decision row tints — keep them visible in light */
+.light-theme .bg-green-900\/10  { background-color: rgba(34,197,94,0.08) !important; }
+.light-theme .bg-green-900\/5   { background-color: rgba(34,197,94,0.05) !important; }
+.light-theme .bg-yellow-900\/10 { background-color: rgba(234,179,8,0.08) !important; }
+.light-theme .bg-yellow-900\/5  { background-color: rgba(234,179,8,0.05) !important; }
+.light-theme .bg-red-900\/10    { background-color: rgba(239,68,68,0.08) !important; }
+.light-theme .bg-orange-900\/10 { background-color: rgba(249,115,22,0.08) !important; }
+
+/* Status badge backgrounds */
+.light-theme .bg-green-900\/50  { background-color: rgba(34,197,94,0.12) !important; }
+.light-theme .bg-red-900\/50    { background-color: rgba(239,68,68,0.12) !important; }
+.light-theme .bg-yellow-900\/50 { background-color: rgba(234,179,8,0.12) !important; }
+.light-theme .bg-blue-900\/50   { background-color: rgba(59,130,246,0.12) !important; }
+.light-theme .bg-orange-900\/50 { background-color: rgba(249,115,22,0.12) !important; }
+.light-theme .bg-purple-900\/50 { background-color: rgba(168,85,247,0.12) !important; }
+
+/* --- Borders --- */
+.light-theme .border-gray-800   { border-color: #e2e8f0 !important; } /* slate-200 */
+.light-theme .border-gray-800\/50 { border-color: rgba(226,232,240,0.5) !important; }
+.light-theme .border-gray-700   { border-color: #cbd5e1 !important; } /* slate-300 */
+.light-theme .border-green-800  { border-color: #86efac !important; }
+.light-theme .border-red-800    { border-color: #fca5a5 !important; }
+.light-theme .border-yellow-800 { border-color: #fde047 !important; }
+
+/* --- Text --- */
+.light-theme .text-gray-100 { color: #1e293b !important; } /* slate-800 */
+.light-theme .text-gray-200 { color: #334155 !important; } /* slate-700 */
+.light-theme .text-gray-300 { color: #475569 !important; } /* slate-600 */
+.light-theme .text-gray-400 { color: #64748b !important; } /* slate-500 */
+.light-theme .text-gray-500 { color: #94a3b8 !important; } /* slate-400 */
+.light-theme .text-gray-600 { color: #94a3b8 !important; }
+.light-theme .text-white     { color: #0f172a !important; } /* slate-900 */
+
+/* Keep colored text readable */
+.light-theme .text-blue-400  { color: #2563eb !important; }
+.light-theme .text-blue-300  { color: #3b82f6 !important; }
+.light-theme .text-green-400 { color: #16a34a !important; }
+.light-theme .text-green-500 { color: #16a34a !important; }
+.light-theme .text-red-400   { color: #dc2626 !important; }
+.light-theme .text-yellow-400 { color: #ca8a04 !important; }
+.light-theme .text-yellow-300 { color: #ca8a04 !important; }
+.light-theme .text-orange-400 { color: #ea580c !important; }
+.light-theme .text-purple-400 { color: #9333ea !important; }
+.light-theme .text-emerald-400 { color: #059669 !important; }
+
+/* --- Header / Nav specific --- */
+.light-theme header.bg-gray-900 {
+  background-color: #ffffff !important;
+  border-bottom-color: #e2e8f0 !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+
+/* Active nav tab */
+.light-theme .bg-gray-800.text-white.border-b-2 {
+  background-color: #f1f5f9 !important;
+  color: #0f172a !important;
+}
+
+/* --- Inputs / Forms --- */
+.light-theme input.bg-gray-800,
+.light-theme select.bg-gray-800,
+.light-theme textarea.bg-gray-800 {
+  background-color: #ffffff !important;
+  border-color: #cbd5e1 !important;
+  color: #1e293b !important;
+}
+
+.light-theme input.bg-gray-800::placeholder,
+.light-theme textarea.bg-gray-800::placeholder {
+  color: #94a3b8 !important;
+}
+
+/* --- Buttons — keep bg-blue/purple/green buttons as-is --- */
+
+/* --- Scrollbar --- */
+.light-theme ::-webkit-scrollbar-track { background: #f1f5f9; }
+.light-theme ::-webkit-scrollbar-thumb { background: #cbd5e1; }
+
+/* --- Charts: Recharts tooltip --- */
+.light-theme .recharts-default-tooltip {
+  background-color: #ffffff !important;
+  border-color: #e2e8f0 !important;
+}
+
+/* --- Card panels (the rounded-lg border containers) --- */
+.light-theme .rounded-lg.border.border-gray-800.p-4,
+.light-theme .rounded-lg.border.border-gray-800 {
+  background-color: #ffffff !important;
+  border-color: #e2e8f0 !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+
+/* --- Slide-over panel (TC detail) --- */
+.light-theme .bg-gray-900.border-l.border-gray-800 {
+  background-color: #ffffff !important;
+  border-left-color: #e2e8f0 !important;
+}
+
+/* --- Progress bars --- */
+.light-theme .bg-gray-800.rounded-full {
+  background-color: #e2e8f0 !important;
+}
+
+/* --- Table header text --- */
+.light-theme th.text-gray-500 { color: #64748b !important; }
+
+/* --- Hover states --- */
+.light-theme .hover\:bg-gray-800\/50:hover { background-color: rgba(241,245,249,0.8) !important; }
+.light-theme .hover\:text-white:hover { color: #0f172a !important; }
+
+/* --- Login page specific --- */
+.light-theme .min-h-screen.bg-gray-950 {
+  background-color: #f8fafc !important;
+}
+
+/* --- Recharts grid --- */
+.light-theme .recharts-cartesian-grid line {
+  stroke: #e2e8f0 !important;
+}
+
+/* --- Version badge --- */
+.light-theme span.bg-gray-800.text-gray-500 {
+  background-color: #f1f5f9 !important;
+  color: #64748b !important;
+}

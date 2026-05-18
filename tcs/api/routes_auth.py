@@ -4,7 +4,7 @@ tcs.api.routes_auth
 
 Authentication endpoints for the Control Plane.
 
-POST /v1/auth/login — create session with username and role
+POST /v2/auth/login — create session with username and role
 """
 
 from __future__ import annotations

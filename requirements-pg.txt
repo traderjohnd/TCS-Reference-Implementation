@@ -1,0 +1,4 @@
+# PostgreSQL dependencies for TCS Phase 4.
+# Install with: pip install -r requirements-pg.txt
+# Only needed when TCS_DB_BACKEND=postgres.
+psycopg[binary]>=3.1

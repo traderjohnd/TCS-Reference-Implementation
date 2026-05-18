@@ -1,36 +1,73 @@
-# Claude Code internal files
+# ─── Claude Code internal files ────────────────────────────────────────────
 .claude/
 CLAUDE.md
 
-# Internal planning and spec documents
+# ─── Internal planning / spec documents ────────────────────────────────────
 PHASE_2_PLAN.md
 TCS_Claude_Code_Context_Package/
 TCS_Adaptive_Governance_Position_Paper.docx
 TCS_Modular_Governance_Architecture_v3.docx
 TCS_Phase3_Build_Specification.docx
+TCS_Phase4_Build_Specification.md
 
-# Databases
-data/tcs.db
-data/tcs.db-shm
-data/tcs.db-wal
-demo.sqlite
+# ─── Databases / persistent state ──────────────────────────────────────────
+data/
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
-# Standalone dashboard (replaced by frontend/)
+# ─── Replaced infra ────────────────────────────────────────────────────────
 dashboard/index.html
 
-# Python cache
+# ─── Python ────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
 
-# Environment
+# ─── Frontend (React / Vite / Node) ───────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+frontend/.cache/
+frontend/*.tsbuildinfo
+node_modules/
+
+# ─── Environment / secrets ─────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
 .venv/
 venv/
+env/
+ENV/
+*.pem
+*.key
+secrets/
 
-# OS files
+# ─── IDE / editor / OS files ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini

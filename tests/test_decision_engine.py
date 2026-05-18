@@ -46,43 +46,44 @@ class TestPriorityLadder:
         d, _ = map_decision(inp, r)
         assert d == "Stop"
 
-    def test_priority_3_gate_fail_above_kappa_stops(self):
-        """Gate=0 and TIS_raw > kappa -> Stop."""
-        # clinical profile: kappa=0.90, thresholds B/A/C/U high.
-        # Craft: all high except U at 0.0 (fails U gate), raw still > 0.90.
-        inp = make_tis_input(
-            "clinical-cds-samed-v2",
-            {"B": 1.0, "A": 1.0, "C": 1.0, "K": 0.50},  # U fails 0.80
-        )
-        r = compute_tis(inp)
-        # raw = 0.25*1 + 0.20*1 + 0.35*1 + 0.20*0.5 = 0.90 exactly
-        # Need raw > 0.90. Bump one dimension.
-        inp2 = make_tis_input(
-            "clinical-cds-samed-v2",
-            {"B": 1.0, "A": 1.0, "C": 1.0, "K": 0.55},  # U fails 0.80
-        )
-        r2 = compute_tis(inp2)
-        assert r2.gate_result == 0
-        assert r2.tis_raw > 0.90    # > kappa
-        d, _ = map_decision(inp2, r2)
-        assert d == "Stop"
-
-    def test_priority_4_gate_fail_within_kappa_holds(self):
-        """Gate=0, TIS_raw <= kappa, C3 != 0 -> Hold (gate path)."""
+    def test_priority_3_gate_fail_below_kappa_stops(self):
+        """Gate=0 and S_base < kappa -> Stop (too degraded to remediate)."""
+        # fin profile: kappa=0.90.
+        # B=0.94, A=0.76, C=0.92, K=0.88; A fails the 0.90 gate.
+        # S_base = 0.30*0.94 + 0.25*0.76 + 0.30*0.92 + 0.15*0.88 = 0.880
+        # S_base < 0.90 -> STOP (Priority 3, paper-aligned direction).
         inp = make_tis_input(
             "fin-high-risk-suitability-v3",
-            {"B": 0.94, "A": 0.76, "C": 0.92, "K": 0.88},  # A fails 0.90
+            {"B": 0.94, "A": 0.76, "C": 0.92, "K": 0.88},
         )
         r = compute_tis(inp)
         assert r.gate_result == 0
-        assert r.tis_raw <= 0.90
+        assert r.s_base < 0.90
+        d, _ = map_decision(inp, r)
+        assert d == "Stop"
+
+    def test_priority_4_gate_fail_at_or_above_kappa_holds(self):
+        """
+        Gate=0, S_base >= kappa, C3 != 0 -> Hold (remediable via review).
+
+        clinical profile: kappa=0.90, K threshold=0.80.
+        B=1.0, A=1.0, C=1.0, K=0.55: K fails the 0.80 gate.
+        S_base = 0.25 + 0.20 + 0.35 + 0.20*0.55 = 0.910 >= 0.90 -> HOLD.
+        """
+        inp = make_tis_input(
+            "clinical-cds-samed-v2",
+            {"B": 1.0, "A": 1.0, "C": 1.0, "K": 0.55},
+        )
+        r = compute_tis(inp)
+        assert r.gate_result == 0
+        assert r.s_base >= 0.90
         d, _ = map_decision(inp, r)
         assert d == "Hold"
 
     def test_priority_5_below_escalate_escalates(self):
         """Gate=1 and TIS_current < theta_escalate -> Escalate."""
         # At r3 fin: theta_escalate=0.70. Need all gates pass but low total.
-        # Hardest: B,A,C,U all at their thresholds, big decay.
+        # Hardest: B,A,C,K all at their thresholds, big decay.
         inp = make_tis_input(
             "fin-high-risk-suitability-v3",
             {"B": 0.90, "A": 0.90, "C": 0.90, "K": 0.80},
@@ -153,12 +154,16 @@ class TestPriorityLadder:
 class TestRequiresHumanReview:
     def test_hold_always_requires_review(self):
         """Hold decisions always require review."""
+        # Need an actual HOLD: gate=0, C3 != 0, S_base >= kappa.
+        # clinical profile: B=1.0,A=1.0,C=1.0,K=0.55 -> K gate fails,
+        # S_base=0.91 >= kappa=0.90 -> HOLD via Priority 4.
         inp = make_tis_input(
-            "fin-high-risk-suitability-v3",
-            {"B": 0.94, "A": 0.76, "C": 0.92, "K": 0.88},  # A fails
+            "clinical-cds-samed-v2",
+            {"B": 1.0, "A": 1.0, "C": 1.0, "K": 0.55},
         )
         r = compute_tis(inp)
-        _, review = map_decision(inp, r)
+        d, review = map_decision(inp, r)
+        assert d == "Hold"
         assert review is True
 
     def test_escalate_always_requires_review(self):

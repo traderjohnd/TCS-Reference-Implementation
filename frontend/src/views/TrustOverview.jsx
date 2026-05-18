@@ -2,7 +2,7 @@ import { usePolling } from '../hooks/useApi';
 import MetricCard from '../components/MetricCard';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell,
+  PieChart, Pie, Cell, AreaChart, Area, Legend,
 } from 'recharts';
 
 const DECISION_COLORS = {
@@ -10,12 +10,14 @@ const DECISION_COLORS = {
   Escalate: '#f97316', Stop: '#ef4444',
 };
 
-const DIM_LABELS = { B: 'Boundedness', A: 'Attribution', C: 'Compliance', U: 'Uncertainty' };
+const DIM_LABELS = { B: 'Boundedness', A: 'Attribution', C: 'Compliance', K: 'Known' };
 
 export default function TrustOverview() {
   const { data: metrics, loading } = usePolling('/metrics/live', 5000);
   const { data: health } = usePolling('/health', 10000);
   const { data: drift } = usePolling('/dynamics/drift?window_hours=24', 15000);
+  const { data: timeseries } = usePolling('/metrics/timeseries?window=1h&bucket=1m', 10000);
+  const { data: gateFailures } = usePolling('/metrics/gate-failures?window=24h', 15000);
 
   if (loading || !metrics) {
     return <div className="text-gray-500">Loading metrics...</div>;
@@ -132,6 +134,62 @@ export default function TrustOverview() {
             </div>
           ))}
         </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+          <h3 className="text-sm font-medium text-gray-400 mb-3">Decision Timeseries (1h window)</h3>
+          {timeseries?.buckets?.length > 0 ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <AreaChart data={timeseries.buckets}>
+                <XAxis dataKey="timestamp" tick={{ fill: '#9ca3af', fontSize: 10 }} tickFormatter={(v) => v ? new Date(v).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''} />
+                <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }} />
+                <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', borderRadius: 8 }} labelStyle={{ color: '#fff' }} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Area type="monotone" dataKey="allow" stackId="1" stroke="#22c55e" fill="#22c55e" fillOpacity={0.6} />
+                <Area type="monotone" dataKey="hold" stackId="1" stroke="#eab308" fill="#eab308" fillOpacity={0.6} />
+                <Area type="monotone" dataKey="stop" stackId="1" stroke="#ef4444" fill="#ef4444" fillOpacity={0.6} />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[200px] flex items-center justify-center text-gray-600">No timeseries data yet</div>
+          )}
+        </div>
+
+        <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+          <h3 className="text-sm font-medium text-gray-400 mb-3">Gate Failure Breakdown (24h)</h3>
+          {gateFailures?.dimensions && Object.keys(gateFailures.dimensions).length > 0 ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={Object.entries(gateFailures.dimensions).map(([dim, count]) => ({ dim: DIM_LABELS[dim] || dim, count }))}>
+                <XAxis dataKey="dim" tick={{ fill: '#9ca3af', fontSize: 11 }} />
+                <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }} />
+                <Tooltip contentStyle={{ background: '#1f2937', border: '1px solid #374151', borderRadius: 8 }} labelStyle={{ color: '#fff' }} />
+                <Bar dataKey="count" fill="#f97316" radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[200px] flex items-center justify-center text-gray-600">No gate failures recorded</div>
+          )}
+        </div>
+      </div>
+
+      <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <h3 className="text-sm font-medium text-gray-400 mb-3">Governance Latency Percentiles</h3>
+        <div className="grid grid-cols-3 gap-4 text-center">
+          <div>
+            <div className="text-xs text-gray-500 mb-1">p50</div>
+            <div className="text-lg font-mono text-gray-500">--</div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500 mb-1">p95</div>
+            <div className="text-lg font-mono text-gray-500">--</div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500 mb-1">p99</div>
+            <div className="text-lg font-mono text-gray-500">--</div>
+          </div>
+        </div>
+        <p className="text-xs text-gray-600 text-center mt-2">Latency metrics available when demo is running</p>
       </div>
     </div>
   );

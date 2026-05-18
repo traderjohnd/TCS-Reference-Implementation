@@ -51,7 +51,7 @@ PLATFORM_ADMIN = Role(
     name="platform_admin",
     description="Full system access. Cannot approve own dual-control requests.",
     permitted=frozenset({
-        "/v1/",
+        "/v2/",
     }),
     blocked=frozenset(),  # no blocks except self-approval (enforced in dual_control)
 )
@@ -60,16 +60,16 @@ GOVERNANCE_ADMIN = Role(
     name="governance_admin",
     description="Governance operations: govern, certificates, metrics, dynamics, simulation, packs.",
     permitted=frozenset({
-        "/v1/govern",
-        "/v1/certificates",
-        "/v1/metrics",
-        "/v1/dynamics",
-        "/v1/simulation",
-        "/v1/health",
+        "/v2/govern",
+        "/v2/certificates",
+        "/v2/metrics",
+        "/v2/dynamics",
+        "/v2/simulation",
+        "/v2/health",
     }),
     blocked=frozenset({
-        "/v1/admin/users",
-        "/v1/admin/modules",
+        "/v2/admin/users",
+        "/v2/admin/modules",
     }),
 )
 
@@ -77,20 +77,20 @@ POLICY_EDITOR = Role(
     name="policy_editor",
     description="Read governance data, run simulations, view PLL recommendations.",
     permitted=frozenset({
-        "/v1/govern",
-        "/v1/simulation",
-        "/v1/dynamics/pll/recommendations",
-        "/v1/dynamics/pll/history",
-        "/v1/dynamics/trust-loss",
-        "/v1/dynamics/drift",
-        "/v1/certificates",
-        "/v1/metrics",
-        "/v1/health",
+        "/v2/govern",
+        "/v2/simulation",
+        "/v2/dynamics/pll/recommendations",
+        "/v2/dynamics/pll/history",
+        "/v2/dynamics/trust-loss",
+        "/v2/dynamics/drift",
+        "/v2/certificates",
+        "/v2/metrics",
+        "/v2/health",
     }),
     blocked=frozenset({
-        "/v1/dynamics/pll/approve",
-        "/v1/dynamics/pll/reject",
-        "/v1/dynamics/recovery/activate",
+        "/v2/dynamics/pll/approve",
+        "/v2/dynamics/pll/reject",
+        "/v2/dynamics/recovery/activate",
     }),
 )
 
@@ -98,16 +98,16 @@ COMPLIANCE_OFFICER = Role(
     name="compliance_officer",
     description="Audit access: certificates, metrics, drift, hold queue.",
     permitted=frozenset({
-        "/v1/certificates",
-        "/v1/metrics",
-        "/v1/dynamics/drift",
-        "/v1/dynamics/trust-loss",
-        "/v1/govern",
-        "/v1/health",
+        "/v2/certificates",
+        "/v2/metrics",
+        "/v2/dynamics/drift",
+        "/v2/dynamics/trust-loss",
+        "/v2/govern",
+        "/v2/health",
     }),
     blocked=frozenset({
-        "/v1/dynamics/pll/approve",
-        "/v1/simulation/replay",
+        "/v2/dynamics/pll/approve",
+        "/v2/simulation/replay",
     }),
 )
 
@@ -115,14 +115,14 @@ WORKFLOW_OWNER = Role(
     name="workflow_owner",
     description="Own-workflow governance: hold queue and certificates for own workflow.",
     permitted=frozenset({
-        "/v1/govern",
-        "/v1/certificates",
-        "/v1/health",
-        "/v1/metrics",
+        "/v2/govern",
+        "/v2/certificates",
+        "/v2/health",
+        "/v2/metrics",
     }),
     blocked=frozenset({
-        "/v1/dynamics",
-        "/v1/simulation",
+        "/v2/dynamics",
+        "/v2/simulation",
     }),
 )
 
@@ -130,14 +130,14 @@ AUDITOR = Role(
     name="auditor",
     description="Read-only certificate and chain verification access.",
     permitted=frozenset({
-        "/v1/certificates",
-        "/v1/health",
+        "/v2/certificates",
+        "/v2/health",
     }),
     blocked=frozenset({
-        "/v1/dynamics",
-        "/v1/simulation",
-        "/v1/govern",
-        "/v1/metrics",
+        "/v2/dynamics",
+        "/v2/simulation",
+        "/v2/govern",
+        "/v2/metrics",
     }),
 )
 
@@ -145,14 +145,14 @@ EXECUTIVE_VIEWER = Role(
     name="executive_viewer",
     description="Dashboard-only: live metrics and summary.",
     permitted=frozenset({
-        "/v1/metrics",
-        "/v1/health",
+        "/v2/metrics",
+        "/v2/health",
     }),
     blocked=frozenset({
-        "/v1/certificates",
-        "/v1/dynamics",
-        "/v1/simulation",
-        "/v1/govern",
+        "/v2/certificates",
+        "/v2/dynamics",
+        "/v2/simulation",
+        "/v2/govern",
     }),
 )
 
@@ -160,14 +160,14 @@ EXCEPTION_APPROVER = Role(
     name="exception_approver",
     description="Approve overrides and PLL changes. Cannot approve own requests.",
     permitted=frozenset({
-        "/v1/govern",
-        "/v1/dynamics/pll/approve",
-        "/v1/dynamics/pll/reject",
-        "/v1/dynamics/pll/recommendations",
-        "/v1/dynamics/pll/history",
-        "/v1/certificates",
-        "/v1/metrics",
-        "/v1/health",
+        "/v2/govern",
+        "/v2/dynamics/pll/approve",
+        "/v2/dynamics/pll/reject",
+        "/v2/dynamics/pll/recommendations",
+        "/v2/dynamics/pll/history",
+        "/v2/certificates",
+        "/v2/metrics",
+        "/v2/health",
     }),
     blocked=frozenset(),
 )

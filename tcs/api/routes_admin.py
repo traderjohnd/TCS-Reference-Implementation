@@ -4,9 +4,9 @@ tcs.api.routes_admin
 
 Phase 3 Step 10 — Admin endpoints for Platform Admin.
 
-GET  /v1/admin/users     — list users/sessions
-POST /v1/admin/users     — create user with role
-GET  /v1/admin/modules   — module configuration status
+GET  /v2/admin/users     — list users/sessions
+POST /v2/admin/users     — create user with role
+GET  /v2/admin/modules   — module configuration status
 """
 
 from __future__ import annotations

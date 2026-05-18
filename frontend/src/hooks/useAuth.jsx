@@ -3,14 +3,14 @@ import { createContext, useContext, useState, useCallback } from 'react';
 const AuthContext = createContext(null);
 
 const ROLE_VIEW_ACCESS = {
-  platform_admin: ['overview', 'decisions', 'drift', 'policy', 'audit', 'economic', 'admin'],
-  governance_admin: ['overview', 'decisions', 'drift', 'policy', 'audit', 'economic'],
-  compliance_officer: ['overview', 'decisions', 'drift', 'policy', 'audit', 'economic'],
-  policy_editor: ['overview', 'policy'],
-  workflow_owner: ['decisions'],
-  auditor: ['audit'],
-  executive_viewer: ['overview', 'economic'],
-  exception_approver: ['overview', 'decisions', 'drift', 'audit'],
+  platform_admin: ['connections', 'overview', 'chat', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives', 'admin'],
+  governance_admin: ['connections', 'overview', 'chat', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives'],
+  compliance_officer: ['connections', 'overview', 'chat', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives'],
+  policy_editor: ['connections', 'overview', 'chat', 'policy'],
+  workflow_owner: ['connections', 'chat', 'decisions'],
+  auditor: ['connections', 'audit', 'telemetry', 'archives'],
+  executive_viewer: ['connections', 'overview', 'economic'],
+  exception_approver: ['connections', 'overview', 'chat', 'decisions', 'drift', 'audit', 'archives'],
 };
 
 export function AuthProvider({ children }) {
@@ -20,7 +20,7 @@ export function AuthProvider({ children }) {
   });
 
   const login = useCallback(async (username, role) => {
-    const res = await fetch('/v1/auth/login', {
+    const res = await fetch('/v2/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, role }),

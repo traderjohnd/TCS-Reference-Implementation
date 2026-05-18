@@ -4,8 +4,8 @@ tcs.api.routes_dynamics
 
 Phase 3 adaptive governance API endpoints.
 
-GET /v1/dynamics/trust-loss — Trust Loss Function computation
-GET /v1/dynamics/drift      — Trust Drift Detection (Step 3)
+GET /v2/dynamics/trust-loss — Trust Loss Function computation
+GET /v2/dynamics/drift      — Trust Drift Detection (Step 3)
 """
 
 from __future__ import annotations

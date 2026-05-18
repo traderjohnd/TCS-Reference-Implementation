@@ -1,13 +1,13 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { usePolling, apiFetch, apiPost } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
 
 function TCDetailPanel({ certificateId, onClose }) {
-  const { data: tc, loading } = apiFetch ? null : null;
   const [tcData, setTcData] = useState(null);
   const [loadingTc, setLoadingTc] = useState(true);
 
-  useState(() => {
+  useEffect(() => {
+    setLoadingTc(true);
     apiFetch(`/certificates/${certificateId}`)
       .then(setTcData)
       .catch(() => setTcData(null))
@@ -18,7 +18,7 @@ function TCDetailPanel({ certificateId, onClose }) {
 
   const sections = [
     { title: 'Identity', fields: ['certificate_id', 'subject_id', 'subject_type', 'domain', 'risk_tier', 'action_class', 'policy_set_id'] },
-    { title: 'Score', fields: ['tis_raw', 'tis_adjusted', 'tis_current', 'penalty_aggregate'] },
+    { title: 'Score', fields: ['s_base', 's_adjusted', 'tis_raw', 'tis_adjusted', 'tis_current', 'penalty_aggregate'] },
     { title: 'Components', data: tcData.component_scores },
     { title: 'Gate Results', data: tcData.gate_results },
     { title: 'Decision', fields: ['decision', 'requires_human_review', 'blocking_reason'] },
@@ -156,28 +156,37 @@ export default function LiveDecisions() {
                 <th className="pb-2 pr-3">B</th>
                 <th className="pb-2 pr-3">A</th>
                 <th className="pb-2 pr-3">C</th>
-                <th className="pb-2 pr-3">U</th>
+                <th className="pb-2 pr-3">K</th>
                 <th className="pb-2 pr-3">Domain</th>
+                <th className="pb-2 pr-3">Latency</th>
                 <th className="pb-2"></th>
               </tr>
             </thead>
             <tbody>
-              {decisions.map((d) => (
-                <tr key={d.certificate_id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
+              {decisions.map((d) => {
+                const rowBg = d.decision === 'Allow' ? 'bg-green-900/10'
+                  : d.decision === 'Hold' ? 'bg-yellow-900/10'
+                  : d.decision === 'Stop' ? 'bg-red-900/10'
+                  : d.decision === 'Escalate' ? 'bg-orange-900/10'
+                  : '';
+                return (
+                <tr key={d.certificate_id} className={`border-b border-gray-800/50 hover:bg-gray-800/30 ${rowBg}`}>
                   <td className="py-2 pr-3"><StatusBadge decision={d.decision} /></td>
                   <td className="py-2 pr-3 font-mono text-xs text-gray-400">{d.subject_id}</td>
                   <td className="py-2 pr-3 font-mono text-xs">{d.tis_current?.toFixed(4)}</td>
                   <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.B?.toFixed(2)}</td>
                   <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.A?.toFixed(2)}</td>
                   <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.C?.toFixed(2)}</td>
-                  <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.U?.toFixed(2)}</td>
+                  <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.K?.toFixed(2)}</td>
                   <td className="py-2 pr-3 text-xs text-gray-500">{d.domain}</td>
+                  <td className="py-2 pr-3 font-mono text-xs text-gray-500">{d.governance_ms != null ? `${d.governance_ms}ms` : '--'}</td>
                   <td className="py-2">
                     <button onClick={() => setSelectedTc(d.certificate_id)}
                       className="text-xs text-blue-400 hover:text-blue-300">Detail</button>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

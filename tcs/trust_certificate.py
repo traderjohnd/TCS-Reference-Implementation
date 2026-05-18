@@ -313,11 +313,21 @@ class TrustCertificate:
     policy_set_id: str           # profile.profile_id
 
     # ---- Layer S: Score ------------------------------------------------- #
+    # Score naming (white paper alignment):
+    #   s_base       = Σᵢ wᵢ · dimᵢ           (gate-independent composite)
+    #   s_adjusted   = s_base * (1 - P)        (gate-independent post-penalty)
+    #   tis_raw      = gate * s_base           (gated; 0 on gate fail)
+    #   tis_adjusted = gate * s_adjusted       (gated; 0 on gate fail)
+    #   tis_current  = s_adjusted * decay * gate * is_valid
+    # The decision engine uses s_base for Priority 3/4 kappa discrimination
+    # because tis_raw collapses to 0 on gate failure (white paper definition).
+    s_base: float
+    s_adjusted: float
     tis_raw: float
     tis_adjusted: float
     tis_current: float
-    component_scores: Dict[str, float]        # B,A,C,U
-    component_weights: Dict[str, float]       # B,A,C,U; Σ = 1
+    component_scores: Dict[str, float]        # B,A,C,K (BACK)
+    component_weights: Dict[str, float]       # B,A,C,K (BACK); Σ = 1
     penalty_aggregate: float
     penalty_breakdown: Dict[str, float]       # P_cb,P_d,P_n,P_h,P_ps (all five)
     failing_dimension_subfactors: Dict[str, Dict[str, float]]
@@ -389,17 +399,53 @@ class TrustCertificate:
     # connection_type_modifier_id:  versioned CT modifier set ID.
     # resolved_policy_profile_id:   composite audit ID
     #                               (base_profile + modifier_id + timestamp).
-    # chain_depth:                  number of hops in an agent / AI chain
-    #                               (only meaningful for CT-8 and CT-11;
-    #                                0 otherwise).
-    # chain_u_scores:               per-hop U_i values used for
-    #                               U_chain = 1 - Π(U_i) at CT-8 / CT-11;
-    #                               empty list otherwise.
+    # chain_depth:                  number of hops in an agent chain
+    #                               (only meaningful for CT-8; 0 otherwise).
+    #                               CT-11 is NOT a chain context.
+    # chain_u_scores:               per-hop K_i values used for the
+    #                               CT-8 chain math (K_chain = Π(K_i),
+    #                               U_chain = 1 - K_chain). Kept under
+    #                               the legacy field name "chain_u_scores"
+    #                               for archive compatibility; values are
+    #                               K_i (positive calibration scores).
+    #                               Empty list for non-CT-8 connections.
     connection_type: Optional[str] = None
     connection_type_modifier_id: Optional[str] = None
     resolved_policy_profile_id: Optional[str] = None
     chain_depth: int = 0
     chain_u_scores: List[float] = field(default_factory=list)
+
+    # ---- Standards Composer audit (Slice 4) ---------------------------- #
+    # When the active policy profile was produced by the Standards
+    # Composer, this block carries the composer inputs verbatim so the
+    # TC self-documents which standards governed the decision. None when
+    # the profile is built-in (not composed). The fields are:
+    #   industry, sub_industry, use_case
+    #   standards                     list of standard ids (sorted)
+    #   risk_tier, action_class
+    #   composition_rules_version
+    #   composed_at                   ISO-8601 timestamp of composition
+    # The audit can reconstruct the full composition by looking up the
+    # standards library, the composition rules version, and the pack
+    # registry — but this block makes the standards trail visible on
+    # the certificate itself without requiring a join.
+    composer_metadata: Optional[Dict[str, Any]] = None
+
+    # ---- Governance Risk Rule audit (Slice 4.5) ------------------------ #
+    # Records every risk rule that matched the query during this
+    # evaluation. Each entry carries:
+    #   rule_id, rule_version, applies_to_domains, matched_domain,
+    #   matched_term_groups (group_index + matched_term per group),
+    #   effect (c3_violation, c3_category, blocking_reason,
+    #           decision_pressure, requires_human_review, penalties,
+    #           explanation),
+    #   active_policy_profile_id
+    # An empty list means the classifier ran but no rule matched. None
+    # means the classifier did not run (legacy path predating Slice 4.5
+    # or classifier failure). Rules are versioned so a future audit can
+    # tell exactly which definition of clinical_medication_dosing_pregnancy
+    # (or any other rule) was in effect when the TC was issued.
+    governance_rule_matches: Optional[List[Dict[str, Any]]] = None
 
     # ---- Trust Enforcement Layer (TCS-TEL-001 — TCS_SPEC.md §19) ------- #
     # Four new TC layers required for Phase 1 completion. The dataclass
@@ -477,7 +523,9 @@ class TrustCertificate:
             "gca_context_id": self.gca_context_id,
             "policy_set_id": self.policy_set_id,
 
-            # Score
+            # Score (white paper alignment — see TISResult docstring)
+            "s_base":          _r(self.s_base),
+            "s_adjusted":      _r(self.s_adjusted),
             "tis_raw":         _r(self.tis_raw),
             "tis_adjusted":    _r(self.tis_adjusted),
             "tis_current":     _r(self.tis_current),
@@ -544,6 +592,22 @@ class TrustCertificate:
             "resolved_policy_profile_id": self.resolved_policy_profile_id,
             "chain_depth": int(self.chain_depth),
             "chain_u_scores": [_r(v) for v in self.chain_u_scores],
+
+            # Standards Composer audit (Slice 4)
+            "composer_metadata": (
+                dict(self.composer_metadata) if self.composer_metadata else None
+            ),
+
+            # Governance Risk Rule audit (Slice 4.5).
+            # None means the classifier did not run for this evaluation.
+            # An empty list means it ran and no rule matched. A non-empty
+            # list carries one audit dict per triggered rule (see
+            # RuleMatch.to_audit_dict for shape).
+            "governance_rule_matches": (
+                [dict(m) for m in self.governance_rule_matches]
+                if self.governance_rule_matches is not None
+                else None
+            ),
 
             # Trust Enforcement Layer (TCS-TEL-001 §19)
             "identity_binding":   _layer_to_dict(self.identity_binding),
@@ -768,15 +832,15 @@ def _generate_explanation(
         )
     elif decision == "Stop":
         decision_fragment = (
-            f"Gate collapsed (G=0) and TIS_raw={_r(tis_result.tis_raw)} "
-            f"exceeds soft-hold ceiling kappa={_r(profile.soft_hold_ceiling)} "
-            f"-> Stop."
+            f"Gate collapsed (G=0) and S_base={_r(tis_result.s_base)} "
+            f"is below remediability floor kappa={_r(profile.soft_hold_ceiling)} "
+            f"-> Stop (too degraded to remediate)."
         )
     elif decision == "Hold":
         decision_fragment = (
-            f"Gate collapsed (G=0) but TIS_raw={_r(tis_result.tis_raw)} "
-            f"remains within soft-hold ceiling kappa="
-            f"{_r(profile.soft_hold_ceiling)} -> Hold (remediable)."
+            f"Gate collapsed (G=0) but S_base={_r(tis_result.s_base)} "
+            f"remains at or above remediability floor kappa="
+            f"{_r(profile.soft_hold_ceiling)} -> Hold (remediable through review)."
         )
     elif decision == "Escalate":
         decision_fragment = (
@@ -977,6 +1041,35 @@ def generate_certificate(
     chain_depth = int(meta.get("chain_depth", 0))
     chain_u_scores = [float(v) for v in meta.get("chain_u_scores", [])]
 
+    # ---- Standards Composer audit (Slice 4) ---------------------------- #
+    # If the active policy profile was produced by the Standards
+    # Composer, the route/GCA will have stashed its composer_metadata
+    # in context_metadata. Pass it through to the TC verbatim so the
+    # audit trail is self-contained.
+    cm_raw = meta.get("composer_metadata")
+    composer_metadata: Optional[Dict[str, Any]] = (
+        dict(cm_raw) if isinstance(cm_raw, dict) else None
+    )
+
+    # ---- Governance Risk Rule audit (Slice 4.5) ------------------------ #
+    # The GCA stashes one audit dict per triggered rule in
+    # context_metadata["governance_rule_matches"] (see
+    # governed_context._apply_query_risk_classification). The shape comes
+    # from RuleMatch.to_audit_dict() and already includes rule_version,
+    # matched_domain, matched_term_groups, effect (with c3_category), and
+    # active_policy_profile_id. We pass it through verbatim so the TC
+    # self-documents which deterministic rules fired and which version
+    # of each rule was in effect.
+    rule_matches_raw = meta.get("governance_rule_matches")
+    if rule_matches_raw is None:
+        governance_rule_matches: Optional[List[Dict[str, Any]]] = None
+    elif isinstance(rule_matches_raw, list):
+        governance_rule_matches = [
+            dict(m) for m in rule_matches_raw if isinstance(m, dict)
+        ]
+    else:
+        governance_rule_matches = None
+
     # ---- Trust Enforcement Layer (TCS-TEL-001 §19) --------------------- #
     # Phase-1 stubs for the four new layers. The stubs are "optimistic":
     # identity is authenticated at high confidence, governance is
@@ -1072,6 +1165,8 @@ def generate_certificate(
         policy_set_id=profile.profile_id,
 
         # Score
+        s_base=tis_result.s_base,
+        s_adjusted=tis_result.s_adj,
         tis_raw=tis_result.tis_raw,
         tis_adjusted=tis_result.tis_adj,
         tis_current=tis_result.tis_current,
@@ -1134,6 +1229,12 @@ def generate_certificate(
         resolved_policy_profile_id=resolved_policy_profile_id,
         chain_depth=chain_depth,
         chain_u_scores=chain_u_scores,
+
+        # Standards Composer audit (Slice 4)
+        composer_metadata=composer_metadata,
+
+        # Governance Risk Rule audit (Slice 4.5)
+        governance_rule_matches=governance_rule_matches,
 
         # Trust Enforcement Layer (TCS-TEL-001 §19)
         # audit_integrity is attached after construction so that its

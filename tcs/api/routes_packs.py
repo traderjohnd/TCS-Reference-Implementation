@@ -4,11 +4,11 @@ tcs.api.routes_packs
 
 Phase 3 Step 8 — Regulatory Pack API endpoints.
 
-GET  /v1/packs                  — list available packs
-GET  /v1/packs/active           — currently active pack
-GET  /v1/packs/{pack_id}        — pack detail
-POST /v1/packs/{pack_id}/deploy — deploy pack
-GET  /v1/packs/{pack_id}/export — audit export
+GET  /v2/packs                  — list available packs
+GET  /v2/packs/active           — currently active pack
+GET  /v2/packs/{pack_id}        — pack detail
+POST /v2/packs/{pack_id}/deploy — deploy pack
+GET  /v2/packs/{pack_id}/export — audit export
 """
 
 from __future__ import annotations

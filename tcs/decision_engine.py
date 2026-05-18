@@ -13,8 +13,8 @@ with its priority number and the spec rule it enforces.
 
     Priority 1:  is_valid == 0                                  -> Stop
     Priority 2:  gate == 0 and C3 == 0.00                       -> Stop
-    Priority 3:  gate == 0 and tis_raw > kappa                  -> Stop
-    Priority 4:  gate == 0 and tis_raw <= kappa                 -> Hold (gate path)
+    Priority 3:  gate == 0 and S_base <  kappa                  -> Stop
+    Priority 4:  gate == 0 and S_base >= kappa                  -> Hold (gate path)
     Priority 5:  gate == 1 and tis_current < theta_escalate     -> Escalate
     Priority 6:  gate == 1 and tis_current < theta_hold         -> Hold (score path)
     Priority 7:  gate == 1 and tis_current < theta_allow
@@ -23,6 +23,39 @@ with its priority number and the spec rule it enforces.
 
 This ordering is load-bearing. C-P.10 (TCS_SPEC.md §13) explicitly
 prohibits reordering the priority list.
+
+------------------------------------------------------------------------
+NAMING NOTE: S_base vs tis_raw (white paper alignment)
+------------------------------------------------------------------------
+
+Per the white paper:
+
+    S_base   = Σᵢ wᵢ · dimᵢ        (gate-independent weighted composite)
+    tis_raw  = gate * S_base        (gated, collapses to 0 on gate fail)
+
+The decision ladder's Priority 3/4 discriminator uses S_base, NOT
+tis_raw. tis_raw is unusable for the kappa comparison because it
+collapses to 0 whenever the gate fails.
+
+------------------------------------------------------------------------
+KAPPA SEMANTICS: REMEDIABILITY FLOOR
+------------------------------------------------------------------------
+
+kappa is a FLOOR, not a ceiling. The rule is:
+
+    S_base >= kappa  =>  baseline composite is strong enough that
+                         a gate failure is remediable through human
+                         review -> HOLD.
+
+    S_base <  kappa  =>  baseline composite is too degraded; output
+                         is not worth reviewing -> STOP.
+
+This is the white paper's argument: high baseline + specific gate
+failure = a fixable issue worth human attention; low baseline +
+gate failure = too far gone.
+
+The two corresponding regression tests in test_compound_trust.py
+(TestDecisionLadderSBaseDiscriminator) pin this behavior.
 
 -------------------------------------------------------------------------
 SEMANTIC DISTINCTION — Hold vs Escalate vs Observe
@@ -200,7 +233,7 @@ def map_decision(
     profile = tis_input.policy_profile
 
     tis_current = tis_result.tis_current
-    tis_raw     = tis_result.tis_raw
+    s_base      = tis_result.s_base
     gate        = tis_result.gate_result
     c3_score    = tis_result.C3_score
     is_valid    = tis_result.is_valid
@@ -215,7 +248,7 @@ def map_decision(
         is_valid=is_valid,
         gate=gate,
         c3_score=c3_score,
-        tis_raw=tis_raw,
+        s_base=s_base,
         tis_current=tis_current,
         kappa=kappa,
         theta_allow=theta_allow,
@@ -316,7 +349,7 @@ def _apply_priority_ladder(
     is_valid: int,
     gate: int,
     c3_score: float,
-    tis_raw: float,
+    s_base: float,
     tis_current: float,
     kappa: float,
     theta_allow: float,
@@ -326,6 +359,18 @@ def _apply_priority_ladder(
 ) -> str:
     """
     Walk the decision priority ladder from TCS_SPEC.md §12.
+
+    kappa is a REMEDIABILITY FLOOR (white paper alignment):
+        - S_base >= kappa  => the gate-independent composite is strong
+                              enough that a gate failure is plausibly
+                              remediable by human review -> HOLD.
+        - S_base <  kappa  => the composite is too degraded to bother
+                              reviewing -> STOP.
+
+    The discriminator is ``s_base`` (the gate-independent composite),
+    NOT ``tis_raw`` — under the white paper's definition tis_raw =
+    gate * s_base, which collapses to 0 on gate failure and would
+    make Priority 3/4 unable to distinguish HOLD from STOP.
 
     All arguments are keyword-only so the caller cannot accidentally swap
     positional arguments (a subtle but dangerous bug class for a file this
@@ -340,20 +385,20 @@ def _apply_priority_ladder(
 
     # ----- Priority 2: Hard safety violation (C3 = 0.00) ----------------- #
     # C-P.8: the soft-hold ceiling kappa does NOT apply when C3 = 0.00.
-    # This is the only condition that can produce Stop with a sub-kappa
-    # TIS_raw when the gate has collapsed.
+    # Hard Stop regardless of s_base magnitude.
     if gate == 0 and c3_score == 0.00:
         return "Stop"
 
-    # ----- Priority 3: Gate failure above soft-hold ceiling -------------- #
-    # Gate collapsed and the pre-penalty composite is too high to rehabilitate.
-    if gate == 0 and tis_raw > kappa:
+    # ----- Priority 3: Gate failure below remediability floor ------------ #
+    # Gate collapsed AND the gate-independent composite is too degraded
+    # to warrant human review. Stop.
+    if gate == 0 and s_base < kappa:
         return "Stop"
 
-    # ----- Priority 4: Gate failure within soft-hold ceiling ------------- #
-    # Gate path Hold: a specific fixable gap (missing attribution, stale
-    # context, etc.). Routed to process remediation, not human review.
-    if gate == 0 and tis_raw <= kappa:
+    # ----- Priority 4: Gate failure at or above remediability floor ------ #
+    # Gate failed but the baseline composite is high enough that a
+    # human-review remediation is the right outcome. Hold.
+    if gate == 0 and s_base >= kappa:
         return "Hold"
 
     # ----- Priority 5: Below escalate threshold -------------------------- #
@@ -396,7 +441,7 @@ def _apply_priority_ladder(
     raise ValueError(
         "Decision logic exhausted without resolution. "
         f"gate={gate} is_valid={is_valid} c3={c3_score} "
-        f"tis_raw={tis_raw} tis_current={tis_current} "
+        f"s_base={s_base} tis_current={tis_current} "
         f"kappa={kappa} theta_allow={theta_allow} theta_hold={theta_hold} "
         f"theta_escalate={theta_escalate} risk_tier={risk_tier}"
     )

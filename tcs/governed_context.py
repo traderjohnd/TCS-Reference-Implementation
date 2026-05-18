@@ -718,9 +718,13 @@ class ResolvedTISProfile:
         connection_type         — "CT-1".."CT-13" identifier
         modifier_id             — versioned CT modifier set ID
         resolved_profile_id     — composite audit ID for the TC
-        use_chain_uncertainty   — True for CT-8 / CT-11
-        chain_depth             — hops in agent/AI chain (default 0)
-        chain_u_scores          — per-hop U_i list (default [])
+        use_chain_uncertainty   — True for CT-8 only (agent chains)
+        chain_depth             — hops in the agent chain (default 0)
+        chain_u_scores          — per-hop K_i list, kept under the name
+                                   ``chain_u_scores`` for backward compat
+                                   with archived TCs. New code reading
+                                   this field should treat the values
+                                   as K_i (positive calibration scores).
         base_profile_id         — original base profile id for audit
         domain / risk_tier / action_class / invalidation_triggers /
         regulatory_mapping / profile_id — straight passthroughs
@@ -794,9 +798,16 @@ def resolve_policy_profile(
     The resolved profile preserves every non-weight field from the
     base profile. Weights are modified by ``CT_WEIGHT_MODIFIERS[ct]``
     entry-wise, and the Sigma=1.0 invariant is validated before
-    returning. CT-8 and CT-11 additionally set
-    ``use_chain_uncertainty=True`` and carry the provided
+    returning. CT-8 (agent chain) additionally sets
+    ``use_chain_uncertainty=True`` and carries the provided
     ``chain_u_scores``.
+
+    CT-11 (AI-generated attribution) does NOT trigger chain
+    uncertainty. It is its own connection type with its own weight
+    modifier vector. If AI-generated content appears inside an agent
+    chain workflow, the workflow graph captures both the CT-8 chain
+    context and the per-hop CT-11 nodes — the chain math belongs to
+    the CT-8 context, not to CT-11 as a standalone connection type.
 
     Parameters
     ----------
@@ -805,8 +816,8 @@ def resolve_policy_profile(
     connection_type
         One of "CT-1".."CT-13" (or "CT-12" to trigger stop).
     chain_u_scores
-        Per-hop uncertainty scores for CT-8 / CT-11 chains. Ignored
-        for other connection types.
+        Per-hop K_i calibration scores for CT-8 agent chains. Ignored
+        for all other connection types, including CT-11.
 
     Raises
     ------
@@ -846,8 +857,14 @@ def resolve_policy_profile(
         f"{base_profile.profile_id}::{connection_type}::{CT_MODIFIER_ID}"
     )
 
-    use_chain = connection_type in ("CT-8", "CT-11")
-    chain_scores = list(chain_u_scores or [])
+    # CT-8 (agent chain) is the ONLY connection type that triggers the
+    # chain uncertainty formula. CT-11 (AI-generated attribution) is its
+    # own connection type with its own weight modifier — it does not
+    # automatically inherit chain math. This aligns with the BACK model
+    # in the whitepaper, where U_chain is a derived uncertainty quantity
+    # belonging to the CT-8 agent-chain context.
+    use_chain = connection_type == "CT-8"
+    chain_scores = list(chain_u_scores or []) if use_chain else []
 
     resolved = ResolvedTISProfile(
         profile_id=base_profile.profile_id,
@@ -882,11 +899,19 @@ def resolve_policy_profile(
 
 def compute_chain_uncertainty(u_scores: List[float]) -> float:
     """
-    Chain uncertainty formula for CT-8 and CT-11 (TCS_SPEC.md §18).
+    Chain uncertainty formula for CT-8 agent chains (TCS_SPEC.md §18).
 
-        U_chain = 1 - prod(U_i)
+    Note: this is the BACK-aligned formulation. Inputs are K_i (per-hop
+    Known/calibration scores; higher = better), kept under the legacy
+    parameter name ``u_scores`` for backward compatibility. The returned
+    value ``U_chain`` is a derived uncertainty quantity. Callers that
+    feed the TIS engine should convert back to K_chain = 1 - U_chain
+    before scoring; U_chain itself is never a primary dimension.
 
-    Treats each U_i as a per-hop reliability score; chain reliability
+        K_chain = prod(K_i)
+        U_chain = 1 - K_chain
+
+    Treats each K_i as a per-hop reliability score; chain reliability
     is the product; chain uncertainty is 1 minus that.
 
     Returns 0.0 on an empty list (no chain = no chain uncertainty).
@@ -1023,6 +1048,26 @@ def assemble_context_v2(
     ctx["injection_reason"] = injection_report["injection_reason"]
     ctx["sensitivity_tier"] = sensitivity_tier
 
+    # Governance risk classifier — runs against the user prompt under
+    # the active domain. Applies C3 / penalty effects to ctx so the
+    # legacy path produces the same governance signals as the trace
+    # path. Without this, legacy callers would miss rule-based C3
+    # detections (e.g. medication+dosing+pregnancy) that the trace
+    # path catches.
+    _query_for_rules = ""
+    for _key in ("prompt", "user_query", "free_text"):
+        v = meta_in.get(_key)
+        if isinstance(v, str) and v.strip():
+            _query_for_rules = v
+            break
+    _apply_query_risk_classification(
+        query_text=_query_for_rules,
+        domain_hint=getattr(base_profile, "domain", None),
+        ctx_meta=ctx,
+        dimension_scores=None,  # legacy path doesn't have dim scores at this stage
+        active_policy_profile_id=getattr(base_profile, "profile_id", None),
+    )
+
     # Connection-type audit trail for the TC
     ctx["connection_type"] = connection_type
     ctx["connection_type_modifier_id"] = resolved.modifier_id
@@ -1058,3 +1103,466 @@ def assemble_context_v2(
 
     return ctx, resolved
 
+
+# --------------------------------------------------------------------------- #
+# Phase 4 — assemble_context_from_trace                                        #
+# --------------------------------------------------------------------------- #
+#
+# This is the GCA entry point for the workflow-graph path. It walks a
+# GovernedWorkflowTrace, aggregates the BACK signals each connector
+# emitted, resolves the dominant connection type against the base
+# policy profile, and produces a fully-populated TISInput the engine
+# can score directly.
+#
+# Critical invariant: the TIS engine still sees only a TISInput. It
+# does not import or understand traces, events, or connectors. The
+# workflow layer is purely additive — it produces the same shape the
+# engine has always consumed.
+
+def _apply_query_risk_classification(
+    *,
+    query_text: str,
+    domain_hint: Optional[str],
+    ctx_meta: Dict[str, Any],
+    dimension_scores: Optional[Dict[str, float]] = None,
+    active_policy_profile_id: Optional[str] = None,
+) -> List[Any]:
+    """
+    Run the governance risk classifier and apply its merged effect to
+    ctx_meta (always) and dimension_scores (when provided).
+
+    Used by BOTH the legacy ``assemble_context_v2`` path (which has
+    no dimension_scores at this stage) and the trace path's
+    ``assemble_context_from_trace`` (which does).
+
+    Records full per-match audit evidence in
+    ``ctx_meta["governance_rule_matches"]`` so the Trust Certificate
+    can persist it. Each match carries:
+
+        rule_id, rule_version, applies_to_domains, matched_domain,
+        matched_term_groups (with group_index + matched_term),
+        effect (c3_violation, c3_category, blocking_reason,
+        decision_pressure, requires_human_review, penalties,
+        explanation), active_policy_profile_id
+
+    Failure is non-fatal — risk classification is additive; if the
+    classifier crashes, the connector signals and other GCA steps
+    still drive the decision.
+    """
+    rule_matches: List[Any] = []
+    try:
+        from tcs.governance import (
+            classify_query_risk, merge_effects, SCENARIO_RULES,
+        )
+    except Exception:
+        return rule_matches
+    if not query_text:
+        ctx_meta["governance_rule_matches"] = []
+        return rule_matches
+
+    try:
+        rule_matches = list(classify_query_risk(
+            query=query_text, domain=domain_hint, rules=list(SCENARIO_RULES),
+        ))
+    except Exception:
+        return rule_matches
+
+    if rule_matches:
+        agg = merge_effects(rule_matches)
+        # C3 from a rule force-collapses BOTH the C dimension AND the
+        # c3_score sub-factor input. The decision ladder's Priority 2
+        # hard stop reads c3_score_computed; without setting both,
+        # only the C gate would fail (Priority 3/4 path), missing the
+        # hard-stop semantics the rule intended.
+        #
+        # The blocking_reason is prefixed with the primary safety
+        # category so audit records explicitly name the guardrail
+        # class that fired (prohibited_action, prohibited_content,
+        # prompt_injection_pattern, credential_pattern,
+        # unauthorized_scope, safety_envelope_violation).
+        if agg.c3_violation:
+            ctx_meta["c3_score_computed"] = 0.0
+            ctx_meta["injection_detected"] = True
+            cat = agg.primary_safety_category or "prohibited_action"
+            reason_tail = agg.blocking_reason or "governance_rule_c3_violation"
+            ctx_meta["injection_reason"] = f"{cat}:{reason_tail}"
+            # New authoritative fields.
+            ctx_meta["governance_safety_categories"] = list(agg.safety_categories)
+            ctx_meta["governance_primary_safety_category"] = cat
+            # Legacy fields — kept for back-compat with anything still
+            # reading them (dashboard widgets, older tests). The new
+            # code path prefers governance_primary_safety_category.
+            ctx_meta["governance_c3_categories"] = list(agg.c3_categories)
+            ctx_meta["governance_c3_primary_category"] = agg.primary_c3_category
+            if dimension_scores is not None:
+                dimension_scores["C"] = 0.0
+        # Numeric penalties subtract from corresponding dim scores
+        # (only when dimension_scores were provided — legacy path
+        # doesn't have them at this stage).
+        if dimension_scores is not None:
+            if agg.boundedness_penalty:
+                dimension_scores["B"] = round(
+                    max(0.0, dimension_scores.get("B", 1.0) - agg.boundedness_penalty), 4
+                )
+            if agg.attribution_penalty:
+                dimension_scores["A"] = round(
+                    max(0.0, dimension_scores.get("A", 1.0) - agg.attribution_penalty), 4
+                )
+            if agg.known_calibration_penalty:
+                dimension_scores["K"] = round(
+                    max(0.0, dimension_scores.get("K", 1.0) - agg.known_calibration_penalty), 4
+                )
+        # Novelty + audit fields always go on ctx_meta.
+        if agg.novelty_lift:
+            ctx_meta["novelty_score"] = round(
+                min(1.0, float(ctx_meta.get("novelty_score", 0.0)) + agg.novelty_lift), 4
+            )
+        if agg.blocking_reason:
+            # blocking_context drives the TC's blocking_reason via
+            # _derive_blocking_reason. Prefix it with the primary
+            # safety category so the TC reads, e.g.,
+            # "prohibited_action:consumer_facing_dosing_during_pregnancy".
+            cat = agg.primary_safety_category
+            ctx_meta["blocking_context"] = (
+                f"{cat}:{agg.blocking_reason}" if cat else agg.blocking_reason
+            )
+            ctx_meta["governance_rule_blocking_reason"] = agg.blocking_reason
+        if agg.requires_human_review:
+            ctx_meta["governance_rule_requires_human_review"] = True
+        if agg.decision_pressure:
+            ctx_meta["governance_rule_decision_pressure"] = agg.decision_pressure
+        if agg.explanation:
+            ctx_meta["governance_rule_explanation"] = agg.explanation
+        # Three-class control summary fields. The decision engine still
+        # arbitrates the final outcome via the existing ladder; these
+        # are audit signals describing which class of guardrail fired.
+        ctx_meta["governance_primary_control_class"] = agg.primary_control_class
+        if agg.override_policy:
+            ctx_meta["governance_override_policy"] = agg.override_policy
+
+    # Full per-match audit records, persisted to the TC. Each entry
+    # carries rule_id + rule_version + matched_domain +
+    # matched_term_groups + effect + active_policy_profile_id so the
+    # decision is fully reproducible from the TC alone.
+    ctx_meta["governance_rule_matches"] = [
+        {
+            **m.to_audit_dict(),
+            "active_policy_profile_id": active_policy_profile_id,
+        }
+        for m in rule_matches
+    ]
+    return rule_matches
+
+
+def _select_dominant_connection_type(events: List[Any]) -> str:
+    """
+    Pick the single connection_type that drives policy resolution.
+
+    Priority (first match wins):
+        1. Any CT-8 event             -> CT-8 (agent chain dominates)
+        2. Any CT-4 event             -> CT-4 (RAG attribution is load-bearing)
+        3. First event's CT           -> that CT
+        4. No events                  -> CT-1 (safe API default)
+
+    This selection is deliberate: in a mixed LLM+RAG workflow, CT-4
+    wins because the attribution risk introduced by retrieval is
+    what the policy needs to govern. In a future agent-chain workflow,
+    CT-8 wins over both because the chain math is the dominant signal.
+
+    Marker events (connector_type "marker.tis_evaluation") are
+    excluded — they exist only to record the eval boundary and do
+    not represent a real upstream connection.
+    """
+    cts: List[str] = []
+    for e in events:
+        ct = getattr(e, "connection_type", None)
+        connector_type = getattr(e, "connector_type", "") or ""
+        if not ct:
+            continue
+        if connector_type.startswith("marker."):
+            continue
+        cts.append(ct)
+    if not cts:
+        return "CT-1"
+    if "CT-8" in cts:
+        return "CT-8"
+    if "CT-4" in cts:
+        return "CT-4"
+    return cts[0]
+
+
+def _detect_post_eval_invalidation(trace: Any) -> Optional[str]:
+    """
+    Check whether any post-marker node carries invalidation evidence.
+
+    Returns the invalidation event name to apply, or None if no
+    invalidation is required. Currently detects:
+
+        - context_expansion: MCP connector emitted post-marker
+          with connector_metadata['context_expansion']=True. Per
+          C-R.14, post-evaluation retrieval expanding governed
+          context invalidates the workflow's TC.
+
+    The orchestrator runs all nodes (pre and post marker) before
+    the GCA assembles. This function is what enforces the C-R.14
+    semantics on the declared post-marker portion of the trace.
+    """
+    nodes = getattr(trace, "nodes", [])
+    after_marker = False
+    for node in nodes:
+        node_type = getattr(node, "node_type", None)
+        node_type_value = getattr(node_type, "value", None) or str(node_type)
+        if node_type_value == "tis_evaluation_marker":
+            after_marker = True
+            continue
+        if not after_marker:
+            continue
+        event = getattr(node, "event", None)
+        if event is None:
+            continue
+        meta = getattr(event, "connector_metadata", None) or {}
+        if meta.get("context_expansion"):
+            return "context_expansion"
+    return None
+
+
+def _aggregate_back_scores(events: List[Any]) -> Dict[str, float]:
+    """
+    Combine per-event BACK signals into the four dimension scores.
+
+    Each signal's ``score_contribution`` is a positive calibration
+    value in [0, 1]. The aggregate is the minimum across events:
+    one weak signal pulls the dimension down. This is conservative
+    and matches the spirit of TIS as a *guard*, not an average.
+
+    A C3 violation in any event forces C to 0.0 (the gate-collapsing
+    signal — propagates the C3=0 hard stop through to the engine).
+    """
+    if not events:
+        return {"B": 1.0, "A": 1.0, "C": 1.0, "K": 1.0}
+
+    b_scores: List[float] = []
+    a_scores: List[float] = []
+    c_scores: List[float] = []
+    k_scores: List[float] = []
+    c3_violation = False
+
+    for ev in events:
+        b_scores.append(float(ev.boundedness.score_contribution))
+        a_scores.append(float(ev.attribution.score_contribution))
+        c_scores.append(float(ev.compliance.score_contribution))
+        k_scores.append(float(ev.known.score_contribution))
+        if ev.compliance.c3_violation:
+            c3_violation = True
+
+    b = round(min(b_scores), 4)
+    a = round(min(a_scores), 4)
+    c = 0.0 if c3_violation else round(min(c_scores), 4)
+    k = round(min(k_scores), 4)
+    return {"B": b, "A": a, "C": c, "K": k}
+
+
+def _aggregate_context_metadata(events: List[Any]) -> Dict[str, Any]:
+    """
+    Build context_metadata penalty inputs from event signals.
+
+    Maps:
+        - n_gaps                 = sum of integration_boundary_gaps
+        - novelty_score          = max novelty_score across events
+        - injection_detected     = any compliance.c3_violation
+        - c3_score_computed      = 0.0 if any C3 violation else 1.0
+        - context_age_hours      = 0.1 (fresh — trace just executed)
+        - days_since_review      = 1
+        - is_policy_sensitive    = False (caller may override)
+    """
+    n_gaps = 0
+    novelty = 0.0
+    injection_detected = False
+    injection_reason: Optional[str] = None
+    for ev in events:
+        n_gaps += int(getattr(ev.attribution, "integration_boundary_gaps", 0) or 0)
+        novelty = max(novelty, float(getattr(ev.known, "novelty_score", 0.0) or 0.0))
+        if ev.compliance.c3_violation:
+            injection_detected = True
+            injection_reason = injection_reason or ev.compliance.c3_pattern
+
+    return {
+        "n_gaps": n_gaps,
+        "novelty_score": round(novelty, 4),
+        "context_age_hours": 0.1,
+        "days_since_review": 1,
+        "is_policy_sensitive": False,
+        "injection_detected": injection_detected,
+        "injection_reason": injection_reason,
+        "c3_score_computed": 0.0 if injection_detected else 1.0,
+    }
+
+
+def assemble_context_from_trace(
+    trace: Any,
+    *,
+    base_profile: Optional[PolicyProfile] = None,
+    base_profile_id: Optional[str] = None,
+    captured_at: Optional[datetime] = None,
+) -> Tuple[Any, ResolvedTISProfile]:
+    """
+    Walk a GovernedWorkflowTrace and produce a (TISInput, ResolvedTISProfile).
+
+    This is the Phase 4 GCA entry point. The trace carries the
+    full evidence record from every connector that ran; this
+    function compiles that evidence into the TISInput shape the
+    Phase 1 engine consumes.
+
+    The TIS engine remains pure: it sees a TISInput, scores it, and
+    returns a TISResult. It does not know workflows exist.
+
+    Parameters
+    ----------
+    trace
+        A fully-executed GovernedWorkflowTrace with attached events.
+    base_profile / base_profile_id
+        The policy profile to govern this workflow under. Same
+        contract as ``assemble_context_v2``.
+    captured_at
+        Assembly timestamp (default: now UTC).
+
+    Returns
+    -------
+    (TISInput, ResolvedTISProfile)
+        The TISInput is ready for ``tis_engine.compute_tis(...)``.
+        The ResolvedTISProfile carries the CT-modified weights and
+        chain audit fields (chain_depth, chain_u_scores) for CT-8.
+    """
+    # Lazy imports to avoid circular dependency at module load.
+    from tcs.tis_engine import TISInput
+
+    if base_profile is None:
+        if base_profile_id is None:
+            base_profile_id = getattr(trace, "base_profile_id", None)
+        if base_profile_id is None:
+            raise ValueError(
+                "assemble_context_from_trace requires a base_profile "
+                "or base_profile_id (either argument or trace.base_profile_id)."
+            )
+        base_profile = load_profile(base_profile_id)
+
+    events = list(trace.events())
+
+    # 1. Dominant connection type for policy resolution.
+    connection_type = _select_dominant_connection_type(events)
+
+    # 2. Aggregate BACK scores from event signals.
+    dimension_scores = _aggregate_back_scores(events)
+
+    # 3. Build penalty-input context_metadata from event signals.
+    ctx_meta = _aggregate_context_metadata(events)
+
+    # 3a. Governance risk classification (Slice 4.5).
+    # Inspects the user query against deterministic, domain-scoped
+    # term-group rules and applies the merged effect to
+    # dimension_scores / ctx_meta. This is a policy-trigger layer, not
+    # semantic understanding: rules emit C3 violations, review flags,
+    # and BACK penalties when their configured term groups all match.
+    # Governance outcomes come from matched rule patterns, not from
+    # canned LLM response text. Variant phrasings that use the
+    # configured vocabularies produce the same effect.
+    meta_obj = getattr(trace, "metadata", None) or {}
+    query_text = ""
+    if isinstance(meta_obj, dict):
+        query_text = str(meta_obj.get("query") or "")
+    domain_hint = (
+        getattr(base_profile, "domain", None)
+        or (meta_obj.get("industry") if isinstance(meta_obj, dict) else None)
+    )
+    _apply_query_risk_classification(
+        query_text=query_text,
+        domain_hint=domain_hint,
+        ctx_meta=ctx_meta,
+        dimension_scores=dimension_scores,
+        active_policy_profile_id=getattr(base_profile, "profile_id", None),
+    )
+
+    # 4. CT-8 chain handling. CT-11 is NOT chained (BACK migration).
+    chain_k_scores: List[float] = []
+    if connection_type == "CT-8":
+        for ev in events:
+            csk = getattr(ev.known, "chain_k_scores", None)
+            if csk:
+                chain_k_scores = list(csk)
+                break
+
+    # 5. Resolve the policy profile against the CT (CT modifiers applied).
+    # Note: resolve_policy_profile's chain_u_scores parameter is kept under
+    # the legacy field name for archive backward compatibility; the values
+    # we pass are K_i positive calibration scores.
+    resolved = resolve_policy_profile(
+        base_profile,
+        connection_type,
+        chain_u_scores=chain_k_scores if connection_type == "CT-8" else None,
+    )
+
+    # 6. If CT-8 chain, override the K dimension with K_chain = prod(K_i).
+    #    The derived U_chain = 1 - K_chain is not a primary dimension; it
+    #    surfaces only as audit metadata.
+    if connection_type == "CT-8" and chain_k_scores:
+        u_chain = compute_chain_uncertainty(chain_k_scores)
+        k_chain = round(1.0 - u_chain, 4)
+        dimension_scores["K"] = k_chain
+        ctx_meta["chain_depth"] = len(chain_k_scores)
+        ctx_meta["chain_u_scores"] = chain_k_scores  # legacy field name; values are K_i
+        ctx_meta["k_chain"] = k_chain
+        ctx_meta["u_chain_derived"] = round(u_chain, 4)
+
+    # 7. CT audit trail in context_metadata.
+    ctx_meta["connection_type"] = connection_type
+    ctx_meta["connection_type_modifier_id"] = resolved.modifier_id
+    ctx_meta["resolved_policy_profile_id"] = resolved.resolved_profile_id
+
+    # 8. Sub-factor scores: lift C3 into the canonical sub_factor shape so
+    #    the engine's failing_dimension_subfactors extraction works.
+    sub_factor_scores: Dict[str, Dict[str, float]] = {
+        "C": {"C3": float(ctx_meta["c3_score_computed"])}
+    }
+
+    # 9. Freeze the context (C-R.14) and add GCA snapshot ID.
+    frozen_at = captured_at or datetime.now(timezone.utc)
+    ctx_meta = freeze_context(ctx_meta, frozen_at=frozen_at)
+    ctx_meta["captured_at"] = frozen_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ctx_meta.setdefault("gca_snapshot_id", f"gca-{uuid.uuid4().hex[:12]}")
+
+    # 10. Trace audit fields for the TC.
+    ctx_meta["workflow_id"] = getattr(trace, "workflow_id", None)
+    ctx_meta["workflow_schema_version"] = getattr(trace, "schema_version", None)
+    ctx_meta["workflow_event_count"] = len(events)
+
+    # 11. Post-eval invalidation check (C-R.14). If a TIS evaluation
+    #     marker is present and any post-marker node emitted context-
+    #     expansion evidence, the workflow's TC is invalid before it
+    #     is even computed. The engine's invalidation path then forces
+    #     TIS_current = 0, decision = Stop, lifecycle = invalidated.
+    #     Operationally: delivery blocked, re-evaluation required.
+    invalidation_event = _detect_post_eval_invalidation(trace)
+    is_valid = 0 if invalidation_event else 1
+    if invalidation_event:
+        ctx_meta["invalidation_event"] = invalidation_event
+        ctx_meta["context_expanded_after_evaluation"] = (
+            invalidation_event == "context_expansion"
+        )
+
+    # 12. Build the TISInput. subject_id defaults to the workflow_id so
+    #     every workflow execution gets a stable subject. Callers that
+    #     want a different subject_id should set it on the returned TC.
+    tis_input = TISInput(
+        subject_id=getattr(trace, "workflow_id", "unknown-workflow"),
+        subject_type="governed_workflow",
+        policy_profile=resolved,
+        dimension_scores=dimension_scores,
+        sub_factor_scores=sub_factor_scores,
+        context_metadata=ctx_meta,
+        elapsed_hours=0.0,
+        is_valid=is_valid,
+        invalidation_event=invalidation_event,
+        evaluation_time=frozen_at,
+    )
+
+    return tis_input, resolved

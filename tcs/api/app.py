@@ -12,7 +12,7 @@ App state carries three objects the routes read:
 
     app.state.store          — CertificateStore (persistence)
     app.state.interceptor    — RequestInterceptor (runtime pipeline)
-    app.state.start_time     — datetime for /v1/health uptime
+    app.state.start_time     — datetime for /v2/health uptime
 
 Dependency injection for routes uses a simple ``Depends`` pattern that
 reads from ``request.app.state``. This keeps the routes testable
@@ -44,15 +44,19 @@ from tcs.api.routes_pll import router as pll_router
 from tcs.api.routes_recovery import router as recovery_router
 from tcs.api.routes_simulation import router as simulation_router
 from tcs.api.routes_packs import router as packs_router
+from tcs.api.routes_standards import router as standards_router
 from tcs.api.routes_admin import router as admin_router
 from tcs.api.routes_auth import router as auth_router
+from tcs.api.routes_query import router as query_router
+from tcs.api.routes_connections import router as connections_router
+from tcs.api.routes_archive import router as archive_router
 
 
-#: Version surfaced via /v1/health. Bumped when the API contract or
+#: Version surfaced via /v2/health. Bumped when the API contract or
 #: canonical policy profiles change.
 API_VERSION = "0.2.0"
 
-#: Policy set version surfaced via /v1/health. Matches the composite
+#: Policy set version surfaced via /v2/health. Matches the composite
 #: identifier emitted by governed_context.CT_MODIFIER_ID.
 POLICY_VERSION = "ct-modifiers-v1-2026-04"
 
@@ -78,13 +82,19 @@ def create_app(
     -------
     FastAPI
         Application with three routers mounted:
-            * /v1/govern         (routes_govern)
-            * /v1/certificates   (routes_certificates)
-            * /v1/metrics, /v1/health (routes_metrics)
+            * /v2/govern         (routes_govern)
+            * /v2/certificates   (routes_certificates)
+            * /v2/metrics, /v2/health (routes_metrics)
     """
     owns_store = False
     if store is None:
-        store = CertificateStore()
+        backend = os.environ.get("TCS_DB_BACKEND", "sqlite").lower()
+        if backend == "postgres":
+            from tcs.persistence.pg_store import PostgresCertificateStore
+            store = PostgresCertificateStore()
+            store.run_migrations()
+        else:
+            store = CertificateStore()
         owns_store = True
 
     if interceptor is None:
@@ -144,9 +154,9 @@ def create_app(
             path = request.url.path
             if path in ("/docs", "/openapi.json", "/redoc"):
                 return await call_next(request)
-            if path.startswith("/v1/auth/"):
+            if path.startswith("/v2/auth/"):
                 return await call_next(request)
-            if path.startswith("/assets/") or not path.startswith("/v1/"):
+            if path.startswith("/assets/") or not path.startswith("/v2/"):
                 return await call_next(request)
 
             from tcs.identity.session import get_session
@@ -173,16 +183,20 @@ def create_app(
     app.add_middleware(RBACMiddleware)
 
     # Mount routers
-    app.include_router(govern_router, prefix="/v1", tags=["govern"])
-    app.include_router(certificates_router, prefix="/v1", tags=["certificates"])
-    app.include_router(metrics_router, prefix="/v1", tags=["metrics"])
-    app.include_router(dynamics_router, prefix="/v1", tags=["dynamics"])
-    app.include_router(pll_router, prefix="/v1", tags=["pll"])
-    app.include_router(recovery_router, prefix="/v1", tags=["recovery"])
-    app.include_router(simulation_router, prefix="/v1", tags=["simulation"])
-    app.include_router(packs_router, prefix="/v1", tags=["packs"])
-    app.include_router(admin_router, prefix="/v1", tags=["admin"])
-    app.include_router(auth_router, prefix="/v1", tags=["auth"])
+    app.include_router(govern_router, prefix="/v2", tags=["govern"])
+    app.include_router(certificates_router, prefix="/v2", tags=["certificates"])
+    app.include_router(metrics_router, prefix="/v2", tags=["metrics"])
+    app.include_router(dynamics_router, prefix="/v2", tags=["dynamics"])
+    app.include_router(pll_router, prefix="/v2", tags=["pll"])
+    app.include_router(recovery_router, prefix="/v2", tags=["recovery"])
+    app.include_router(simulation_router, prefix="/v2", tags=["simulation"])
+    app.include_router(packs_router, prefix="/v2", tags=["packs"])
+    app.include_router(standards_router, prefix="/v2", tags=["standards"])
+    app.include_router(admin_router, prefix="/v2", tags=["admin"])
+    app.include_router(auth_router, prefix="/v2", tags=["auth"])
+    app.include_router(query_router, prefix="/v2", tags=["query"])
+    app.include_router(connections_router, prefix="/v2", tags=["connections"])
+    app.include_router(archive_router, prefix="/v2", tags=["archives"])
 
     # --- Static file serving for frontend build output ------------------- #
     _frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"

@@ -118,7 +118,9 @@ class TestLifecycleState:
         assert tc.lifecycle_state == "admissible"
 
     def test_hold_maps_to_computed(self):
-        tc, _, _ = _make_tc({"B": 0.94, "A": 0.76, "C": 0.92, "K": 0.88})
+        # Inputs chosen so gate fails (A<0.90) but S_base >= kappa=0.90 -> HOLD
+        # under paper-aligned ladder (kappa as remediability floor).
+        tc, _, _ = _make_tc({"B": 1.00, "A": 0.62, "C": 1.00, "K": 1.00})
         assert tc.decision == "Hold"
         assert tc.lifecycle_state == "computed"
 

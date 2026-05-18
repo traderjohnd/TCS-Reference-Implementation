@@ -4,11 +4,11 @@ tcs.api.routes_pll
 
 Phase 3 Step 4 — Policy Learning Layer API endpoints.
 
-GET  /v1/dynamics/pll/recommendations
-POST /v1/dynamics/pll/approve/{record_id}
-POST /v1/dynamics/pll/reject/{record_id}
-POST /v1/dynamics/pll/rollback/{record_id}
-GET  /v1/dynamics/pll/history
+GET  /v2/dynamics/pll/recommendations
+POST /v2/dynamics/pll/approve/{record_id}
+POST /v2/dynamics/pll/reject/{record_id}
+POST /v2/dynamics/pll/rollback/{record_id}
+GET  /v2/dynamics/pll/history
 """
 
 from __future__ import annotations

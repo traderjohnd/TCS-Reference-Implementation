@@ -79,13 +79,15 @@ class TestScenarioDecisions:
 
     def test_02_aggregation_t2_t2_t3(self, all_results):
         r = all_results[1]
-        assert r.response.decision == "Hold"
+        # Paper-aligned ladder: gate=0 + S_base < kappa -> Stop.
+        assert r.response.decision == "Stop"
         assert r.response.blocked is True
         assert r.matched_expectation is True
 
     def test_03_missing_clinical_provenance(self, all_results):
         r = all_results[2]
-        assert r.response.decision == "Hold"
+        # Paper-aligned ladder: gate=0 + S_base < kappa -> Stop.
+        assert r.response.decision == "Stop"
         assert r.response.blocked is True
         assert r.matched_expectation is True
 
@@ -103,7 +105,8 @@ class TestScenarioDecisions:
 
     def test_06_low_confidence_differential(self, all_results):
         r = all_results[5]
-        assert r.response.decision == "Hold"
+        # Paper-aligned ladder: gate=0 + S_base < kappa -> Stop.
+        assert r.response.decision == "Stop"
         assert r.response.blocked is True
         assert r.matched_expectation is True
 

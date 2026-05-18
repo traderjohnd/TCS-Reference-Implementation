@@ -4,10 +4,10 @@ tcs.api.routes_recovery
 
 Phase 3 Step 5 — Recovery Orchestrator API endpoints.
 
-GET  /v1/dynamics/recovery/status
-POST /v1/dynamics/recovery/activate
-POST /v1/dynamics/recovery/advance-phase
-GET  /v1/dynamics/recovery/history
+GET  /v2/dynamics/recovery/status
+POST /v2/dynamics/recovery/activate
+POST /v2/dynamics/recovery/advance-phase
+GET  /v2/dynamics/recovery/history
 """
 
 from __future__ import annotations

@@ -128,42 +128,42 @@ class TestRoleDefinitions:
 
 class TestRoleAccess:
     def test_platform_admin_can_access_everything(self):
-        assert PLATFORM_ADMIN.can_access("GET", "/v1/govern")
-        assert PLATFORM_ADMIN.can_access("POST", "/v1/dynamics/pll/approve/x")
-        assert PLATFORM_ADMIN.can_access("GET", "/v1/certificates/abc")
+        assert PLATFORM_ADMIN.can_access("GET", "/v2/govern")
+        assert PLATFORM_ADMIN.can_access("POST", "/v2/dynamics/pll/approve/x")
+        assert PLATFORM_ADMIN.can_access("GET", "/v2/certificates/abc")
 
     def test_governance_admin_can_govern(self):
-        assert GOVERNANCE_ADMIN.can_access("POST", "/v1/govern")
-        assert GOVERNANCE_ADMIN.can_access("GET", "/v1/certificates/abc")
-        assert GOVERNANCE_ADMIN.can_access("GET", "/v1/dynamics/drift")
+        assert GOVERNANCE_ADMIN.can_access("POST", "/v2/govern")
+        assert GOVERNANCE_ADMIN.can_access("GET", "/v2/certificates/abc")
+        assert GOVERNANCE_ADMIN.can_access("GET", "/v2/dynamics/drift")
 
     def test_governance_admin_blocked_from_admin(self):
-        assert not GOVERNANCE_ADMIN.can_access("POST", "/v1/admin/users")
-        assert not GOVERNANCE_ADMIN.can_access("POST", "/v1/admin/modules")
+        assert not GOVERNANCE_ADMIN.can_access("POST", "/v2/admin/users")
+        assert not GOVERNANCE_ADMIN.can_access("POST", "/v2/admin/modules")
 
     def test_policy_editor_blocked_from_pll_approve(self):
-        assert not POLICY_EDITOR.can_access("POST", "/v1/dynamics/pll/approve/x")
-        assert not POLICY_EDITOR.can_access("POST", "/v1/dynamics/recovery/activate")
+        assert not POLICY_EDITOR.can_access("POST", "/v2/dynamics/pll/approve/x")
+        assert not POLICY_EDITOR.can_access("POST", "/v2/dynamics/recovery/activate")
 
     def test_policy_editor_can_simulate(self):
-        assert POLICY_EDITOR.can_access("POST", "/v1/simulation/replay")
+        assert POLICY_EDITOR.can_access("POST", "/v2/simulation/replay")
 
     def test_auditor_read_only(self):
-        assert AUDITOR.can_access("GET", "/v1/certificates/abc")
-        assert not AUDITOR.can_access("POST", "/v1/govern")
-        assert not AUDITOR.can_access("GET", "/v1/dynamics/drift")
+        assert AUDITOR.can_access("GET", "/v2/certificates/abc")
+        assert not AUDITOR.can_access("POST", "/v2/govern")
+        assert not AUDITOR.can_access("GET", "/v2/dynamics/drift")
 
     def test_executive_viewer_metrics_only(self):
-        assert EXECUTIVE_VIEWER.can_access("GET", "/v1/metrics/live")
-        assert not EXECUTIVE_VIEWER.can_access("GET", "/v1/certificates/abc")
-        assert not EXECUTIVE_VIEWER.can_access("GET", "/v1/dynamics/drift")
+        assert EXECUTIVE_VIEWER.can_access("GET", "/v2/metrics/live")
+        assert not EXECUTIVE_VIEWER.can_access("GET", "/v2/certificates/abc")
+        assert not EXECUTIVE_VIEWER.can_access("GET", "/v2/dynamics/drift")
 
     def test_workflow_owner_blocked_from_dynamics(self):
-        assert not WORKFLOW_OWNER.can_access("GET", "/v1/dynamics/drift")
-        assert not WORKFLOW_OWNER.can_access("POST", "/v1/simulation/replay")
+        assert not WORKFLOW_OWNER.can_access("GET", "/v2/dynamics/drift")
+        assert not WORKFLOW_OWNER.can_access("POST", "/v2/simulation/replay")
 
     def test_exception_approver_can_approve_pll(self):
-        assert EXCEPTION_APPROVER.can_access("POST", "/v1/dynamics/pll/approve/x")
+        assert EXCEPTION_APPROVER.can_access("POST", "/v2/dynamics/pll/approve/x")
 
 
 # --------------------------------------------------------------------------- #
@@ -187,16 +187,16 @@ class TestSessionManagement:
 
     def test_session_can_access(self):
         session = create_session("u1", "alice", ["governance_admin"], "tok1")
-        assert session.can_access("GET", "/v1/govern")
-        assert not session.can_access("POST", "/v1/admin/users")
+        assert session.can_access("GET", "/v2/govern")
+        assert not session.can_access("POST", "/v2/admin/users")
 
     def test_multi_role_session(self):
         session = create_session("u1", "alice",
                                  ["policy_editor", "exception_approver"], "tok1")
         # policy_editor can simulate
-        assert session.can_access("POST", "/v1/simulation/replay")
+        assert session.can_access("POST", "/v2/simulation/replay")
         # exception_approver can approve PLL
-        assert session.can_access("POST", "/v1/dynamics/pll/approve/x")
+        assert session.can_access("POST", "/v2/dynamics/pll/approve/x")
 
 
 # --------------------------------------------------------------------------- #
@@ -206,16 +206,16 @@ class TestSessionManagement:
 class TestRBACMiddleware:
     def test_rbac_disabled_allows_all(self, no_rbac_client):
         """With RBAC disabled, all endpoints are accessible."""
-        resp = no_rbac_client.get("/v1/health")
+        resp = no_rbac_client.get("/v2/health")
         assert resp.status_code == 200
 
     def test_rbac_enabled_no_auth_returns_401(self, rbac_client):
-        resp = rbac_client.get("/v1/health")
+        resp = rbac_client.get("/v2/health")
         assert resp.status_code == 401
 
     def test_rbac_enabled_invalid_token_returns_401(self, rbac_client):
         resp = rbac_client.get(
-            "/v1/health",
+            "/v2/health",
             headers={"Authorization": "Bearer invalid-token"},
         )
         assert resp.status_code == 401
@@ -223,7 +223,7 @@ class TestRBACMiddleware:
     def test_rbac_enabled_valid_token_allows(self, rbac_client):
         token = _make_token("u1", "alice", ["governance_admin"])
         resp = rbac_client.get(
-            "/v1/health",
+            "/v2/health",
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200
@@ -231,7 +231,7 @@ class TestRBACMiddleware:
     def test_rbac_enabled_unauthorized_returns_403(self, rbac_client):
         token = _make_token("u1", "alice", ["executive_viewer"])
         resp = rbac_client.get(
-            "/v1/certificates",
+            "/v2/certificates",
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 403
@@ -239,7 +239,7 @@ class TestRBACMiddleware:
     def test_platform_admin_accesses_all(self, rbac_client):
         token = _make_token("u1", "admin", ["platform_admin"])
         resp = rbac_client.get(
-            "/v1/metrics/live",
+            "/v2/metrics/live",
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200
@@ -247,7 +247,7 @@ class TestRBACMiddleware:
     def test_auditor_can_read_certificates(self, rbac_client):
         token = _make_token("u1", "auditor", ["auditor"])
         resp = rbac_client.get(
-            "/v1/certificates",
+            "/v2/certificates",
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200

@@ -253,42 +253,42 @@ class TestAuditExport:
 
 class TestPackAPI:
     def test_list_packs(self, client):
-        resp = client.get("/v1/packs")
+        resp = client.get("/v2/packs")
         assert resp.status_code == 200
         data = resp.json()
         assert len(data) == 5
 
     def test_get_pack(self, client):
-        resp = client.get("/v1/packs/financial_services")
+        resp = client.get("/v2/packs/financial_services")
         assert resp.status_code == 200
         data = resp.json()
         assert data["pack_id"] == "financial_services"
 
     def test_get_pack_not_found(self, client):
-        resp = client.get("/v1/packs/nonexistent")
+        resp = client.get("/v2/packs/nonexistent")
         assert resp.status_code == 404
 
     def test_deploy_pack(self, client):
-        resp = client.post("/v1/packs/financial_services/deploy")
+        resp = client.post("/v2/packs/financial_services/deploy")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "deployed"
 
     def test_active_pack_none(self, client):
-        resp = client.get("/v1/packs/active")
+        resp = client.get("/v2/packs/active")
         assert resp.status_code == 200
         data = resp.json()
         assert data["active"] is False
 
     def test_active_pack_after_deploy(self, client):
-        client.post("/v1/packs/financial_services/deploy")
-        resp = client.get("/v1/packs/active")
+        client.post("/v2/packs/financial_services/deploy")
+        resp = client.get("/v2/packs/active")
         data = resp.json()
         assert data["active"] is True
         assert data["pack_id"] == "financial_services"
 
     def test_export_endpoint(self, client):
-        resp = client.get("/v1/packs/financial_services/export?window_hours=48")
+        resp = client.get("/v2/packs/financial_services/export?window_hours=48")
         assert resp.status_code == 200
         data = resp.json()
         assert data["export_format"] == "finra_examination_v2"

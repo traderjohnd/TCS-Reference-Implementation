@@ -17,16 +17,19 @@ scenarios throughout.
 Scenario coverage:
 
     01 clean_clinical_recommendation   -> Allow     (standard CT-4, all gates pass)
-    02 aggregation_t2_t2_t3            -> Hold      (T1+T2+T2 aggregates to T3, B gate elevated)
-    03 missing_clinical_provenance     -> Hold      (A gate fails, source not version-controlled)
+    02 aggregation_t2_t2_t3            -> Stop      (T1+T2+T2 aggregates to T3, B gate fail, S_base<kappa)
+    03 missing_clinical_provenance     -> Stop      (A gate fails, S_base below remediability floor)
     04 treatment_before_confirmation   -> Stop      (C3=0.00 hard zero, non-overrideable)
     05 phi_in_output                   -> Allow     (T3 PHI detected, redaction applied)
-    06 low_confidence_differential     -> Hold      (U gate fails, low similarity)
+    06 low_confidence_differential     -> Stop      (K gate fails, S_base below remediability floor)
     07 physician_step_up               -> Allow     (step-up auth required, T2->T3 action)
     08 governance_degraded_failsafe    -> Stop      (governance integrity < 0.50, fail-safe)
 
-That's 3 Allow, 3 Hold, 2 Stop. Coverage includes aggregation
-detection, PHI redaction, step-up authorization, and fail-safe.
+That's 3 Allow, 5 Stop. Scenarios 02, 03, 06 are gate-path Stops
+under the white-paper-aligned ladder (kappa as remediability floor):
+S_base < kappa with C3>0 -> Stop (too degraded to remediate). The
+clinical narrative is unchanged; the decision label reflects the
+paper's semantics rather than the pre-alignment inversion.
 
 Usage:
 
@@ -217,7 +220,10 @@ def build_scenarios() -> List[DemoScenario]:
                 "B_score": 0.82,
             },
         ),
-        expected_decision="Hold",
+        # Paper-aligned ladder: gate=0 + S_base < kappa -> Stop
+        # (kappa is a remediability floor; B-gate fail with degraded
+        # baseline is "too far gone" for remediation).
+        expected_decision="Stop",
         expected_blocked=True,
         expected_metadata={"aggregation_detected": True},
     ))
@@ -253,7 +259,8 @@ def build_scenarios() -> List[DemoScenario]:
                 "A_score": 0.82,
             },
         ),
-        expected_decision="Hold",
+        # Paper-aligned ladder: gate=0 + S_base < kappa -> Stop.
+        expected_decision="Stop",
         expected_blocked=True,
     ))
 
@@ -365,7 +372,8 @@ def build_scenarios() -> List[DemoScenario]:
                 "low_diagnostic_confidence": True,
             },
         ),
-        expected_decision="Hold",
+        # Paper-aligned ladder: gate=0 + S_base < kappa -> Stop.
+        expected_decision="Stop",
         expected_blocked=True,
     ))
 

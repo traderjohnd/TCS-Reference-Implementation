@@ -16,6 +16,7 @@ export default function DriftMonitoring() {
   const { data: drift } = usePolling('/dynamics/drift?window_hours=48', 10000);
   const { data: trustLoss } = usePolling('/dynamics/trust-loss?domain=financial_services&window_hours=48', 15000);
   const { data: pllRecs } = usePolling('/dynamics/pll/recommendations', 10000);
+  const { data: liveMetrics } = usePolling('/metrics/live', 10000);
   const [approving, setApproving] = useState(null);
 
   const signals = drift?.signals || [];
@@ -42,8 +43,40 @@ export default function DriftMonitoring() {
     setApproving(null);
   };
 
+  const govScore = liveMetrics?.governance_integrity_score;
+  const govPct = govScore != null ? (govScore * 100).toFixed(1) : null;
+  const govColor = govScore > 0.9 ? 'text-green-400' : govScore > 0.7 ? 'text-yellow-400' : 'text-red-400';
+  const govBorder = govScore > 0.9 ? 'border-green-800' : govScore > 0.7 ? 'border-yellow-800' : 'border-red-800';
+  const govLabel = govScore > 0.9 ? 'Nominal' : govScore > 0.7 ? 'Warning' : 'Critical';
+  const gateFailRate = liveMetrics?.gate_failure_rate;
+  const chainIntact = liveMetrics?.chain_intact;
+
   return (
     <div className="space-y-6">
+      {liveMetrics && (
+        <div className={`bg-gray-900 rounded-lg border ${govBorder} p-4`}>
+          <h3 className="text-sm font-medium text-gray-400 mb-3">Governance Health</h3>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+              <div className="text-xs text-gray-500 mb-1">Integrity Score</div>
+              <div className={`text-xl font-bold font-mono ${govColor}`}>{govPct != null ? `${govPct}%` : '--'}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500 mb-1">Gate Failure Rate</div>
+              <div className="text-xl font-bold font-mono text-gray-300">{gateFailRate != null ? `${(gateFailRate * 100).toFixed(1)}%` : '--'}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500 mb-1">Chain Intact</div>
+              <div className={`text-xl font-bold font-mono ${chainIntact ? 'text-green-400' : 'text-red-400'}`}>{chainIntact != null ? (chainIntact ? 'Yes' : 'BROKEN') : '--'}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-500 mb-1">Status</div>
+              <div className={`text-xl font-bold ${govColor}`}>Governance Health: {govLabel}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
         <h3 className="text-sm font-medium text-gray-400 mb-3">Drift Signals by Context</h3>
         {signals.length === 0 ? (

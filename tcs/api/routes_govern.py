@@ -2,7 +2,7 @@
 tcs.api.routes_govern
 =====================
 
-POST /v1/govern — the runtime governance entry point.
+POST /v2/govern — the runtime governance entry point.
 
 Accepts a RAG-shaped request (query, retrieved chunks, candidate
 answer, plus optional identity / tier / extras), runs it through the
@@ -50,7 +50,7 @@ class ChunkBody(BaseModel):
 
 class GovernRequestBody(BaseModel):
     """
-    JSON body for POST /v1/govern.
+    JSON body for POST /v2/govern.
 
     Fields mirror ``RAGOutput`` so the API surface is a thin
     translation layer. Optional ``base_profile_id`` lets the caller
@@ -140,7 +140,7 @@ def post_govern(body: GovernRequestBody, request: Request) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# /v1/govern/decisions/stream — recent decisions feed                          #
+# /v2/govern/decisions/stream — recent decisions feed                          #
 # --------------------------------------------------------------------------- #
 
 @router.get("/govern/decisions/stream")
@@ -176,7 +176,7 @@ def decisions_stream(
 
 
 # --------------------------------------------------------------------------- #
-# /v1/govern/hold-queue — open Hold decisions                                  #
+# /v2/govern/hold-queue — open Hold decisions                                  #
 # --------------------------------------------------------------------------- #
 
 @router.get("/govern/hold-queue")
@@ -211,7 +211,7 @@ def hold_queue(
 
 
 # --------------------------------------------------------------------------- #
-# /v1/govern/hold-queue/{tc_id}/override — submit override                     #
+# /v2/govern/hold-queue/{tc_id}/override — submit override                     #
 # --------------------------------------------------------------------------- #
 
 class OverrideBody(BaseModel):

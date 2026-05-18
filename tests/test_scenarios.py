@@ -72,13 +72,17 @@ def test_healthcare_stop():
     result = compute_tis(tis_input)
 
     # Exact intermediate values from TEST_SCENARIOS.md
-    assert result.tis_raw == 0.6825
+    # Under the white-paper-aligned naming: s_base is the gate-INDEPENDENT
+    # weighted composite; tis_raw = gate * s_base collapses to 0 on gate fail.
+    assert result.s_base == 0.6825
+    assert result.tis_raw == 0.0      # gate=0 -> tis_raw collapses
     assert result.penalty_breakdown == {
         "P_cb": 0.0000, "P_d": 0.0000, "P_n": 0.0040,
         "P_h": 0.0000, "P_ps": 0.0000,
     }
     assert result.penalty_aggregate == 0.0012
-    assert result.tis_adj == 0.6817
+    assert result.s_adj == 0.6817
+    assert result.tis_adj == 0.0      # gate=0 -> tis_adj collapses
     assert result.gate_result == 0
     assert result.gate_results_by_dim == {
         "B": "pass", "A": "pass", "C": "fail", "K": "pass"
@@ -199,10 +203,20 @@ def test_finance_allow():
 # Scenario 4 — Financial Services HOLD (Attribution Gate Failure)              #
 # =========================================================================== #
 
-def test_finance_hold_attribution():
+def test_finance_stop_attribution_low_sbase():
     """
-    Single gate failure on A. TIS_raw <= kappa -> Hold (gate path), not Stop.
-    blocking_reason populated with the specific A=0.76 detail.
+    Scenario 4 (paper-aligned).
+
+    Single gate failure on A. S_base = 0.88 < kappa = 0.90 -> STOP via
+    Priority 3 (gate-failure path, below remediability floor). Under the
+    paper's kappa-as-floor semantics, a degraded baseline + gate failure
+    is not worth remediating — too far gone.
+
+    Pre-paper-alignment this scenario asserted HOLD because the local
+    code had the kappa direction inverted; flipping to STOP brings the
+    test in line with the white paper.
+
+    blocking_reason still records the specific A=0.76 detail.
     """
     tis_input = make_tis_input(
         profile_id="fin-high-risk-suitability-v3",
@@ -218,11 +232,13 @@ def test_finance_hold_attribution():
     )
     result = compute_tis(tis_input)
 
-    assert result.tis_raw == 0.8800
+    assert result.s_base == 0.8800
+    assert result.tis_raw == 0.0      # gate=0 collapses tis_raw
     assert result.penalty_breakdown["P_cb"] == 0.0400
     assert result.penalty_breakdown["P_n"] == 0.0040
     assert result.penalty_aggregate == 0.0108
-    assert result.tis_adj == 0.8705
+    assert result.s_adj == 0.8705
+    assert result.tis_adj == 0.0      # gate=0 collapses tis_adj
     assert result.gate_result == 0
     assert result.gate_results_by_dim == {
         "B": "pass", "A": "fail", "C": "pass", "K": "pass"
@@ -231,11 +247,11 @@ def test_finance_hold_attribution():
     assert result.failing_dimensions == ["A"]
 
     decision, review = map_decision(tis_input, result)
-    assert decision == "Hold"   # gate=0, raw 0.88 <= kappa 0.90
-    assert review is True
+    assert decision == "Stop"   # Priority 3: gate=0, S_base=0.88 < kappa=0.90
+    assert review is False      # Stops are not reviewable
 
     tc = generate_certificate(tis_input, result, decision, review)
-    assert tc.lifecycle_state == "computed"
+    assert tc.lifecycle_state == "blocked"
     assert tc.blocking_reason == "attribution_gate_fail_A=0.76_threshold=0.9"
     assert tc.failure_mode == "A_gate_fail"
 
@@ -291,10 +307,17 @@ def test_enterprise_info_allow():
 # Scenario 6 — High-Risk U Gate Failure -> Hold (Not Stop)                     #
 # =========================================================================== #
 
-def test_high_risk_uncertainty_gate():
+def test_high_risk_known_gate_stop_low_sbase():
     """
-    At r3/a4, U IS in gate_set. U=0.72 < 0.80 fails.
-    TIS_raw <= kappa -> Hold (not Stop). C3 != 0 so no hard stop.
+    Scenario 6 (paper-aligned).
+
+    At r3/a4, K IS in gate_set. K=0.72 < 0.80 fails.
+    S_base = 0.8635 < kappa = 0.90 -> STOP via Priority 3 (below
+    remediability floor). C3 != 0 so this is not a hard C3 stop.
+
+    Pre-paper-alignment this scenario asserted HOLD because the local
+    code had the kappa direction inverted; flipping to STOP brings the
+    test in line with the white paper.
     """
     tis_input = make_tis_input(
         profile_id="clinical-cds-samed-v2",
@@ -310,11 +333,13 @@ def test_high_risk_uncertainty_gate():
     )
     result = compute_tis(tis_input)
 
-    assert result.tis_raw == 0.8635
+    assert result.s_base == 0.8635
+    assert result.tis_raw == 0.0      # gate=0 collapses tis_raw
     assert result.penalty_breakdown["P_n"] == 0.0400
     assert result.penalty_aggregate == 0.0120
     # Doc arithmetic slip: doc says 0.8532, exact product is 0.85313800 -> 0.8531
-    assert result.tis_adj == 0.8531
+    assert result.s_adj == 0.8531
+    assert result.tis_adj == 0.0      # gate=0 collapses tis_adj
     assert result.gate_result == 0
     assert result.gate_results_by_dim == {
         "B": "pass", "A": "pass", "C": "pass", "K": "fail"
@@ -323,11 +348,11 @@ def test_high_risk_uncertainty_gate():
     assert result.tis_current == 0.0000
 
     decision, review = map_decision(tis_input, result)
-    assert decision == "Hold"   # gate=0, raw 0.8635 <= kappa 0.90
-    assert review is True
+    assert decision == "Stop"   # Priority 3: gate=0, S_base=0.8635 < kappa=0.90
+    assert review is False      # Stops are not reviewable
 
     tc = generate_certificate(tis_input, result, decision, review)
-    assert tc.lifecycle_state == "computed"
+    assert tc.lifecycle_state == "blocked"
     assert tc.blocking_reason == "known_gate_fail_K=0.72_threshold=0.8"
     assert tc.failure_mode == "K_gate_fail"
 

@@ -814,7 +814,12 @@ def _tc_from_json(content_json: str) -> TrustCertificate:
         gca_context_id=d["gca_context_id"],
         policy_set_id=d["policy_set_id"],
 
-        # Score
+        # Score. s_base / s_adjusted fall back to tis_raw / tis_adjusted
+        # for legacy archived TCs written before the white-paper-aligned
+        # naming split (where tis_raw was the gate-INDEPENDENT composite,
+        # i.e. semantically s_base). New TCs always carry s_base directly.
+        s_base=float(d.get("s_base", d.get("tis_raw", 0.0))),
+        s_adjusted=float(d.get("s_adjusted", d.get("tis_adjusted", 0.0))),
         tis_raw=float(d["tis_raw"]),
         tis_adjusted=float(d["tis_adjusted"]),
         tis_current=float(d["tis_current"]),
@@ -877,6 +882,25 @@ def _tc_from_json(content_json: str) -> TrustCertificate:
         resolved_policy_profile_id=d.get("resolved_policy_profile_id"),
         chain_depth=int(d.get("chain_depth", 0)),
         chain_u_scores=[float(x) for x in d.get("chain_u_scores", [])],
+
+        # Standards Composer audit (Slice 4)
+        composer_metadata=(
+            dict(d["composer_metadata"])
+            if isinstance(d.get("composer_metadata"), dict) else None
+        ),
+
+        # Governance Risk Rule audit (Slice 4.5).
+        # Stored as a JSON list; round-trip preserves None vs [] semantics
+        # (None = classifier did not run; [] = ran with no matches). The
+        # ``.get(..., None)`` default plus the explicit None check below
+        # is the backward-compat fallback for TCs written before this
+        # field existed.
+        governance_rule_matches=(
+            [dict(m) for m in d["governance_rule_matches"]
+             if isinstance(m, dict)]
+            if isinstance(d.get("governance_rule_matches"), list)
+            else None
+        ),
 
         # TEL layers
         identity_binding=_build_identity_binding(d.get("identity_binding")),
@@ -1088,3 +1112,261 @@ CertificateStore.get_recovery_incident = _get_recovery_incident
 CertificateStore.get_active_recovery = _get_active_recovery
 CertificateStore.update_recovery_incident = _update_recovery_incident
 CertificateStore.list_recovery_incidents = _list_recovery_incidents
+
+
+# --------------------------------------------------------------------------- #
+# Control Plane Observability (Phase 4 Step 5)                                 #
+# --------------------------------------------------------------------------- #
+
+def _timeseries_buckets(
+    self: "CertificateStore",
+    window_hours: float = 1.0,
+    bucket_minutes: float = 1.0,
+) -> list:
+    """
+    Return time-bucketed decision counts and mean TIS for dashboard
+    timeseries charts.
+
+    Each bucket is a dict:
+        {"t": iso8601, "allow_count": int, "hold_count": int,
+         "stop_count": int, "observe_count": int, "escalate_count": int,
+         "mean_tis": float}
+    """
+    from datetime import timedelta
+
+    rows = self.query_window(window_hours)
+    if not rows:
+        return []
+
+    bucket_seconds = bucket_minutes * 60.0
+    buckets: Dict[str, Dict[str, Any]] = {}
+
+    for r in rows:
+        ts_str = r["evaluation_timestamp"]
+        ts = _parse_iso8601(ts_str)
+        if ts is None:
+            continue
+        # Floor to bucket boundary
+        epoch = ts.timestamp()
+        floored_epoch = (epoch // bucket_seconds) * bucket_seconds
+        bucket_key = datetime.fromtimestamp(floored_epoch, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        if bucket_key not in buckets:
+            buckets[bucket_key] = {
+                "t": bucket_key,
+                "allow_count": 0,
+                "hold_count": 0,
+                "stop_count": 0,
+                "observe_count": 0,
+                "escalate_count": 0,
+                "_tis_sum": 0.0,
+                "_tis_n": 0,
+            }
+
+        b = buckets[bucket_key]
+        decision = r["decision"]
+        if decision == "Allow":
+            b["allow_count"] += 1
+        elif decision == "Hold":
+            b["hold_count"] += 1
+        elif decision == "Stop":
+            b["stop_count"] += 1
+        elif decision == "Observe":
+            b["observe_count"] += 1
+        elif decision == "Escalate":
+            b["escalate_count"] += 1
+
+        b["_tis_sum"] += float(r["tis_current"])
+        b["_tis_n"] += 1
+
+    result = []
+    for key in sorted(buckets.keys()):
+        b = buckets[key]
+        mean_tis = round(b["_tis_sum"] / b["_tis_n"], 4) if b["_tis_n"] > 0 else 0.0
+        result.append({
+            "t": b["t"],
+            "allow_count": b["allow_count"],
+            "hold_count": b["hold_count"],
+            "stop_count": b["stop_count"],
+            "observe_count": b["observe_count"],
+            "escalate_count": b["escalate_count"],
+            "mean_tis": mean_tis,
+        })
+    return result
+
+
+def _gate_failure_details(
+    self: "CertificateStore",
+    window_hours: float = 24.0,
+) -> dict:
+    """
+    Return gate failure breakdown by dimension and by profile.
+
+    Returns:
+        {"total": int,
+         "by_dimension": {"B": int, "A": int, "C": int, "K": int},
+         "by_profile": {"profile-id": int, ...}}
+    """
+    rows = self.query_window(window_hours)
+    by_dimension: Dict[str, int] = {"B": 0, "A": 0, "C": 0, "K": 0}
+    by_profile: Dict[str, int] = {}
+    total = 0
+
+    for r in rows:
+        d = json.loads(r["content_json"])
+        if d.get("gate_passed", True):
+            continue
+        total += 1
+
+        gate_results = d.get("gate_results", {})
+        for dim in ("B", "A", "C", "K"):
+            if gate_results.get(dim) == "fail":
+                by_dimension[dim] += 1
+
+        profile_id = d.get("policy_set_id", "unknown")
+        by_profile[profile_id] = by_profile.get(profile_id, 0) + 1
+
+    return {
+        "total": total,
+        "by_dimension": by_dimension,
+        "by_profile": by_profile,
+    }
+
+
+def _attribution_gap_details(
+    self: "CertificateStore",
+    window_hours: float = 24.0,
+) -> dict:
+    """
+    Return attribution gap metrics and trend.
+
+    Returns:
+        {"total_gaps": int, "mean_gaps_per_eval": float,
+         "trend": [{"t": iso8601, "n_gaps": int}]}
+    """
+    rows = self.query_window(window_hours)
+    total_gaps = 0
+    trend: List[Dict[str, Any]] = []
+
+    for r in rows:
+        d = json.loads(r["content_json"])
+        n_gaps = int(d.get("integration_boundary_gaps", 0))
+        total_gaps += n_gaps
+        trend.append({
+            "t": r["evaluation_timestamp"],
+            "n_gaps": n_gaps,
+        })
+
+    n_evals = len(rows)
+    mean_gaps = round(total_gaps / n_evals, 4) if n_evals > 0 else 0.0
+
+    return {
+        "total_gaps": total_gaps,
+        "mean_gaps_per_eval": mean_gaps,
+        "trend": trend,
+    }
+
+
+def _chain_summary(
+    self: "CertificateStore",
+    chain_id: str,
+) -> dict:
+    """
+    Return summary for a specific chain including length, timestamps,
+    decision counts, and verification status.
+
+    Returns:
+        {"chain_id": str, "length": int, "first_at": iso8601,
+         "last_at": iso8601, "verified": bool,
+         "decisions": {"Allow": int, ...}}
+    """
+    rows = self._conn.execute(
+        "SELECT decision, evaluation_timestamp FROM trust_certificates "
+        "WHERE chain_id = ? ORDER BY chain_sequence ASC",
+        (chain_id,),
+    ).fetchall()
+
+    if not rows:
+        return {
+            "chain_id": chain_id,
+            "length": 0,
+            "first_at": None,
+            "last_at": None,
+            "verified": True,
+            "decisions": {},
+        }
+
+    decisions: Dict[str, int] = {}
+    for r in rows:
+        dec = str(r["decision"])
+        decisions[dec] = decisions.get(dec, 0) + 1
+
+    return {
+        "chain_id": chain_id,
+        "length": len(rows),
+        "first_at": rows[0]["evaluation_timestamp"],
+        "last_at": rows[-1]["evaluation_timestamp"],
+        "verified": self.verify_chain(chain_id),
+        "decisions": decisions,
+    }
+
+
+def _telemetry_stream(
+    self: "CertificateStore",
+    window_hours: float = 1.0,
+    limit: int = 100,
+) -> list:
+    """
+    Return per-evaluation telemetry records for real-time charting.
+
+    Each record contains: timestamp, TIS scores (raw/adj/current),
+    per-dimension scores (B/A/C/K), penalty breakdown, decision,
+    gate pass/fail, and governance latency.
+
+    This powers the Telemetry view — dimension score trends,
+    K calibration sparkline, penalty pressure over time.
+    """
+    rows = self.query_window(window_hours)
+    if not rows:
+        return []
+
+    records = []
+    for r in rows[-limit:]:  # most recent N
+        d = json.loads(r["content_json"])
+        cs = d.get("component_scores", {})
+        pb = d.get("penalty_breakdown", {})
+        records.append({
+            "t": r["evaluation_timestamp"],
+            "certificate_id": d.get("certificate_id", ""),
+            "subject_id": d.get("subject_id", ""),
+            "decision": r["decision"],
+            "tis_raw": round(float(d.get("tis_raw", 0.0)), 4),
+            "tis_adjusted": round(float(d.get("tis_adjusted", 0.0)), 4),
+            "tis_current": float(r["tis_current"]),
+            "B": round(cs.get("B", 0.0), 4),
+            "A": round(cs.get("A", 0.0), 4),
+            "C": round(cs.get("C", 0.0), 4),
+            # Read-side legacy fallback: archived TCs written before the
+            # BACU -> BACK migration may have "U" instead of "K". This is
+            # NOT a translation layer — new writes always use K end-to-end.
+            "K": round(cs.get("K", cs.get("U", 0.0)), 4),
+            "gate_passed": d.get("gate_passed", True),
+            "P_cb": round(pb.get("P_cb", 0.0), 4),
+            "P_d": round(pb.get("P_d", 0.0), 4),
+            "P_n": round(pb.get("P_n", 0.0), 4),
+            "P_h": round(pb.get("P_h", 0.0), 4),
+            "P_ps": round(pb.get("P_ps", 0.0), 4),
+            "penalty_aggregate": round(float(d.get("penalty_aggregate", 0.0)), 4),
+            "governance_ms": d.get("governance_ms"),
+            "profile_id": d.get("policy_set_id", ""),
+        })
+    return records
+
+
+CertificateStore.timeseries_buckets = _timeseries_buckets
+CertificateStore.gate_failure_details = _gate_failure_details
+CertificateStore.attribution_gap_details = _attribution_gap_details
+CertificateStore.chain_summary = _chain_summary
+CertificateStore.telemetry_stream = _telemetry_stream

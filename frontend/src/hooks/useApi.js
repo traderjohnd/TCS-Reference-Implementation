@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 
-const API_BASE = '/v1';
+const API_BASE = '/v2';
 
 function getHeaders() {
   const token = localStorage.getItem('tcs_token');

@@ -14,7 +14,8 @@ Public API:
     loaded_tc = store.get(certificate_id)   # re-hydrate from DB
     ok = store.verify_chain(chain_id)       # C-R.18 hash-chain integrity check
 
-Phase 2 uses SQLite. Phase 3 migrates to PostgreSQL with the same schema.
+Phase 2 uses SQLite. Phase 4 adds PostgreSQL as an alternative backend
+selectable via ``TCS_DB_BACKEND=postgres``.
 """
 
 from tcs.persistence.db import (
@@ -38,3 +39,11 @@ __all__ = [
     "ChainSequenceError",
     "CertificateNotFoundError",
 ]
+
+# PostgresCertificateStore is available only when psycopg is installed.
+# Import lazily to avoid breaking the rest of TCS on systems without it.
+try:
+    from tcs.persistence.pg_store import PostgresCertificateStore
+    __all__.append("PostgresCertificateStore")
+except ImportError:
+    pass

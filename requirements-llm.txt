@@ -1,0 +1,10 @@
+# Optional LLM provider clients.
+#
+# Install only if you intend to connect to real OpenAI or Anthropic
+# providers from the Governed Chat. The Mock provider is built-in
+# and requires no API key.
+#
+# Install with: pip install -r requirements-llm.txt
+
+openai>=1.40,<2
+anthropic>=0.30,<1

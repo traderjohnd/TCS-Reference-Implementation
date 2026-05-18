@@ -6,9 +6,9 @@ Trust Certificate read surface.
 
 Endpoints
 ---------
-GET /v1/certificates                    list recent TCs across all chains
-GET /v1/certificates/verify-chain       verify hash chain integrity
-GET /v1/certificates/{certificate_id}   fetch a single TC by id
+GET /v2/certificates                    list recent TCs across all chains
+GET /v2/certificates/verify-chain       verify hash chain integrity
+GET /v2/certificates/{certificate_id}   fetch a single TC by id
 
 The list and verify-chain routes are declared *before* the
 ``{certificate_id}`` route so FastAPI does not match the literal
@@ -16,7 +16,7 @@ path segments as ids.
 
 These endpoints are the "show me the receipts" surface. Regulatory
 and audit consumers call them with ids they got from a prior
-/v1/govern response, or browse the recent feed in the dashboard.
+/v2/govern response, or browse the recent feed in the dashboard.
 """
 
 from __future__ import annotations
@@ -96,6 +96,23 @@ def verify_chain(
         "tc_count": store.count(),
         "broken_chains": broken,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Chain summary                                                                #
+# --------------------------------------------------------------------------- #
+
+@router.get("/certificates/chain/{chain_id}/summary")
+def chain_summary(
+    chain_id: str,
+    request: Request,
+) -> Dict[str, Any]:
+    """
+    Return summary for a specific chain including length, timestamps,
+    decision counts, and verification status.
+    """
+    store = request.app.state.store
+    return store.chain_summary(chain_id)
 
 
 # --------------------------------------------------------------------------- #

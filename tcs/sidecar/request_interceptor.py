@@ -114,10 +114,15 @@ def default_scoring_policy(
             - sub_factor_scores["C"]["C3"] tracks the binary C3 signal
 
         K (Known)
-            - for CT-8 / CT-11: K = compute_chain_uncertainty(chain_u_scores)
-              which returns 1 - product(K_i). Scenario 17 shape:
-              3 x 0.88 -> 0.3185 -> fails 0.80 gate -> Hold.
-            - for CT-4 / others:
+            - for CT-8 (agent chain): the chain math computes
+              U_chain = compute_chain_uncertainty(chain_k_scores) which
+              returns 1 - product(K_i). The K dimension fed to the
+              engine is K_chain = 1 - U_chain = product(K_i). Scenario
+              17 shape: 3 x 0.88 -> U_chain = 0.3185 -> the resulting
+              K_chain fails the 0.80 gate -> Hold. CT-11 (AI-generated
+              attribution) does NOT apply chain math; it uses the
+              CT-4/other path.
+            - for CT-4 / CT-11 / others:
                 baseline 0.88
                 subtract k_subfactor_penalty (scaled by 1.0 — the
                 adapter already bounds the penalty at 0.5, so worst

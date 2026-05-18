@@ -126,10 +126,11 @@ class TestEnforceAllFiveDecisions:
                 {"B": 0.72, "A": 0.72, "C": 0.76, "K": 0.50},
             )
         elif decision == "Hold":
-            # gate-path hold: A fails
+            # gate-path hold: A fails (0.62 < 0.90); S_base = 0.905 >= kappa=0.90
+            # so HOLD under paper-aligned ladder (kappa as remediability floor).
             inp = make_tis_input(
                 "fin-high-risk-suitability-v3",
-                {"B": 0.94, "A": 0.76, "C": 0.92, "K": 0.88},
+                {"B": 1.00, "A": 0.62, "C": 1.00, "K": 1.00},
             )
         elif decision == "Escalate":
             inp = make_tis_input(
@@ -394,6 +395,12 @@ class TestInterceptorHold:
         """
         Scenario 9 shape: 2 chunks with missing source_doc, 1 complete.
         A score drops below the CT-4 0.93 gate -> Hold.
+
+        Under the paper-aligned ladder, kappa is a remediability floor:
+        a gate-fail HOLD requires S_base >= kappa. The default scoring
+        produces S_base ~0.899 here, which would Stop. We pin B and C
+        slightly higher via extra_metadata so S_base crosses 0.90 and
+        the gate-fail maps to HOLD as intended.
         """
         out = RAGOutput(
             query="Give a recommendation",
@@ -408,6 +415,7 @@ class TestInterceptorHold:
             ],
             candidate_answer="Recommendation text.",
             subject_id="rec-gaps-001",
+            extra_metadata={"B_score": 1.00, "C_score": 1.00},
         )
         req = adapter.adapt(out)
         resp = interceptor.govern(req)

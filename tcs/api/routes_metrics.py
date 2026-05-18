@@ -2,8 +2,8 @@
 tcs.api.routes_metrics
 ======================
 
-GET /v1/metrics/live  — runtime governance telemetry
-GET /v1/health        — liveness and integrity check
+GET /v2/metrics/live  — runtime governance telemetry
+GET /v2/health        — liveness and integrity check
 
 The metrics endpoint reads aggregate stats directly from the store:
 TIS distribution, gate failure rate, governance integrity score,
@@ -26,14 +26,39 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from fastapi import APIRouter, Request
+import re
+
+from fastapi import APIRouter, Query, Request
 
 
 router = APIRouter()
 
 
 # --------------------------------------------------------------------------- #
-# /v1/metrics/live                                                             #
+# Shared helpers                                                               #
+# --------------------------------------------------------------------------- #
+
+_WINDOW_RE = re.compile(r"^(\d+(?:\.\d+)?)(h|m)$")
+
+
+def _parse_window(s: str) -> float:
+    """
+    Parse a human-friendly window string into hours.
+
+    Examples: "1h" -> 1.0, "24h" -> 24.0, "30m" -> 0.5
+    """
+    m = _WINDOW_RE.match(s.strip().lower())
+    if not m:
+        raise ValueError(f"Invalid window format: {s!r}; expected e.g. '1h' or '30m'")
+    value = float(m.group(1))
+    unit = m.group(2)
+    if unit == "h":
+        return value
+    return value / 60.0
+
+
+# --------------------------------------------------------------------------- #
+# /v2/metrics/live                                                             #
 # --------------------------------------------------------------------------- #
 
 @router.get("/metrics/live")
@@ -81,11 +106,11 @@ def get_metrics_live(request: Request) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# /v1/health                                                                   #
+# /v2/health                                                                   #
 # --------------------------------------------------------------------------- #
 
 # --------------------------------------------------------------------------- #
-# /v1/metrics/summary — aggregate metrics for Executive View                   #
+# /v2/metrics/summary — aggregate metrics for Executive View                   #
 # --------------------------------------------------------------------------- #
 
 @router.get("/metrics/summary")
@@ -125,6 +150,132 @@ def get_metrics_summary(request: Request) -> Dict[str, Any]:
         "snapshot_at": datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# /v2/metrics/timeseries                                                       #
+# --------------------------------------------------------------------------- #
+
+@router.get("/metrics/timeseries")
+def get_timeseries(
+    request: Request,
+    window: str = Query("1h"),
+    bucket: str = Query("1m"),
+) -> Dict[str, Any]:
+    """
+    Time-bucketed decision counts and mean TIS for dashboard
+    timeseries charts.
+    """
+    store = request.app.state.store
+    window_hours = _parse_window(window)
+    bucket_minutes = _parse_window(bucket) * 60.0  # _parse_window returns hours
+    return {"buckets": store.timeseries_buckets(window_hours, bucket_minutes)}
+
+
+# --------------------------------------------------------------------------- #
+# /v2/metrics/gate-failures                                                    #
+# --------------------------------------------------------------------------- #
+
+@router.get("/metrics/gate-failures")
+def get_gate_failures(
+    request: Request,
+    window: str = Query("24h"),
+) -> Dict[str, Any]:
+    """Gate failure breakdown by dimension and profile."""
+    store = request.app.state.store
+    window_hours = _parse_window(window)
+    return store.gate_failure_details(window_hours)
+
+
+# --------------------------------------------------------------------------- #
+# /v2/metrics/attribution-gaps                                                 #
+# --------------------------------------------------------------------------- #
+
+@router.get("/metrics/attribution-gaps")
+def get_attribution_gaps(
+    request: Request,
+    window: str = Query("24h"),
+) -> Dict[str, Any]:
+    """Attribution gap metrics and trend."""
+    store = request.app.state.store
+    window_hours = _parse_window(window)
+    return store.attribution_gap_details(window_hours)
+
+
+# --------------------------------------------------------------------------- #
+# /v2/health                                                                   #
+# --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# /v2/metrics/telemetry                                                        #
+# --------------------------------------------------------------------------- #
+
+@router.get("/metrics/telemetry")
+def get_telemetry(
+    request: Request,
+    window: str = Query("1h"),
+    limit: int = Query(100),
+) -> Dict[str, Any]:
+    """
+    Per-evaluation telemetry stream for real-time charts.
+
+    Returns individual TC data points with dimension scores, TIS values,
+    penalty breakdowns, and K calibration signals for the Telemetry view.
+    """
+    store = request.app.state.store
+    window_hours = _parse_window(window)
+    records = store.telemetry_stream(window_hours, limit)
+
+    # Compute summary statistics for the window
+    if records:
+        k_scores = [r["K"] for r in records]
+        tis_scores = [r["tis_current"] for r in records]
+        penalties = [r["penalty_aggregate"] for r in records]
+        gate_fails = sum(1 for r in records if not r["gate_passed"])
+
+        k_mean = round(sum(k_scores) / len(k_scores), 4)
+        k_min = round(min(k_scores), 4)
+        k_max = round(max(k_scores), 4)
+        # K calibration band: scores within 0.1 of mean
+        k_calibrated = sum(1 for k in k_scores if abs(k - k_mean) < 0.10)
+
+        summary = {
+            "count": len(records),
+            "k_calibration": {
+                "mean": k_mean,
+                "min": k_min,
+                "max": k_max,
+                "calibrated_pct": round(k_calibrated / len(k_scores), 4),
+                "below_threshold": sum(1 for k in k_scores if k < 0.80),
+            },
+            "tis_summary": {
+                "mean": round(sum(tis_scores) / len(tis_scores), 4),
+                "min": round(min(tis_scores), 4),
+                "max": round(max(tis_scores), 4),
+            },
+            "penalty_pressure": {
+                "mean": round(sum(penalties) / len(penalties), 4),
+                "max": round(max(penalties), 4),
+            },
+            "gate_failure_count": gate_fails,
+            "gate_failure_rate": round(gate_fails / len(records), 4),
+        }
+    else:
+        summary = {
+            "count": 0,
+            "k_calibration": {"mean": 0, "min": 0, "max": 0, "calibrated_pct": 0, "below_threshold": 0},
+            "tis_summary": {"mean": 0, "min": 0, "max": 0},
+            "penalty_pressure": {"mean": 0, "max": 0},
+            "gate_failure_count": 0,
+            "gate_failure_rate": 0,
+        }
+
+    return {
+        "records": records,
+        "summary": summary,
+        "window": window,
+        "snapshot_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 

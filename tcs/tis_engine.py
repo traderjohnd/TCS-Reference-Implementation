@@ -130,16 +130,43 @@ class TISResult:
     """
     Complete result of a TIS computation.
 
-    Every field is recorded — even when a gate collapse forces TIS_current to
-    0.0000, we still record TIS_raw and TIS_adj for audit purposes (see
-    TCS_SPEC.md §11 "is_valid=0" note: intermediates are retained; only
-    TIS_current is forced to 0.0000).
+    Score naming (aligned to the white paper):
+
+        s_base       = Σᵢ wᵢ(r,a) · dimᵢ(x,k)
+                       The gate-INDEPENDENT weighted dimensional composite.
+                       This is what the decision ladder's Priority 3/4
+                       must use to discriminate STOP vs HOLD on the gate-
+                       failure path: it survives gate collapse so its
+                       magnitude carries meaning ("was the baseline strong
+                       enough that a single gate failure is remediable?").
+
+        s_adj        = s_base · (1 − P)
+                       Post-penalty, pre-gate/decay.
+
+        tis_raw      = gate · s_base
+                       The "raw TIS" per the white paper formula. Collapses
+                       to 0 on gate failure by design. Kept primarily for
+                       wire/audit compatibility and reporting.
+
+        tis_current  = s_adj · decay · gate · I_inv
+                       The operative score consumed by the decision engine.
+
+    All four are recorded in every result even when a gate collapse forces
+    tis_current to 0 (TCS_SPEC.md §11).
+
+    Backward-compat note: previous releases stored ``tis_raw`` as the
+    gate-INDEPENDENT composite (semantically what is now ``s_base``). New
+    code MUST use ``s_base`` for any kappa comparison or remediability
+    decision. The ``tis_raw`` field's value will now be 0 whenever the
+    gate fails, matching the white paper's definition.
     """
 
-    tis_raw: float
+    s_base: float                         # gate-independent composite (white paper)
+    tis_raw: float                        # = gate * s_base (white paper); 0 on gate=0
     penalty_breakdown: Dict[str, float]   # P_cb, P_d, P_n, P_h, P_ps
     penalty_aggregate: float
-    tis_adj: float
+    s_adj: float                          # = s_base * (1 - P); pre-gate/decay
+    tis_adj: float                        # = gate * s_adj; backward-compat
     gate_result: int                      # 0 or 1
     gate_results_by_dim: Dict[str, str]   # "pass" | "fail" | "not_applicable"
     failing_dimensions: List[str]
@@ -427,8 +454,8 @@ def compute_tis(inp: TISInput) -> TISResult:
         dict(inp.dimension_scores), inp.context_metadata
     )
 
-    # Step 2: weighted composite.
-    tis_raw = _compute_tis_raw(scores, profile.weights)
+    # Step 2: gate-independent weighted composite (white paper "S_base").
+    s_base = _compute_tis_raw(scores, profile.weights)
 
     # Step 3: individual penalty components.
     penalty_components = _compute_penalty_components(
@@ -440,26 +467,34 @@ def compute_tis(inp: TISInput) -> TISResult:
         penalty_components, profile.penalty_weights
     )
 
-    # Step 5: post-penalty score.
-    tis_adj = tis_raw * (1.0 - penalty_aggregate)
+    # Step 5: gate-independent post-penalty score (white paper "S_adj").
+    s_adj = s_base * (1.0 - penalty_aggregate)
 
     # Step 6: gate evaluation across gate_set.
     gate_result, gate_results_by_dim, failing = _evaluate_gate(
         scores, profile.thresholds, profile.gate_set
     )
 
-    # Step 7: exponential decay factor.
+    # Step 7: gated quantities per the white paper.
+    #   tis_raw = gate * s_base (collapses to 0 on gate failure)
+    #   tis_adj = gate * s_adj  (collapses to 0 on gate failure)
+    # The decision engine uses s_base (not tis_raw) for Priority 3/4
+    # discrimination so the kappa comparison survives gate collapse.
+    tis_raw = gate_result * s_base
+    tis_adj = gate_result * s_adj
+
+    # Step 8: exponential decay factor.
     decay_factor = math.exp(-profile.decay_rate * inp.elapsed_hours)
 
-    # Step 8: invalidation override — event in E_inv forces is_valid to 0.
+    # Step 9: invalidation override — event in E_inv forces is_valid to 0.
     effective_is_valid = _apply_invalidation(
         inp.is_valid, inp.invalidation_event
     )
 
-    # Step 9: final operative score. Gate=0 or is_valid=0 collapses to 0.0.
-    tis_current = tis_adj * decay_factor * gate_result * effective_is_valid
+    # Step 10: final operative score. Gate=0 or is_valid=0 collapses to 0.0.
+    tis_current = s_adj * decay_factor * gate_result * effective_is_valid
 
-    # Step 10: half-life offset.
+    # Step 11: half-life offset.
     valid_until = _compute_valid_until(
         inp.evaluation_time, profile.decay_rate
     )
@@ -469,9 +504,11 @@ def compute_tis(inp: TISInput) -> TISResult:
 
     # Build the result with canonical 4-decimal rounding applied once.
     return TISResult(
+        s_base=_r(s_base),
         tis_raw=_r(tis_raw),
         penalty_breakdown={k: _r(v) for k, v in penalty_components.items()},
         penalty_aggregate=_r(penalty_aggregate),
+        s_adj=_r(s_adj),
         tis_adj=_r(tis_adj),
         gate_result=int(gate_result),
         gate_results_by_dim=gate_results_by_dim,

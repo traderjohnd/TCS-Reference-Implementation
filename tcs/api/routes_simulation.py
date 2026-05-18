@@ -4,11 +4,11 @@ tcs.api.routes_simulation
 
 Phase 3 Step 6 — Shadow Testing and Simulation API endpoints.
 
-POST /v1/simulation/replay
-POST /v1/simulation/shadow-mode/start
-POST /v1/simulation/shadow-mode/stop
-GET  /v1/simulation/shadow-mode/status
-POST /v1/simulation/ab-compare
+POST /v2/simulation/replay
+POST /v2/simulation/shadow-mode/start
+POST /v2/simulation/shadow-mode/stop
+GET  /v2/simulation/shadow-mode/status
+POST /v2/simulation/ab-compare
 """
 
 from __future__ import annotations

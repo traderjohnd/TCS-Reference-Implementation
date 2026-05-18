@@ -62,7 +62,11 @@ def populated_store(store):
     req = adapter.adapt(allow_output)
     interceptor.govern(req)
 
-    # Hold scenario (low similarity -> U gate fail)
+    # Hold scenario (low similarity -> U gate fail).
+    # Under paper-aligned ladder, kappa is a remediability floor: a
+    # gate-fail Hold requires S_base >= kappa=0.90. Default scoring
+    # here produces S_base ~0.892, which would Stop. Pin B/C slightly
+    # higher so a real HOLD is exercised.
     hold_output = RAGOutput(
         query="Recommend allocation.",
         retrieved_chunks=[
@@ -72,7 +76,11 @@ def populated_store(store):
         ],
         candidate_answer="Recommend speculative portfolio.",
         subject_id="test-hold-01",
-        extra_metadata={"chain_id": "test-chain"},
+        extra_metadata={
+            "chain_id": "test-chain",
+            "B_score": 1.00,
+            "C_score": 1.00,
+        },
     )
     req = adapter.adapt(hold_output)
     interceptor.govern(req)
@@ -117,7 +125,7 @@ def empty_client():
 
 class TestLogin:
     def test_login_returns_token(self, empty_client):
-        resp = empty_client.post("/v1/auth/login", json={
+        resp = empty_client.post("/v2/auth/login", json={
             "username": "admin",
             "role": "governance_admin",
         })
@@ -129,7 +137,7 @@ class TestLogin:
 
     def test_login_with_different_roles(self, empty_client):
         for role in ["platform_admin", "auditor", "executive_viewer"]:
-            resp = empty_client.post("/v1/auth/login", json={
+            resp = empty_client.post("/v2/auth/login", json={
                 "username": f"user_{role}",
                 "role": role,
             })
@@ -143,14 +151,14 @@ class TestLogin:
 
 class TestDecisionStream:
     def test_stream_returns_decisions(self, client):
-        resp = client.get("/v1/govern/decisions/stream")
+        resp = client.get("/v2/govern/decisions/stream")
         assert resp.status_code == 200
         data = resp.json()
         assert "decisions" in data
         assert data["count"] >= 3
 
     def test_stream_decision_fields(self, client):
-        resp = client.get("/v1/govern/decisions/stream")
+        resp = client.get("/v2/govern/decisions/stream")
         data = resp.json()
         d = data["decisions"][0]
         assert "certificate_id" in d
@@ -161,7 +169,7 @@ class TestDecisionStream:
         assert "domain" in d
 
     def test_stream_limit(self, client):
-        resp = client.get("/v1/govern/decisions/stream?limit=1")
+        resp = client.get("/v2/govern/decisions/stream?limit=1")
         assert resp.json()["count"] == 1
 
 
@@ -171,7 +179,7 @@ class TestDecisionStream:
 
 class TestHoldQueue:
     def test_hold_queue(self, client):
-        resp = client.get("/v1/govern/hold-queue")
+        resp = client.get("/v2/govern/hold-queue")
         assert resp.status_code == 200
         data = resp.json()
         assert "holds" in data
@@ -181,7 +189,7 @@ class TestHoldQueue:
             assert h["override_status"] == "pending"
 
     def test_hold_queue_fields(self, client):
-        resp = client.get("/v1/govern/hold-queue")
+        resp = client.get("/v2/govern/hold-queue")
         h = resp.json()["holds"][0]
         assert "certificate_id" in h
         assert "subject_id" in h
@@ -196,13 +204,13 @@ class TestHoldQueue:
 class TestOverride:
     def test_override_hold(self, client):
         # Get a hold TC
-        resp = client.get("/v1/govern/hold-queue")
+        resp = client.get("/v2/govern/hold-queue")
         holds = resp.json()["holds"]
         assert len(holds) >= 1
         tc_id = holds[0]["certificate_id"]
 
         # Submit override
-        resp = client.post(f"/v1/govern/hold-queue/{tc_id}/override", json={
+        resp = client.post(f"/v2/govern/hold-queue/{tc_id}/override", json={
             "override_decision": "Allow",
             "justification": "Reviewed and approved by compliance officer.",
             "override_by": "test_admin",
@@ -214,7 +222,7 @@ class TestOverride:
         assert data["status"] == "applied"
 
     def test_override_nonexistent_tc(self, client):
-        resp = client.post("/v1/govern/hold-queue/nonexistent-id/override", json={
+        resp = client.post("/v2/govern/hold-queue/nonexistent-id/override", json={
             "override_decision": "Allow",
             "justification": "This should fail because TC does not exist.",
             "override_by": "test_admin",
@@ -223,11 +231,11 @@ class TestOverride:
 
     def test_override_non_hold_rejected(self, client):
         # Get an Allow TC
-        resp = client.get("/v1/govern/decisions/stream")
+        resp = client.get("/v2/govern/decisions/stream")
         decisions = resp.json()["decisions"]
         allow_tc = next(d for d in decisions if d["decision"] == "Allow")
 
-        resp = client.post(f"/v1/govern/hold-queue/{allow_tc['certificate_id']}/override", json={
+        resp = client.post(f"/v2/govern/hold-queue/{allow_tc['certificate_id']}/override", json={
             "override_decision": "Allow",
             "justification": "This should fail because TC is not Hold.",
             "override_by": "test_admin",
@@ -235,11 +243,11 @@ class TestOverride:
         assert resp.status_code == 400
 
     def test_override_invalid_decision(self, client):
-        resp = client.get("/v1/govern/hold-queue")
+        resp = client.get("/v2/govern/hold-queue")
         holds = resp.json()["holds"]
         tc_id = holds[0]["certificate_id"]
 
-        resp = client.post(f"/v1/govern/hold-queue/{tc_id}/override", json={
+        resp = client.post(f"/v2/govern/hold-queue/{tc_id}/override", json={
             "override_decision": "Stop",
             "justification": "Invalid decision type test.",
             "override_by": "test_admin",
@@ -253,7 +261,7 @@ class TestOverride:
 
 class TestMetricsSummary:
     def test_summary_returns_data(self, client):
-        resp = client.get("/v1/metrics/summary")
+        resp = client.get("/v2/metrics/summary")
         assert resp.status_code == 200
         data = resp.json()
         assert data["total_evaluations"] >= 3
@@ -264,12 +272,12 @@ class TestMetricsSummary:
         assert "decision_counts" in data
 
     def test_summary_automation_rate(self, client):
-        resp = client.get("/v1/metrics/summary")
+        resp = client.get("/v2/metrics/summary")
         data = resp.json()
         assert 0.0 <= data["automation_rate"] <= 1.0
 
     def test_summary_has_snapshot(self, client):
-        resp = client.get("/v1/metrics/summary")
+        resp = client.get("/v2/metrics/summary")
         assert "snapshot_at" in resp.json()
 
 
@@ -279,13 +287,13 @@ class TestMetricsSummary:
 
 class TestAdminEndpoints:
     def test_list_users(self, empty_client):
-        resp = empty_client.get("/v1/admin/users")
+        resp = empty_client.get("/v2/admin/users")
         assert resp.status_code == 200
         data = resp.json()
         assert "users" in data
 
     def test_create_user(self, empty_client):
-        resp = empty_client.post("/v1/admin/users", json={
+        resp = empty_client.post("/v2/admin/users", json={
             "user_id": "user-test",
             "username": "testuser",
             "roles": ["auditor"],
@@ -297,7 +305,7 @@ class TestAdminEndpoints:
         assert "token" in data
 
     def test_create_user_invalid_role(self, empty_client):
-        resp = empty_client.post("/v1/admin/users", json={
+        resp = empty_client.post("/v2/admin/users", json={
             "user_id": "user-test",
             "username": "testuser",
             "roles": ["nonexistent_role"],
@@ -305,7 +313,7 @@ class TestAdminEndpoints:
         assert resp.status_code == 400
 
     def test_module_status(self, empty_client):
-        resp = empty_client.get("/v1/admin/modules")
+        resp = empty_client.get("/v2/admin/modules")
         assert resp.status_code == 200
         data = resp.json()
         assert data["count"] >= 10
@@ -347,29 +355,29 @@ class TestFrontendBuild:
 
 class TestExistingEndpoints:
     def test_health(self, client):
-        resp = client.get("/v1/health")
+        resp = client.get("/v2/health")
         assert resp.status_code == 200
         assert resp.json()["status"] in ("ok", "degraded")
 
     def test_metrics_live(self, client):
-        resp = client.get("/v1/metrics/live")
+        resp = client.get("/v2/metrics/live")
         assert resp.status_code == 200
         assert "total_evaluations" in resp.json()
 
     def test_certificates_list(self, client):
-        resp = client.get("/v1/certificates")
+        resp = client.get("/v2/certificates")
         assert resp.status_code == 200
 
     def test_verify_chain(self, client):
-        resp = client.get("/v1/certificates/verify-chain")
+        resp = client.get("/v2/certificates/verify-chain")
         assert resp.status_code == 200
         assert "chain_intact" in resp.json()
 
     def test_packs_list(self, client):
-        resp = client.get("/v1/packs")
+        resp = client.get("/v2/packs")
         assert resp.status_code == 200
         assert len(resp.json()) == 5
 
     def test_dynamics_drift(self, client):
-        resp = client.get("/v1/dynamics/drift?window_hours=24")
+        resp = client.get("/v2/dynamics/drift?window_hours=24")
         assert resp.status_code == 200

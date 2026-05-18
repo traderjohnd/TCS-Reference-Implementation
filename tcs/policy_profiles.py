@@ -541,17 +541,52 @@ def load_profile(profile_id: str) -> PolicyProfile:
     """
     Load a PolicyProfile by its profile_id.
 
+    Falls back to the Packs registry if the id is not in the built-in
+    PROFILES dict. This lets Slice 4 composed packs (pack_id =
+    ``composed-<hash16>``) be loaded as profiles transparently — any
+    consumer that calls ``load_profile(active_pack.profile_id)``
+    receives a usable PolicyProfile regardless of whether the source
+    was a built-in profile, a built-in pack, or a standards-composer
+    pack.
+
     Raises
     ------
     ValueError
-        If no profile with the given id is registered.
+        If no profile / pack with the given id is registered.
     """
-    if profile_id not in PROFILES:
-        raise ValueError(
-            f"Unknown policy profile_id {profile_id!r}. "
-            f"Registered profiles: {sorted(PROFILES.keys())}"
-        )
-    return PROFILES[profile_id]
+    if profile_id in PROFILES:
+        return PROFILES[profile_id]
+
+    # Pack-registry fallback (lazy import to avoid cycle).
+    try:
+        from tcs.packs.pack_manager import PACKS as _PACKS
+    except Exception:
+        _PACKS = {}
+
+    for pack in _PACKS.values():
+        pc = pack.get("profile_config") or {}
+        if pc.get("profile_id") == profile_id:
+            return PolicyProfile(
+                profile_id=pc["profile_id"],
+                domain=pc.get("domain", "unknown"),
+                risk_tier=pc["risk_tier"],
+                action_class=pc["action_class"],
+                gate_set=frozenset(pc["gate_set"]),
+                thresholds=dict(pc["thresholds"]),
+                weights=dict(pc["weights"]),
+                penalty_weights=dict(pc["penalty_weights"]),
+                decay_rate=float(pc["decay_rate"]),
+                soft_hold_ceiling=float(pc["soft_hold_ceiling"]),
+                decision_thresholds=dict(pc["decision_thresholds"]),
+                invalidation_triggers=list(pc.get("invalidation_triggers") or []),
+                regulatory_mapping=list(pc.get("regulatory_mapping") or []),
+                description=pack.get("description", ""),
+            )
+
+    raise ValueError(
+        f"Unknown policy profile_id {profile_id!r}. "
+        f"Registered profiles: {sorted(PROFILES.keys())}"
+    )
 
 
 def list_profiles() -> List[str]:

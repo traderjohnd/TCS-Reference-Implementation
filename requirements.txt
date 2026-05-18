@@ -1,3 +1,22 @@
-pydantic>=2.0
+# TCS Reference Implementation — runtime + test dependencies
+#
+# Pinned to the versions verified to pass the full test suite (667
+# tests + 1 skipped) and to build the React frontend without issues.
+# Lower bounds reflect the minimum API the code uses; upper bounds
+# guard against incompatible breaking changes.
+#
+# Install all:    pip install -r requirements.txt
+# Postgres extra: pip install -r requirements-pg.txt  (optional)
+# LLM providers:  pip install -r requirements-llm.txt (optional)
+
+# ─── Core engine + validation ──────────────────────────────────────────────
+pydantic>=2.0,<3
 python-dateutil>=2.8
-pytest>=7.0
+
+# ─── HTTP API surface ──────────────────────────────────────────────────────
+fastapi>=0.110,<1
+uvicorn[standard]>=0.30,<1
+httpx>=0.27,<1
+
+# ─── Tests ─────────────────────────────────────────────────────────────────
+pytest>=7.0,<10
