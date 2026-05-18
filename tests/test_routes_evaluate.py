@@ -201,6 +201,102 @@ class TestEnforceMode:
 
 
 # --------------------------------------------------------------------------- #
+# Regression: enforce-mode TCs MUST NOT use lifecycle_state="observed"        #
+# --------------------------------------------------------------------------- #
+#
+# Slice 5.6 review caught a wording error in the summary report
+# ("enforce / MedDev -> Hold (intervened, TC issued, lifecycle
+# observed)") and asked us to verify the BACKEND wasn't actually
+# mislabeling enforce TCs. The backend is correct: observe mode
+# overrides lifecycle to "observed"; enforce mode leaves it at the
+# decision-derived value (admissible / computed / blocked). This
+# regression test pins the contract explicitly so a future refactor
+# can't quietly invert it.
+
+class TestLifecycleStateRegression:
+    @pytest.mark.parametrize("query,policy_id,expected_decision,expected_lifecycle", [
+        # Clean RAG query under the permissive enterprise baseline
+        # -> Allow -> admissible. (Use enterprise-info-standard-v1
+        # rather than MedDev so the synthetic-default A score still
+        # passes the gate cleanly.)
+        (
+            "Document retention policy summary please.",
+            "enterprise-info-standard-v1",
+            "Allow", "admissible",
+        ),
+        # Consumer lithium-self-dosing under MedDev (we deploy it
+        # below as the active pack) -> Stop -> blocked.
+        (
+            "I'm pregnant and want to know what dose of lithium to take",
+            None,  # use active pack (MedDev)
+            "Stop", "blocked",
+        ),
+    ])
+    def test_enforce_lifecycle_matches_decision_never_observed(
+        self, client, query, policy_id, expected_decision, expected_lifecycle,
+    ):
+        deployed = _deploy_meddev(client)
+        g = client.post("/v2/generate", json={
+            "generation_mode": "rag_llm",
+            "prompt": query,
+            "provider": "mock",
+            "industry_hint": "life_sciences",
+        }).json()
+        body = {
+            "artifact_id": g["artifact_id"],
+            "mode": "enforce",
+            "policy_profile_id": policy_id or deployed["pack_id"],
+        }
+        r = client.post("/v2/evaluate", json=body).json()
+        assert r["decision"] == expected_decision, (
+            f"decision drift for query {query!r} under "
+            f"{body['policy_profile_id']}; expected {expected_decision}, "
+            f"got {r['decision']}"
+        )
+        tc = client.get(f"/v2/certificates/{r['trust_certificate_id']}").json()
+        assert tc["lifecycle_state"] == expected_lifecycle, (
+            f"enforce-mode TC for decision={expected_decision} should have "
+            f"lifecycle_state={expected_lifecycle!r}; got {tc['lifecycle_state']!r}"
+        )
+        # The crisp invariant: enforce mode NEVER yields 'observed'.
+        assert tc["lifecycle_state"] != "observed", (
+            "enforce-mode TC must not be labeled 'observed' — that "
+            "label is reserved for observe-mode evaluations"
+        )
+
+    def test_observe_lifecycle_always_observed_regardless_of_decision(
+        self, client,
+    ):
+        # The complementary half: observe-mode TCs ARE always
+        # labeled 'observed' (regardless of the underlying decision),
+        # because the observe-mode override is what distinguishes
+        # them from enforce-mode TCs.
+        deployed = _deploy_meddev(client)
+        for query in (
+            "Routine question about policy retention.",
+            "I'm pregnant and want to know what dose of lithium to take",
+        ):
+            g = client.post("/v2/generate", json={
+                "generation_mode": "rag_llm",
+                "prompt": query,
+                "provider": "mock",
+                "industry_hint": "life_sciences",
+            }).json()
+            r = client.post("/v2/evaluate", json={
+                "artifact_id": g["artifact_id"],
+                "mode": "observe",
+                "policy_profile_id": deployed["pack_id"],
+            }).json()
+            tc = client.get(f"/v2/certificates/{r['trust_certificate_id']}").json()
+            assert tc["lifecycle_state"] == "observed", (
+                f"observe-mode TC for query {query!r} should be "
+                f"'observed'; got {tc['lifecycle_state']!r}"
+            )
+            assert r["enforcement_action"] == "logged_only"
+            assert r["delivery_intervention"] is False
+
+
+# --------------------------------------------------------------------------- #
 # Mode 3 — what_if                                                             #
 # --------------------------------------------------------------------------- #
 
