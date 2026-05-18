@@ -275,6 +275,59 @@ class PolicyProfile:
 # without updating POLICY_PROFILES.md first.
 
 _RAW_PROFILES: Dict[str, dict] = {
+
+    # Profile 0: Baseline — no standards pack deployed.
+    #
+    # Phase 5 amendment (post Slice 5.3). The formal fallback profile
+    # the /v2/evaluate resolver uses when:
+    #   1. the caller did not pass a policy_profile_id, AND
+    #   2. no active pack is currently deployed.
+    #
+    # The architectural rule the user pinned: "policy_profile_id=null"
+    # MUST NOT mean "no policy math". TIS always needs a resolved
+    # configuration. baseline-no-pack is that resolved configuration
+    # for the "nothing else specified" case — permissive r1/a1
+    # canonical defaults, empty regulatory_mapping, and a description
+    # that makes its purpose explicit in any audit record.
+    #
+    # Replay narrative this enables:
+    #   Raw artifact
+    #     → baseline-no-pack observe   ← formal baseline, not "null"
+    #     → MedDev observe
+    #     → MedDev enforce
+    #     → Financial what-if
+    "baseline-no-pack": {
+        "profile_id": "baseline-no-pack",
+        "domain": "baseline",
+        "risk_tier": "r1",
+        "action_class": "a1",
+        "gate_set": ["B", "A", "C"],
+        "thresholds": {"B": 0.70, "A": 0.70, "C": 0.75, "K": 0.60},
+        "weights": {"B": 0.25, "A": 0.25, "C": 0.30, "K": 0.20},
+        "penalty_weights": {
+            "cb": 0.20, "d": 0.20, "n": 0.20, "h": 0.20, "ps": 0.20
+        },
+        "decay_rate": 0.008,
+        "soft_hold_ceiling": 0.85,
+        "decision_thresholds": {
+            "theta_allow": 0.75, "theta_hold": 0.65, "theta_escalate": 0.55
+        },
+        "invalidation_triggers": [
+            "model_version_change", "policy_update",
+            "data_distribution_drift", "environmental_change",
+        ],
+        "regulatory_mapping": [],
+        "description": (
+            "Baseline profile used when no standards pack is deployed "
+            "and no profile is explicitly specified. TIS still computes "
+            "BACK/gates/decision against canonical r1/a1 defaults, so "
+            "/v2/evaluate always runs full governance math rather than "
+            "short-circuiting on null policy. Replace by deploying a "
+            "standards pack (Policy Controls) or by passing an explicit "
+            "policy_profile_id."
+        ),
+    },
+
     # Profile 1: Financial Services — High Risk Regulated Decision
     "fin-high-risk-suitability-v3": {
         "profile_id": "fin-high-risk-suitability-v3",
