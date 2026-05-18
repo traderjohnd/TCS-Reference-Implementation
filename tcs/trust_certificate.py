@@ -870,8 +870,23 @@ def _generate_explanation(
             + "."
         )
 
+    # Phase 5 Slice 5.5 — make the audit explicit when the subject is a
+    # human-composed draft (no LLM in the loop). Reviewers reading the
+    # TC should be able to tell at a glance that this evaluation
+    # governed a human-authored outbound message before delivery, not
+    # an LLM completion.
+    if inp.subject_type == "human_composed":
+        subject_clause = (
+            f"Human-composed draft message '{inp.subject_id}' (no LLM "
+            f"in the loop) evaluated against"
+        )
+    else:
+        subject_clause = (
+            f"Subject '{inp.subject_id}' ({inp.subject_type}) evaluated against"
+        )
+
     summary = (
-        f"Subject '{inp.subject_id}' ({inp.subject_type}) evaluated against "
+        f"{subject_clause} "
         f"policy '{profile.profile_id}' at {profile.risk_tier}/{profile.action_class} "
         f"in domain '{profile.domain}'. "
         f"Gate set {gate_set_str} evaluated: {gates_str}. "
