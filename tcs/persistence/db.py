@@ -172,6 +172,52 @@ CREATE TABLE IF NOT EXISTS policy_adaptations (
 CREATE INDEX IF NOT EXISTS idx_pa_profile ON policy_adaptations (risk_tolerance_profile_id);
 CREATE INDEX IF NOT EXISTS idx_pa_status  ON policy_adaptations (approval_status);
 
+-- Response artifacts + governance evaluations (Phase 5 — Runtime Sidecar
+-- Transparency). These tables separate generation from governance
+-- evaluation so the same captured output can be replayed under different
+-- policies. Both are append-only — once generated, an artifact may not be
+-- mutated, and an evaluation against that artifact may not be rewritten.
+-- Corrections take the form of new evaluations, not edits to old ones.
+
+CREATE TABLE IF NOT EXISTS response_artifacts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_id         TEXT    NOT NULL UNIQUE,
+    created_at          TEXT    NOT NULL,
+    generation_mode     TEXT    NOT NULL,
+    prompt_hash         TEXT,
+    raw_output_hash     TEXT,
+    provider            TEXT,
+    model               TEXT,
+    session_id          TEXT,
+    content_json        TEXT    NOT NULL,
+    inserted_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_artifact_created  ON response_artifacts (created_at);
+CREATE INDEX IF NOT EXISTS idx_artifact_session  ON response_artifacts (session_id);
+CREATE INDEX IF NOT EXISTS idx_artifact_mode     ON response_artifacts (generation_mode);
+CREATE INDEX IF NOT EXISTS idx_artifact_prompt   ON response_artifacts (prompt_hash);
+
+CREATE TABLE IF NOT EXISTS governance_evaluations (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_id         TEXT    NOT NULL UNIQUE,
+    artifact_id           TEXT    NOT NULL,
+    created_at            TEXT    NOT NULL,
+    mode                  TEXT    NOT NULL,
+    policy_profile_id     TEXT,
+    decision              TEXT    NOT NULL,
+    enforcement_action    TEXT    NOT NULL,
+    delivery_intervention INTEGER NOT NULL DEFAULT 0,
+    trust_certificate_id  TEXT,
+    content_json          TEXT    NOT NULL,
+    inserted_at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (artifact_id) REFERENCES response_artifacts(artifact_id)
+);
+CREATE INDEX IF NOT EXISTS idx_eval_artifact  ON governance_evaluations (artifact_id);
+CREATE INDEX IF NOT EXISTS idx_eval_tc        ON governance_evaluations (trust_certificate_id);
+CREATE INDEX IF NOT EXISTS idx_eval_mode      ON governance_evaluations (mode);
+CREATE INDEX IF NOT EXISTS idx_eval_decision  ON governance_evaluations (decision);
+CREATE INDEX IF NOT EXISTS idx_eval_created   ON governance_evaluations (created_at);
+
 -- Recovery incidents (Phase 3 Step 5 — Recovery Orchestrator).
 -- Tracks the six-phase recovery lifecycle. Status updates are allowed
 -- on phase, status, and diagnostic fields. Core trigger evidence is immutable.
@@ -243,6 +289,34 @@ CREATE TRIGGER IF NOT EXISTS block_delete_request_audit
 BEFORE DELETE ON request_audit
 BEGIN
     SELECT RAISE(ABORT, 'request_audit is append-only (C-R.18)');
+END;
+
+-- Phase 5 append-only triggers. response_artifacts and
+-- governance_evaluations follow the same C-R.18 discipline as the TC
+-- tables: corrections are new rows, never mutations.
+
+CREATE TRIGGER IF NOT EXISTS block_update_response_artifacts
+BEFORE UPDATE ON response_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'response_artifacts is append-only (Phase 5)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS block_delete_response_artifacts
+BEFORE DELETE ON response_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'response_artifacts is append-only (Phase 5)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS block_update_governance_evaluations
+BEFORE UPDATE ON governance_evaluations
+BEGIN
+    SELECT RAISE(ABORT, 'governance_evaluations is append-only (Phase 5)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS block_delete_governance_evaluations
+BEFORE DELETE ON governance_evaluations
+BEGIN
+    SELECT RAISE(ABORT, 'governance_evaluations is append-only (Phase 5)');
 END;
 """
 
