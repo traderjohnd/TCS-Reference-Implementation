@@ -693,7 +693,32 @@ def _derive_blocking_reason(
             return f"{base}_{ctx}"
         return base
 
-    # 3. Gate failure. Use the first failing dimension to build the reason.
+    # 3. Governance-rule reason (Slice 5.5a). When a rule fired and
+    # provided a blocking_reason (e.g. the typed-context lithium
+    # rule's "patient_specific_medication_guidance_during_pregnancy"),
+    # surface that as the TC's blocking_reason rather than the
+    # less-specific gate-failure string. The rule reason names the
+    # actual risk; the gate failure is downstream evidence. The gate
+    # info still appears in failure_mode / failing_dimensions for
+    # diagnostic use.
+    rule_reason = inp.context_metadata.get("governance_rule_blocking_reason")
+    if isinstance(rule_reason, str) and rule_reason:
+        cat = (
+            inp.context_metadata.get("governance_primary_safety_category")
+            or (
+                # Fallback to the typed-context blocking_context if no
+                # primary_safety_category was merged (typed-context
+                # deterministic_bounded rules don't propagate it).
+                (
+                    inp.context_metadata.get("blocking_context", "").split(":")[0]
+                    if ":" in str(inp.context_metadata.get("blocking_context", ""))
+                    else None
+                )
+            )
+        )
+        return f"{cat}:{rule_reason}" if cat else rule_reason
+
+    # 4. Gate failure. Use the first failing dimension to build the reason.
     if tis_result.failing_dimensions:
         dim = tis_result.failing_dimensions[0]
         score = inp.dimension_scores[dim]

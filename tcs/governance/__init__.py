@@ -82,6 +82,11 @@ from tcs.governance.risk_classifier import (
     merge_effects,
 )
 from tcs.governance.scenario_rules import SCENARIO_RULES
+from tcs.governance.typed_context_rules import (
+    TYPED_CONTEXT_RULES,
+    TypedContextRule,
+    evaluate_typed_context_rules,
+)
 
 __all__ = [
     # Schema
@@ -110,6 +115,10 @@ __all__ = [
     "merge_effects",
     # Rules
     "SCENARIO_RULES",
+    # Typed-context rules (Slice 5.5a)
+    "TypedContextRule",
+    "TYPED_CONTEXT_RULES",
+    "evaluate_typed_context_rules",
     # Typed-facts foundation (schema only; evaluator is a follow-up slice)
     "GovernedFacts",
     "evaluate_bounded_controls",

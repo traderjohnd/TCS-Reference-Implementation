@@ -446,6 +446,16 @@ def _score_via_artifact_metadata(
     retrieved_sources, recipient_context, generation_mode defaults.
     Used when no prior runtime snapshot exists, OR when the caller
     explicitly asks for a fresh metadata-based re-evaluation.
+
+    Phase 5 Slice 5.5a: runs the typed-context rule evaluator
+    alongside the term-group classifier. Typed-context rules fire
+    on the combination of recipient_context typed facts +
+    draft-text matching — most importantly, the lithium-to-pregnant-
+    patient outbound case the pure term-group rules cannot catch.
+    Both evaluators emit RuleMatch objects with the same audit shape;
+    we merge them into a single governance_rule_matches list and
+    re-run effect aggregation so the merged decision_pressure /
+    blocking_reason / penalties reflect the union.
     """
     classifier_query = _build_classifier_query(artifact)
     meta_in = _build_metadata_from_artifact(
@@ -453,11 +463,22 @@ def _score_via_artifact_metadata(
     )
     ctx, _resolved = assemble_context_v2(meta_in, base_profile=profile)
 
+    # ---- Slice 5.5a: typed-context rules ----------------------------- #
+    # Run the typed-context evaluator over the artifact's structured
+    # recipient_context + draft. Merge matching rules into the
+    # existing governance_rule_matches list so the audit shape
+    # stays uniform across rule sources.
+    typed_matches = _apply_typed_context_rules(
+        artifact=artifact, profile=profile, ctx=ctx,
+    )
+
     dim_scores = _default_dimension_scores(artifact)
     if ctx.get("c3_score_computed", 1.0) == 0.0:
         dim_scores["C"] = 0.0
 
-    # Apply rule-emitted numeric penalties to dim scores.
+    # Apply rule-emitted numeric penalties to dim scores (includes
+    # both term-group and typed-context rule matches because they
+    # share the governance_rule_matches list at this point).
     if isinstance(ctx.get("governance_rule_matches"), list):
         b_pen = a_pen = k_pen = 0.0
         for m in ctx["governance_rule_matches"]:
@@ -485,6 +506,106 @@ def _score_via_artifact_metadata(
         invalidation_event=None,
         evaluation_time=eval_time,
     )
+
+
+def _apply_typed_context_rules(
+    *,
+    artifact: ResponseArtifact,
+    profile: PolicyProfile,
+    ctx: Dict[str, Any],
+) -> List[Any]:
+    """
+    Run the typed-context evaluator and merge results into the
+    existing rule-audit pipeline.
+
+    Side effects on ``ctx``:
+      - extends ``ctx["governance_rule_matches"]`` with the typed-
+        context rule matches (in addition to term-group matches the
+        GCA already populated)
+      - sets / updates ``ctx["governance_rule_blocking_reason"]``,
+        ``ctx["governance_rule_decision_pressure"]``,
+        ``ctx["governance_rule_requires_human_review"]``,
+        ``ctx["governance_override_policy"]`` from the typed-context
+        merged effect when stronger than what's already set
+      - records ``active_policy_profile_id`` on every typed-context
+        audit dict so the audit format stays uniform with term-group
+        matches
+
+    Returns the list of RuleMatch objects that fired (may be empty).
+    """
+    from tcs.governance import (
+        evaluate_typed_context_rules,
+        merge_effects,
+    )
+
+    # Draft text: for human_composed the artifact's raw_output IS
+    # the outbound message. For other generation modes, the draft
+    # is the prompt + raw_output (so rules can match against
+    # either). Most typed-context rules today target human_composed
+    # via applies_to_generation_modes; the broader text is just
+    # defensive for future rules.
+    if artifact.generation_mode == "human_composed":
+        draft_text = artifact.raw_output or ""
+    else:
+        draft_text = f"{artifact.prompt or ''} {artifact.raw_output or ''}"
+
+    domain = getattr(profile, "domain", None)
+    matches = evaluate_typed_context_rules(
+        generation_mode=artifact.generation_mode,
+        recipient_context=artifact.recipient_context,
+        draft_text=draft_text,
+        domain=domain,
+    )
+    if not matches:
+        return []
+
+    # Append per-rule audit dicts to the existing list.
+    existing = ctx.get("governance_rule_matches") or []
+    active_profile_id = getattr(profile, "profile_id", None)
+    for m in matches:
+        d = m.to_audit_dict()
+        d["active_policy_profile_id"] = active_profile_id
+        d["rule_evaluator"] = "typed_context"  # audit hint
+        existing.append(d)
+    ctx["governance_rule_matches"] = existing
+
+    # Re-aggregate the merged effect across typed-context matches
+    # (the term-group merge already ran inside assemble_context_v2;
+    # we apply the typed-context aggregate on top).
+    agg = merge_effects(matches)
+
+    if agg.blocking_reason:
+        # Surface as the governance rule's reason. We do NOT
+        # overwrite an existing blocking_context that came from a
+        # term-group C3 violation (those are strictly more severe);
+        # otherwise we set it so the TC machinery can pick it up.
+        if not ctx.get("blocking_context"):
+            cat = agg.primary_safety_category
+            ctx["blocking_context"] = (
+                f"{cat}:{agg.blocking_reason}" if cat else agg.blocking_reason
+            )
+        # Always record the typed-context-side reason for audit.
+        ctx["governance_rule_blocking_reason"] = (
+            ctx.get("governance_rule_blocking_reason") or agg.blocking_reason
+        )
+
+    if agg.requires_human_review:
+        ctx["governance_rule_requires_human_review"] = True
+
+    if agg.decision_pressure:
+        # Stronger decision_pressure wins (STOP > HOLD > ESCALATE).
+        existing_pressure = ctx.get("governance_rule_decision_pressure")
+        pressure_priority = {"STOP": 3, "HOLD": 2, "ESCALATE": 1}
+        if (
+            pressure_priority.get(agg.decision_pressure, 0)
+            > pressure_priority.get(existing_pressure or "", 0)
+        ):
+            ctx["governance_rule_decision_pressure"] = agg.decision_pressure
+
+    if agg.override_policy and not ctx.get("governance_override_policy"):
+        ctx["governance_override_policy"] = agg.override_policy
+
+    return matches
 
 
 def _resolve_strategy(
