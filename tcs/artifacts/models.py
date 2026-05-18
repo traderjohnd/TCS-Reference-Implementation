@@ -72,6 +72,27 @@ ENFORCEMENT_LOGGED_ONLY          = "logged_only"           # observe
 ENFORCEMENT_COUNTERFACTUAL_ONLY  = "counterfactual_only"   # what_if
 
 
+# Evaluation origin — tracks the call path that produced an evaluation
+# row. Lets a future auditor answer the question "was this Trust
+# Certificate created during actual runtime enforcement, observe
+# monitoring, or a replay analysis?"
+#
+#   direct  — a single direct /v2/evaluate call.
+#   replay  — one of N evaluations in a /v2/replay batch.
+#   query   — created behind the scenes by /v2/query (the
+#             convenience route that internally fans out to
+#             generation + evaluation).
+EVALUATION_ORIGIN_DIRECT  = "direct"
+EVALUATION_ORIGIN_REPLAY  = "replay"
+EVALUATION_ORIGIN_QUERY   = "query"
+
+_EVALUATION_ORIGINS = frozenset({
+    EVALUATION_ORIGIN_DIRECT,
+    EVALUATION_ORIGIN_REPLAY,
+    EVALUATION_ORIGIN_QUERY,
+})
+
+
 # --------------------------------------------------------------------------- #
 # ResponseArtifact                                                             #
 # --------------------------------------------------------------------------- #
@@ -383,6 +404,12 @@ class GovernanceEvaluation:
     evaluator_identity: Dict[str, Any] = field(default_factory=dict)
     evaluation_completeness_score: float = 1.0
 
+    # Call-path tag (Slice 5.4). Distinguishes evaluations created by
+    # /v2/evaluate (direct), /v2/replay (replay), or /v2/query (query).
+    # Defaults to "direct" so existing callers and persisted rows
+    # remain compatible without explicit updates.
+    evaluation_origin: str = EVALUATION_ORIGIN_DIRECT
+
     # --- Validation + derivation ---------------------------------------- #
 
     def __post_init__(self) -> None:
@@ -447,6 +474,14 @@ class GovernanceEvaluation:
                 "(per locked design decision: counterfactual only, no TC)"
             )
 
+        # evaluation_origin must be one of the three declared values.
+        # Defaulting to "direct" is fine; explicit junk values are not.
+        if self.evaluation_origin not in _EVALUATION_ORIGINS:
+            raise ValueError(
+                f"unknown evaluation_origin {self.evaluation_origin!r}; "
+                f"expected one of: {sorted(_EVALUATION_ORIGINS)}"
+            )
+
     # --- Serialization --------------------------------------------------- #
 
     def to_dict(self) -> Dict[str, Any]:
@@ -476,6 +511,7 @@ class GovernanceEvaluation:
             "evaluation_completeness_score": float(
                 self.evaluation_completeness_score
             ),
+            "evaluation_origin": self.evaluation_origin,
         }
 
     @classmethod
@@ -505,5 +541,10 @@ class GovernanceEvaluation:
             evaluator_identity=dict(d.get("evaluator_identity") or {}),
             evaluation_completeness_score=float(
                 d.get("evaluation_completeness_score", 1.0)
+            ),
+            # Back-compat: rows persisted before this field existed
+            # round-trip as "direct" (which is what they were).
+            evaluation_origin=d.get(
+                "evaluation_origin", EVALUATION_ORIGIN_DIRECT,
             ),
         )

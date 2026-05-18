@@ -87,6 +87,7 @@ from tcs.artifacts.models import (
     EVALUATION_MODE_ENFORCE,
     EVALUATION_MODE_OBSERVE,
     EVALUATION_MODE_WHAT_IF,
+    EVALUATION_ORIGIN_DIRECT,
     GENERATION_MODE_AGENT_WORKFLOW,
     GENERATION_MODE_HUMAN_COMPOSED,
     GENERATION_MODE_RAG_LLM,
@@ -278,6 +279,7 @@ def evaluate_artifact(
     policy_profile_id: Optional[str] = None,
     evaluator_identity: Optional[Dict[str, Any]] = None,
     certificate_store: Any = None,
+    origin: str = EVALUATION_ORIGIN_DIRECT,
 ) -> Tuple[GovernanceEvaluation, Optional[TrustCertificate]]:
     """
     Evaluate a stored artifact under the given mode and policy.
@@ -467,6 +469,7 @@ def evaluate_artifact(
         trust_certificate_id=tc_id,
         evaluator_identity=dict(evaluator_identity or {}),
         evaluation_completeness_score=1.0,
+        evaluation_origin=origin,
     )
     return evaluation, tc
 

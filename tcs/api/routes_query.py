@@ -275,6 +275,144 @@ def _workflow_trace_enabled() -> bool:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Phase 5 Slice 5.4 — /v2/query artifact + evaluation persistence              #
+# --------------------------------------------------------------------------- #
+#
+# /v2/query was originally a fused generate+evaluate+deliver pipeline. The
+# Phase-5 sidecar architecture splits those tiers so the same captured
+# output can be replayed under different policies. Rather than rewrite
+# /v2/query as two separate calls (which would risk parity drift), we
+# leave its scoring path bit-for-bit identical and ADD persistence
+# side-effects: every request now writes a ResponseArtifact + a
+# GovernanceEvaluation (evaluation_origin="query") in addition to the
+# existing TC. The artifact_id is later usable by /v2/replay or
+# /v2/evaluate without re-calling the LLM.
+
+def _persist_query_artifact_and_evaluation(
+    *,
+    artifact_store: Any,
+    body: "QueryRequest",
+    provider_name: str,
+    model_name: str,
+    industry: Optional[str],
+    trace: Any,
+    tis_input: Any,
+    tis_result: Any,
+    decision: str,
+    issued_tc: Any,
+    composer_metadata: Optional[Dict[str, Any]],
+) -> None:
+    """
+    Best-effort persistence of artifact + evaluation rows for a query.
+    Raises are caught at the call site so /v2/query semantics never
+    break on a persistence failure.
+    """
+    from tcs.artifacts import (
+        EVALUATION_MODE_ENFORCE,
+        EVALUATION_ORIGIN_QUERY,
+        GENERATION_MODE_AGENT_WORKFLOW,
+        GovernanceEvaluation,
+        ResponseArtifact,
+    )
+    from tcs.artifacts.evaluation import _snapshot_profile
+
+    # Extract retrieved chunks from the trace for the artifact's
+    # retrieved_sources field. Pulled from the RAG node's payload.
+    retrieved_sources: List[Dict[str, Any]] = []
+    rag_context: Optional[str] = None
+    try:
+        rag_node = trace.get_node("rag-retrieve")
+        if rag_node is not None and isinstance(rag_node.payload, list):
+            bodies: List[str] = []
+            for c in rag_node.payload:
+                if not isinstance(c, dict):
+                    continue
+                retrieved_sources.append({
+                    "chunk_id":         c.get("chunk_id"),
+                    "source_doc":       c.get("source_doc"),
+                    "version":          c.get("version"),
+                    "similarity_score": c.get("similarity_score"),
+                })
+                if c.get("content"):
+                    bodies.append(c["content"])
+            if bodies:
+                rag_context = "\n\n".join(bodies)
+    except KeyError:
+        pass
+
+    # Build the artifact. The system prompt currently used in
+    # /v2/query is the leftover hardcoded "financial advisory"
+    # string for openai/anthropic; we record it as None here rather
+    # than reaching into the connector internals to extract it.
+    # Future cleanup will route /v2/query through the same industry-
+    # derived prompt logic as /v2/generate, at which point this
+    # field will populate. The artifact persists faithfully whatever
+    # the scoring path actually saw.
+    artifact = ResponseArtifact(
+        generation_mode=GENERATION_MODE_AGENT_WORKFLOW,
+        prompt=body.query,
+        raw_output=trace.final_output,
+        provider=provider_name,
+        model=model_name,
+        system_prompt_used=None,
+        rag_enabled=True,
+        rag_context=rag_context,
+        retrieved_sources=retrieved_sources,
+        workflow_trace_id=trace.workflow_id,
+        workflow_trace=trace.to_dict(),
+        recipient_context={"industry_hint": industry} if industry else {},
+        generation_identity={
+            "requesting_identity": "query_endpoint",
+            "identity_type": "system",
+            "role": "runtime_query_path",
+            "session_id": getattr(trace, "workflow_id", None),
+        },
+    )
+    artifact_store.insert_artifact(artifact)
+
+    # Build the evaluation. Reuses the SAME tis_input / tis_result /
+    # decision the scoring path already computed — no re-scoring, no
+    # divergence risk. evaluation_origin="query" tags this row as
+    # runtime, not direct or replay.
+    profile = tis_input.policy_profile
+    snapshot = _snapshot_profile(profile)
+    rule_matches = (
+        tis_input.context_metadata.get("governance_rule_matches")
+        if tis_input.context_metadata else None
+    )
+    selected_standards: List[str] = []
+    if composer_metadata:
+        selected_standards = list(composer_metadata.get("standards") or [])
+
+    evaluation = GovernanceEvaluation(
+        artifact_id=artifact.artifact_id,
+        mode=EVALUATION_MODE_ENFORCE,
+        policy_profile_id=profile.profile_id,
+        policy_profile_snapshot=snapshot,
+        selected_standards=selected_standards,
+        enabled_controls=[],
+        rule_matches=rule_matches,
+        component_scores={
+            k: round(v, 4) for k, v in tis_input.dimension_scores.items()
+        },
+        gate_results=dict(tis_result.gate_results_by_dim),
+        s_base=round(tis_result.s_base, 4),
+        s_adjusted=round(tis_result.s_adj, 4),
+        tis_current=round(tis_result.tis_current, 4),
+        decision=decision,
+        trust_certificate_id=issued_tc.certificate_id,
+        evaluator_identity={
+            "requesting_identity": "query_endpoint",
+            "identity_type": "system",
+            "role": "runtime_query_path",
+        },
+        evaluation_completeness_score=1.0,
+        evaluation_origin=EVALUATION_ORIGIN_QUERY,
+    )
+    artifact_store.insert_evaluation(evaluation)
+
+
 def _run_query_via_trace(
     body: "QueryRequest",
     store,
@@ -283,6 +421,7 @@ def _run_query_via_trace(
     model_name: str,
     composer_metadata: Optional[Dict[str, Any]] = None,
     industry: Optional[str] = None,
+    artifact_store: Optional[Any] = None,
 ) -> "QueryResponse":
     """
     Phase 4 / Slice 1: workflow-graph query path.
@@ -391,6 +530,33 @@ def _run_query_via_trace(
     blocked = decision in ("Hold", "Escalate", "Stop")
     response_text = trace.final_output if not blocked else None
 
+    # Phase 5 Slice 5.4 — alongside the existing scoring path, persist
+    # a ResponseArtifact + GovernanceEvaluation so /v2/query
+    # participates in the runtime sidecar audit trail (and is
+    # replayable later via /v2/replay or /v2/evaluate). This is
+    # PERSISTENCE INSTRUMENTATION: it does not change the scoring
+    # path or the response shape — those remain bit-for-bit identical
+    # to pre-5.4 /v2/query. The parity test in
+    # tests/test_query_refactor_parity.py pins this.
+    if artifact_store is not None:
+        try:
+            _persist_query_artifact_and_evaluation(
+                artifact_store=artifact_store,
+                body=body,
+                provider_name=provider_name,
+                model_name=model_name,
+                industry=industry,
+                trace=trace,
+                tis_input=tis_input,
+                tis_result=tis_result,
+                decision=decision,
+                issued_tc=issued_tc,
+                composer_metadata=composer_metadata,
+            )
+        except Exception:  # noqa: BLE001
+            # Persistence is best-effort; never break /v2/query.
+            pass
+
     # Pull the retrieved chunks from the RAG node's payload. The
     # trace is the source of truth — no second retrieval. The GCA
     # already governed these exact chunks via the RAG node's event.
@@ -463,6 +629,12 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
     from demos.governed_rag.pipeline import GovernedRAGPipeline
 
     store = request.app.state.store
+    # Phase 5 Slice 5.4 — /v2/query also writes a ResponseArtifact
+    # + GovernanceEvaluation per request so the runtime sidecar audit
+    # trail covers query traffic. Optional: if the app didn't register
+    # an artifact_store (test paths that build a bare app), instrument
+    # is silently skipped.
+    artifact_store = getattr(request.app.state, "artifact_store", None)
 
     # Resolve profile_id. Explicit value wins; otherwise use the active
     # deployed pack (Standards Composer or any other pack); otherwise
@@ -532,6 +704,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
                 model_name=model_name,
                 composer_metadata=_active_composer_metadata,
                 industry=_active_industry,
+                artifact_store=artifact_store,
             )
         except Exception as e:
             return QueryResponse(
