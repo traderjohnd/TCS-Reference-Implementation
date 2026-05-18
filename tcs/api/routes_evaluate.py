@@ -86,6 +86,29 @@ class EvaluateRequest(BaseModel):
             "support replay / what-if comparisons (D3)."
         ),
     )
+    strategy: Optional[str] = Field(
+        None,
+        description=(
+            "How to construct the TISInput for this evaluation (Slice "
+            "5.4a — replay fidelity). One of:\n"
+            "  - runtime_snapshot: replay a prior captured TISInput "
+            "verbatim. Requires the artifact to have a prior evaluation "
+            "with a snapshot (e.g. one written by /v2/query).\n"
+            "  - artifact_metadata: fresh metadata-based scoring "
+            "(derives signals from artifact provenance). Use when no "
+            "snapshot exists or when explicitly re-evaluating from "
+            "scratch.\n"
+            "  - what_if_policy_replay: take a prior snapshot's BACK "
+            "signals AND context evidence, score under a DIFFERENT "
+            "policy. Isolates policy impact from evidence drift.\n"
+            "When omitted (recommended), auto-resolves: runtime_snapshot "
+            "if a prior runtime snapshot exists and matches the policy; "
+            "what_if_policy_replay if a snapshot exists but policy "
+            "differs; artifact_metadata otherwise. This default makes "
+            "the regression-test guarantee hold: re-evaluating a "
+            "query-origin artifact reproduces the runtime decision."
+        ),
+    )
     evaluator_identity: Optional[Dict[str, Any]] = Field(
         None,
         description=(
@@ -111,6 +134,9 @@ class EvaluateResponse(BaseModel):
     tis_current: float
     component_scores: Dict[str, float]
     gate_results: Dict[str, str]
+    # Slice 5.4a: surface the strategy actually used so callers can
+    # tell whether they got a runtime-replay or a fresh re-evaluation.
+    evaluation_strategy: str
 
 
 # --------------------------------------------------------------------------- #
@@ -165,6 +191,28 @@ def _artifact_store(request: Request) -> ArtifactStore:
     return store
 
 
+def _lookup_runtime_snapshot(
+    artifact_store: ArtifactStore, artifact_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Find the most recent prior evaluation with a non-None
+    governance_input_snapshot for the given artifact. Used by
+    /v2/evaluate and /v2/replay to default-resolve the
+    runtime_snapshot strategy.
+
+    Returns None if no such evaluation exists yet. Returns the
+    full snapshot dict otherwise — the evaluator decides whether
+    to use it based on policy match (same policy → runtime_snapshot,
+    different policy → what_if_policy_replay).
+    """
+    prior = artifact_store.list_evaluations_for_artifact(artifact_id)
+    # Most recent first — list is ordered oldest first by the store.
+    for ev in reversed(prior):
+        if ev.governance_input_snapshot:
+            return dict(ev.governance_input_snapshot)
+    return None
+
+
 def _certificate_store(request: Request) -> Any:
     """Per-app CertificateStore for TC issuance in observe/enforce."""
     return getattr(request.app.state, "store", None)
@@ -210,6 +258,13 @@ def post_evaluate(body: EvaluateRequest, request: Request) -> EvaluateResponse:
         _certificate_store(request) if mode != EVALUATION_MODE_WHAT_IF else None
     )
 
+    # Slice 5.4a: load a prior runtime snapshot if one exists, so
+    # default strategy resolution can prefer runtime_snapshot replay
+    # over a fresh metadata-based scoring pass. This is what makes
+    # /v2/evaluate reproduce /v2/query's decision on the same artifact
+    # + same policy by default.
+    source_snapshot = _lookup_runtime_snapshot(artifact_store, body.artifact_id)
+
     try:
         evaluation, _tc = evaluate_artifact(
             artifact=artifact,
@@ -217,6 +272,8 @@ def post_evaluate(body: EvaluateRequest, request: Request) -> EvaluateResponse:
             policy_profile_id=profile_id,
             evaluator_identity=body.evaluator_identity,
             certificate_store=cert_store,
+            strategy=body.strategy,
+            source_snapshot=source_snapshot,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -237,6 +294,7 @@ def post_evaluate(body: EvaluateRequest, request: Request) -> EvaluateResponse:
         tis_current=evaluation.tis_current,
         component_scores=dict(evaluation.component_scores),
         gate_results=dict(evaluation.gate_results),
+        evaluation_strategy=evaluation.evaluation_strategy,
     )
 
 

@@ -93,6 +93,47 @@ _EVALUATION_ORIGINS = frozenset({
 })
 
 
+# Evaluation strategy (Slice 5.4a) — describes HOW the evaluation
+# computed its TISInput, which determines whether replay can
+# reproduce the original decision deterministically.
+#
+#   runtime_snapshot
+#       The evaluation reused a previously captured TISInput
+#       verbatim. Used when /v2/query writes its evaluation row
+#       (the captured TISInput goes into governance_input_snapshot),
+#       and when /v2/evaluate is later asked to replay that snapshot
+#       to reproduce the runtime decision. The TIS engine is
+#       deterministic, so this produces identical scores and
+#       decisions every time.
+#
+#   artifact_metadata
+#       The evaluation rebuilt a TISInput from the artifact's
+#       provenance (retrieved_sources, recipient_context, etc.)
+#       using the GCA's metadata path (assemble_context_v2). This
+#       is a *fresh* scoring pass; it does NOT reproduce a
+#       runtime_snapshot evaluation because the BACK signals are
+#       derived differently. This strategy is appropriate when
+#       there is no prior runtime snapshot, or when the caller
+#       explicitly wants a fresh metadata-based re-evaluation.
+#
+#   what_if_policy_replay
+#       The evaluation took a prior snapshot's BACK signals AND
+#       context evidence verbatim, then re-scored them under a
+#       DIFFERENT policy profile. This isolates policy impact:
+#       "what would this exact governance evidence have decided
+#       under policy X?" Useful for replay UIs that compare
+#       outcomes across policies without re-deriving signals.
+EVALUATION_STRATEGY_RUNTIME_SNAPSHOT      = "runtime_snapshot"
+EVALUATION_STRATEGY_ARTIFACT_METADATA     = "artifact_metadata"
+EVALUATION_STRATEGY_WHAT_IF_POLICY_REPLAY = "what_if_policy_replay"
+
+_EVALUATION_STRATEGIES = frozenset({
+    EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+    EVALUATION_STRATEGY_ARTIFACT_METADATA,
+    EVALUATION_STRATEGY_WHAT_IF_POLICY_REPLAY,
+})
+
+
 # --------------------------------------------------------------------------- #
 # ResponseArtifact                                                             #
 # --------------------------------------------------------------------------- #
@@ -410,6 +451,26 @@ class GovernanceEvaluation:
     # remain compatible without explicit updates.
     evaluation_origin: str = EVALUATION_ORIGIN_DIRECT
 
+    # Strategy + snapshot (Slice 5.4a — Replay Fidelity Hardening).
+    #
+    # evaluation_strategy describes HOW the TISInput was constructed:
+    #   - runtime_snapshot       : captured at runtime and replayed verbatim
+    #   - artifact_metadata      : rebuilt from artifact provenance
+    #   - what_if_policy_replay  : prior snapshot's evidence, different policy
+    #
+    # governance_input_snapshot is the captured TISInput shape that
+    # produced this evaluation's scores. With it, the deterministic
+    # TIS engine can reproduce the same TISResult and the same
+    # decision on demand — that's what makes replay actually mean
+    # replay rather than "evaluate something similar through a
+    # different scoring path."
+    #
+    # Default strategy is artifact_metadata for backward compatibility
+    # with rows persisted before this field existed; default snapshot
+    # is None for the same reason (legacy rows have no snapshot).
+    evaluation_strategy: str = EVALUATION_STRATEGY_ARTIFACT_METADATA
+    governance_input_snapshot: Optional[Dict[str, Any]] = None
+
     # --- Validation + derivation ---------------------------------------- #
 
     def __post_init__(self) -> None:
@@ -482,6 +543,28 @@ class GovernanceEvaluation:
                 f"expected one of: {sorted(_EVALUATION_ORIGINS)}"
             )
 
+        # evaluation_strategy must be a known strategy value.
+        if self.evaluation_strategy not in _EVALUATION_STRATEGIES:
+            raise ValueError(
+                f"unknown evaluation_strategy {self.evaluation_strategy!r}; "
+                f"expected one of: {sorted(_EVALUATION_STRATEGIES)}"
+            )
+
+        # If strategy is runtime_snapshot or what_if_policy_replay,
+        # the snapshot is the source of truth for the scores. Demand
+        # that it be present — otherwise the audit trail claims a
+        # snapshot existed but doesn't have one.
+        needs_snapshot = self.evaluation_strategy in (
+            EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+            EVALUATION_STRATEGY_WHAT_IF_POLICY_REPLAY,
+        )
+        if needs_snapshot and not self.governance_input_snapshot:
+            raise ValueError(
+                f"evaluation_strategy={self.evaluation_strategy!r} requires "
+                "a non-empty governance_input_snapshot — the snapshot IS "
+                "the evidence the strategy claims to have replayed"
+            )
+
     # --- Serialization --------------------------------------------------- #
 
     def to_dict(self) -> Dict[str, Any]:
@@ -512,6 +595,11 @@ class GovernanceEvaluation:
                 self.evaluation_completeness_score
             ),
             "evaluation_origin": self.evaluation_origin,
+            "evaluation_strategy": self.evaluation_strategy,
+            "governance_input_snapshot": (
+                dict(self.governance_input_snapshot)
+                if self.governance_input_snapshot is not None else None
+            ),
         }
 
     @classmethod
@@ -546,5 +634,12 @@ class GovernanceEvaluation:
             # round-trip as "direct" (which is what they were).
             evaluation_origin=d.get(
                 "evaluation_origin", EVALUATION_ORIGIN_DIRECT,
+            ),
+            evaluation_strategy=d.get(
+                "evaluation_strategy", EVALUATION_STRATEGY_ARTIFACT_METADATA,
+            ),
+            governance_input_snapshot=(
+                dict(d["governance_input_snapshot"])
+                if d.get("governance_input_snapshot") is not None else None
             ),
         )

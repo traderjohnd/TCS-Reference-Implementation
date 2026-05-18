@@ -311,11 +311,12 @@ def _persist_query_artifact_and_evaluation(
     from tcs.artifacts import (
         EVALUATION_MODE_ENFORCE,
         EVALUATION_ORIGIN_QUERY,
+        EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
         GENERATION_MODE_AGENT_WORKFLOW,
         GovernanceEvaluation,
         ResponseArtifact,
     )
-    from tcs.artifacts.evaluation import _snapshot_profile
+    from tcs.artifacts.evaluation import _snapshot_profile, snapshot_tis_input
 
     # Extract retrieved chunks from the trace for the artifact's
     # retrieved_sources field. Pulled from the RAG node's payload.
@@ -385,6 +386,16 @@ def _persist_query_artifact_and_evaluation(
     if composer_metadata:
         selected_standards = list(composer_metadata.get("standards") or [])
 
+    # Slice 5.4a — capture the EXACT TISInput the runtime decision was
+    # made against. Persisting this on the evaluation row lets a later
+    # /v2/evaluate (default strategy) or /v2/replay reproduce this
+    # decision deterministically via runtime_snapshot replay. Without
+    # this snapshot, replay would have to re-derive BACK signals from
+    # the artifact's serialized metadata, producing a different
+    # decision and undermining the "generate once, evaluate many ways"
+    # invariant.
+    runtime_snapshot = snapshot_tis_input(tis_input)
+
     evaluation = GovernanceEvaluation(
         artifact_id=artifact.artifact_id,
         mode=EVALUATION_MODE_ENFORCE,
@@ -409,6 +420,8 @@ def _persist_query_artifact_and_evaluation(
         },
         evaluation_completeness_score=1.0,
         evaluation_origin=EVALUATION_ORIGIN_QUERY,
+        evaluation_strategy=EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+        governance_input_snapshot=runtime_snapshot,
     )
     artifact_store.insert_evaluation(evaluation)
 

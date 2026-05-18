@@ -88,6 +88,9 @@ from tcs.artifacts.models import (
     EVALUATION_MODE_OBSERVE,
     EVALUATION_MODE_WHAT_IF,
     EVALUATION_ORIGIN_DIRECT,
+    EVALUATION_STRATEGY_ARTIFACT_METADATA,
+    EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+    EVALUATION_STRATEGY_WHAT_IF_POLICY_REPLAY,
     GENERATION_MODE_AGENT_WORKFLOW,
     GENERATION_MODE_HUMAN_COMPOSED,
     GENERATION_MODE_RAG_LLM,
@@ -109,6 +112,167 @@ from tcs.trust_certificate import (
 # --------------------------------------------------------------------------- #
 # Policy snapshot                                                              #
 # --------------------------------------------------------------------------- #
+
+_SENTINEL_NOT_PROVIDED = object()
+
+
+def _capture_effective_policy(profile: Any) -> Dict[str, Any]:
+    """
+    Capture the policy fields the TIS engine actually reads.
+
+    Crucially this captures the EFFECTIVE values — for a
+    ResolvedTISProfile produced by assemble_context_from_trace,
+    that means the CT-modified weights/thresholds the engine
+    actually used. A snapshot that recorded only the base policy_id
+    would not reproduce the runtime decision when replayed.
+
+    Accepts either a PolicyProfile or a ResolvedTISProfile;
+    duck-typed on attribute access.
+    """
+    return {
+        "profile_id":          getattr(profile, "profile_id", None),
+        "domain":              getattr(profile, "domain", None),
+        "risk_tier":           getattr(profile, "risk_tier", None),
+        "action_class":        getattr(profile, "action_class", None),
+        "gate_set":            sorted(getattr(profile, "gate_set", []) or []),
+        "thresholds":          dict(getattr(profile, "thresholds", {}) or {}),
+        "weights":             dict(getattr(profile, "weights", {}) or {}),
+        "penalty_weights":     dict(getattr(profile, "penalty_weights", {}) or {}),
+        "decay_rate":          float(getattr(profile, "decay_rate", 0.0)),
+        "soft_hold_ceiling":   float(getattr(profile, "soft_hold_ceiling", 0.0)),
+        "decision_thresholds": dict(getattr(profile, "decision_thresholds", {}) or {}),
+        "invalidation_triggers": list(
+            getattr(profile, "invalidation_triggers", []) or []
+        ),
+        "regulatory_mapping":  list(
+            getattr(profile, "regulatory_mapping", []) or []
+        ),
+    }
+
+
+def _policy_from_capture(captured: Dict[str, Any]) -> PolicyProfile:
+    """
+    Rebuild a fresh PolicyProfile from a captured effective-policy dict.
+    Used by tis_input_from_snapshot to replay against the EXACT
+    weights/thresholds/gates the runtime scored with.
+    """
+    return PolicyProfile(
+        profile_id=captured["profile_id"],
+        domain=captured.get("domain", "unknown"),
+        risk_tier=captured["risk_tier"],
+        action_class=captured["action_class"],
+        gate_set=frozenset(captured.get("gate_set") or []),
+        thresholds=dict(captured.get("thresholds") or {}),
+        weights=dict(captured.get("weights") or {}),
+        penalty_weights=dict(captured.get("penalty_weights") or {}),
+        decay_rate=float(captured.get("decay_rate", 0.0)),
+        soft_hold_ceiling=float(captured.get("soft_hold_ceiling", 0.0)),
+        decision_thresholds=dict(captured.get("decision_thresholds") or {}),
+        invalidation_triggers=list(captured.get("invalidation_triggers") or []),
+        regulatory_mapping=list(captured.get("regulatory_mapping") or []),
+        description="(replay; rebuilt from captured effective policy)",
+    )
+
+
+def snapshot_tis_input(tis_input: TISInput) -> Dict[str, Any]:
+    """
+    Capture a TISInput as a JSON-serializable dict.
+
+    The captured shape is everything the deterministic TIS engine
+    needs to reproduce the same TISResult: dimension_scores,
+    sub_factor_scores, context_metadata, temporal state, identity,
+    AND the EFFECTIVE policy (weights/thresholds/gate_set/etc. as
+    the engine actually saw them — including CT modifiers when the
+    runtime resolved the policy through assemble_context_from_trace).
+
+    Capturing the effective policy inline is what closes the
+    replay-fidelity gap: /v2/query passes a ResolvedTISProfile to
+    the engine; a replay that loaded only the base profile would
+    see different weights and produce a different score. The
+    snapshot now records the actual numbers the engine used.
+
+    Returns
+    -------
+    dict
+        JSON-serializable. Suitable for the
+        ``governance_input_snapshot`` field on GovernanceEvaluation.
+    """
+    return {
+        "subject_id":         tis_input.subject_id,
+        "subject_type":       tis_input.subject_type,
+        # Base profile_id for cross-reference + auto-resolver logic
+        # (what_if_policy_replay decides "different policy?" by
+        # comparing this against the new policy_profile_id).
+        "policy_profile_id":  tis_input.policy_profile.profile_id,
+        # Full effective policy — the bytes the engine actually used.
+        "effective_policy":   _capture_effective_policy(tis_input.policy_profile),
+        "dimension_scores":   dict(tis_input.dimension_scores),
+        "sub_factor_scores":  {
+            d: dict(sf) for d, sf in (tis_input.sub_factor_scores or {}).items()
+        },
+        "context_metadata":   dict(tis_input.context_metadata or {}),
+        "elapsed_hours":      float(tis_input.elapsed_hours),
+        "is_valid":           int(tis_input.is_valid),
+        "invalidation_event": tis_input.invalidation_event,
+        "evaluation_time":    tis_input.evaluation_time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    }
+
+
+def tis_input_from_snapshot(
+    snapshot: Dict[str, Any],
+    *,
+    policy: Optional[PolicyProfile] = None,
+) -> TISInput:
+    """
+    Rebuild a TISInput from a captured snapshot.
+
+    Policy resolution:
+      - If ``policy`` is supplied (typically for what_if_policy_replay
+        — caller wants a DIFFERENT policy), use it.
+      - Else, rebuild the policy from the snapshot's ``effective_policy``
+        field. This guarantees the engine sees the EXACT same
+        weights/thresholds it scored against originally — including
+        CT modifiers and any other resolution applied at runtime.
+        Without this, a runtime_snapshot replay against a profile
+        that had CT modifiers applied at runtime would see different
+        weights and produce a different score.
+
+    Determinism guarantee: ``compute_tis(tis_input_from_snapshot(s))``
+    reproduces the original ``compute_tis(original_tis_input)`` whenever
+    ``s == snapshot_tis_input(original_tis_input)``. The TIS engine is
+    pure; same input gives same output.
+    """
+    from datetime import datetime
+    ev = snapshot["evaluation_time"]
+    if ev.endswith("Z"):
+        ev = ev[:-1] + "+00:00"
+    effective_profile = policy
+    if effective_profile is None:
+        captured = snapshot.get("effective_policy")
+        if not captured:
+            raise ValueError(
+                "snapshot has no effective_policy and no replacement "
+                "policy was supplied; cannot rebuild TISInput"
+            )
+        effective_profile = _policy_from_capture(captured)
+    return TISInput(
+        subject_id=snapshot["subject_id"],
+        subject_type=snapshot["subject_type"],
+        policy_profile=effective_profile,
+        dimension_scores=dict(snapshot["dimension_scores"]),
+        sub_factor_scores={
+            d: dict(sf)
+            for d, sf in (snapshot.get("sub_factor_scores") or {}).items()
+        },
+        context_metadata=dict(snapshot.get("context_metadata") or {}),
+        elapsed_hours=float(snapshot.get("elapsed_hours", 0.0)),
+        is_valid=int(snapshot.get("is_valid", 1)),
+        invalidation_event=snapshot.get("invalidation_event"),
+        evaluation_time=datetime.fromisoformat(ev),
+    )
+
 
 def _snapshot_profile(profile: PolicyProfile) -> Dict[str, Any]:
     """
@@ -269,86 +433,31 @@ def _build_metadata_from_artifact(
 
 
 # --------------------------------------------------------------------------- #
-# Main entry point                                                             #
+# Strategy-specific scoring paths                                              #
 # --------------------------------------------------------------------------- #
 
-def evaluate_artifact(
-    *,
-    artifact: ResponseArtifact,
-    mode: str,
-    policy_profile_id: Optional[str] = None,
-    evaluator_identity: Optional[Dict[str, Any]] = None,
-    certificate_store: Any = None,
-    origin: str = EVALUATION_ORIGIN_DIRECT,
-) -> Tuple[GovernanceEvaluation, Optional[TrustCertificate]]:
+def _score_via_artifact_metadata(
+    artifact: ResponseArtifact, profile: PolicyProfile, eval_time: datetime,
+) -> TISInput:
     """
-    Evaluate a stored artifact under the given mode and policy.
+    Build a fresh TISInput from the artifact's stored provenance.
 
-    Parameters
-    ----------
-    artifact
-        The ResponseArtifact loaded from the store. NEVER re-generated.
-    mode
-        One of "observe", "enforce", "what_if".
-    policy_profile_id
-        Caller-provided profile id (D3). If None, the caller is
-        expected to have resolved the active pack id before calling
-        — this function does NOT consult the pack manager (keeping
-        the dependency surface narrow). The route handler is the
-        right place to resolve "default to active pack."
-    evaluator_identity
-        Who triggered the evaluation. Recorded on the evaluation row
-        and the TC (if one is issued).
-    certificate_store
-        Optional CertificateStore for persisting the TC. If None and
-        mode is observe/enforce, the TC is generated but not
-        persisted — caller can persist later. If mode is what_if,
-        no TC is constructed regardless.
-
-    Returns
-    -------
-    (evaluation, tc_or_none)
-        ``evaluation`` is the constructed GovernanceEvaluation (NOT
-        yet persisted by this function — caller writes to ArtifactStore).
-        ``tc_or_none`` is the TrustCertificate when issued (observe
-        or enforce), or None for what_if.
+    This is the metadata-driven path: rebuild signals from
+    retrieved_sources, recipient_context, generation_mode defaults.
+    Used when no prior runtime snapshot exists, OR when the caller
+    explicitly asks for a fresh metadata-based re-evaluation.
     """
-    if policy_profile_id is None:
-        raise ValueError(
-            "evaluate_artifact requires policy_profile_id (route handler "
-            "resolves caller-default vs active-pack default)"
-        )
-
-    profile = load_profile(policy_profile_id)
-    profile_snapshot = _snapshot_profile(profile)
     classifier_query = _build_classifier_query(artifact)
     meta_in = _build_metadata_from_artifact(
         artifact, classifier_query=classifier_query,
     )
+    ctx, _resolved = assemble_context_v2(meta_in, base_profile=profile)
 
-    # GCA. Runs the rule classifier as a side effect; populates
-    # ctx["c3_score_computed"], ctx["governance_rule_matches"], etc.
-    ctx, resolved = assemble_context_v2(
-        meta_in,
-        base_profile=profile,
-    )
-
-    # Starting dimension scores from provenance. The classifier may
-    # have already collapsed C via ctx["c3_score_computed"]==0.0
-    # (no-op here because dim_scores didn't go into assemble_context_v2,
-    # but we mirror that effect on the computed scores below).
     dim_scores = _default_dimension_scores(artifact)
     if ctx.get("c3_score_computed", 1.0) == 0.0:
-        # C3 violation detected by classifier — collapse C so the gate
-        # fails and Priority 2 of the decision ladder fires.
         dim_scores["C"] = 0.0
 
-    # Apply rule-emitted numeric penalties to dim scores (the
-    # classifier records boundedness_penalty, attribution_penalty,
-    # known_calibration_penalty on the merged effect; assemble_context_v2
-    # already mutated ctx but we never passed dim_scores in, so we
-    # must apply the deltas ourselves here).
-    # These are stored in the per-rule audit dicts; sum and clamp.
+    # Apply rule-emitted numeric penalties to dim scores.
     if isinstance(ctx.get("governance_rule_matches"), list):
         b_pen = a_pen = k_pen = 0.0
         for m in ctx["governance_rule_matches"]:
@@ -363,12 +472,8 @@ def evaluate_artifact(
         if k_pen:
             dim_scores["K"] = max(0.0, dim_scores["K"] - min(1.0, k_pen))
 
-    # Build the TISInput. The subject_id is the artifact_id —
-    # everything in the TC and evaluation can be joined back to the
-    # captured generation.
-    eval_time = datetime.now(timezone.utc).replace(microsecond=0)
     sub_factor_scores = {"C": {"C3": ctx.get("c3_score_computed", 1.0)}}
-    tis_input = TISInput(
+    return TISInput(
         subject_id=artifact.artifact_id,
         subject_type=artifact.generation_mode,
         policy_profile=profile,
@@ -381,8 +486,209 @@ def evaluate_artifact(
         evaluation_time=eval_time,
     )
 
+
+def _resolve_strategy(
+    caller_strategy: Optional[str],
+    source_snapshot: Optional[Dict[str, Any]],
+    policy: PolicyProfile,
+) -> str:
+    """
+    Decide which strategy to actually use based on caller intent and
+    snapshot availability.
+
+    Rules:
+      - Caller explicitly named a strategy → honor it.
+        - runtime_snapshot requires a source_snapshot.
+        - what_if_policy_replay requires a source_snapshot AND the
+          policy must differ from the snapshot's original policy.
+      - Caller passed None → "auto":
+        - source_snapshot present + same policy → runtime_snapshot
+        - source_snapshot present + different policy → what_if_policy_replay
+          (caller is asking the same evidence to be re-scored under a
+          different policy; that's the textbook what-if case)
+        - source_snapshot absent → artifact_metadata
+    """
+    if caller_strategy is not None:
+        if caller_strategy not in _ALL_STRATEGIES:
+            raise ValueError(
+                f"unknown evaluation_strategy {caller_strategy!r}; "
+                f"expected one of: {sorted(_ALL_STRATEGIES)}"
+            )
+        if caller_strategy == EVALUATION_STRATEGY_RUNTIME_SNAPSHOT:
+            if not source_snapshot:
+                raise ValueError(
+                    "evaluation_strategy=runtime_snapshot requires a "
+                    "prior captured TISInput snapshot on the artifact "
+                    "(no such snapshot found). Either run /v2/query first "
+                    "or use evaluation_strategy=artifact_metadata."
+                )
+        if caller_strategy == EVALUATION_STRATEGY_WHAT_IF_POLICY_REPLAY:
+            if not source_snapshot:
+                raise ValueError(
+                    "evaluation_strategy=what_if_policy_replay requires "
+                    "a prior captured TISInput snapshot on the artifact"
+                )
+            if source_snapshot.get("policy_profile_id") == policy.profile_id:
+                raise ValueError(
+                    "evaluation_strategy=what_if_policy_replay requires a "
+                    "DIFFERENT policy_profile_id than the snapshot's "
+                    "original policy. Pass a different policy_profile_id "
+                    "or use runtime_snapshot to replay verbatim."
+                )
+        return caller_strategy
+
+    # Auto-resolution rules:
+    #   - snapshot exists AND policy matches → runtime_snapshot.
+    #     This is the load-bearing case: /v2/query writes a snapshot,
+    #     a subsequent /v2/evaluate under the SAME policy must
+    #     reproduce the runtime decision deterministically. The
+    #     regression test pins this.
+    #   - everything else → artifact_metadata.
+    #     Different policy means a fresh re-evaluation under the new
+    #     policy, with signals freshly derived from artifact
+    #     provenance. We deliberately do NOT auto-pick
+    #     what_if_policy_replay when policies differ — that strategy
+    #     reuses prior evidence (which may include rule-collapsed C=0)
+    #     across the policy switch, which is rarely what an unqualified
+    #     replay should mean. what_if_policy_replay is opt-in only.
+    if source_snapshot and source_snapshot.get("policy_profile_id") == policy.profile_id:
+        return EVALUATION_STRATEGY_RUNTIME_SNAPSHOT
+    return EVALUATION_STRATEGY_ARTIFACT_METADATA
+
+
+_ALL_STRATEGIES = frozenset({
+    EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+    EVALUATION_STRATEGY_ARTIFACT_METADATA,
+    EVALUATION_STRATEGY_WHAT_IF_POLICY_REPLAY,
+})
+
+
+# --------------------------------------------------------------------------- #
+# Main entry point                                                             #
+# --------------------------------------------------------------------------- #
+
+def evaluate_artifact(
+    *,
+    artifact: ResponseArtifact,
+    mode: str,
+    policy_profile_id: Optional[str] = None,
+    evaluator_identity: Optional[Dict[str, Any]] = None,
+    certificate_store: Any = None,
+    origin: str = EVALUATION_ORIGIN_DIRECT,
+    strategy: Optional[str] = None,
+    source_snapshot: Optional[Dict[str, Any]] = None,
+) -> Tuple[GovernanceEvaluation, Optional[TrustCertificate]]:
+    """
+    Evaluate a stored artifact under the given mode, policy, and
+    replay strategy. NEVER re-calls the LLM.
+
+    Parameters
+    ----------
+    artifact
+        The ResponseArtifact loaded from the store.
+    mode
+        observe | enforce | what_if (the delivery-side mode).
+    policy_profile_id
+        Caller-resolved profile id (D3).
+    evaluator_identity
+        Who triggered the evaluation. Recorded on the evaluation row.
+    certificate_store
+        Optional CertificateStore for persisting the TC (observe/enforce only).
+    origin
+        direct | replay | query — call-path audit tag.
+    strategy
+        runtime_snapshot | artifact_metadata | what_if_policy_replay
+        or None (auto-resolve). Auto picks runtime_snapshot when a
+        source_snapshot is supplied AND its policy matches; picks
+        what_if_policy_replay when a snapshot is supplied with a
+        different policy; otherwise artifact_metadata.
+    source_snapshot
+        A captured TISInput dict (per snapshot_tis_input). When
+        present and strategy is runtime_snapshot or
+        what_if_policy_replay, the engine replays this exact input
+        verbatim — producing deterministic, reproducible decisions.
+        Route handlers are responsible for locating the right
+        source_snapshot (typically the most recent runtime-origin
+        evaluation for the artifact).
+
+    Returns
+    -------
+    (evaluation, tc_or_none)
+        ``evaluation`` is the constructed GovernanceEvaluation with
+        the actually-used strategy + captured governance_input_snapshot
+        set. ``tc_or_none`` is the TrustCertificate when issued.
+    """
+    if policy_profile_id is None:
+        raise ValueError(
+            "evaluate_artifact requires policy_profile_id (route handler "
+            "resolves caller-default vs active-pack default)"
+        )
+
+    profile = load_profile(policy_profile_id)
+    profile_snapshot = _snapshot_profile(profile)
+    eval_time = datetime.now(timezone.utc).replace(microsecond=0)
+
+    resolved_strategy = _resolve_strategy(strategy, source_snapshot, profile)
+
+    if resolved_strategy == EVALUATION_STRATEGY_ARTIFACT_METADATA:
+        # Fresh metadata-based scoring (the pre-5.4a behavior).
+        tis_input = _score_via_artifact_metadata(artifact, profile, eval_time)
+    elif resolved_strategy == EVALUATION_STRATEGY_RUNTIME_SNAPSHOT:
+        # Replay the captured TISInput verbatim, including the
+        # EFFECTIVE policy the runtime scored with (which may have
+        # CT modifiers applied — those are baked into the snapshot's
+        # effective_policy field). Same input → same TISResult → same
+        # decision. This is the replay-fidelity guarantee Slice 5.4a
+        # exists to deliver.
+        #
+        # We deliberately do NOT pass `policy=profile` here — that
+        # would replace the captured effective weights with the
+        # freshly-loaded BASE weights, breaking parity for CT-modified
+        # runs. The snapshot's effective_policy is the source of truth.
+        tis_input = tis_input_from_snapshot(source_snapshot)
+        # Force eval_time to the current moment so the row is timestamped
+        # consistently with other evaluations issued now. The captured
+        # evaluation_time in the snapshot is preserved inside
+        # governance_input_snapshot for audit reconstruction.
+        tis_input = TISInput(
+            subject_id=tis_input.subject_id,
+            subject_type=tis_input.subject_type,
+            policy_profile=tis_input.policy_profile,
+            dimension_scores=tis_input.dimension_scores,
+            sub_factor_scores=tis_input.sub_factor_scores,
+            context_metadata=tis_input.context_metadata,
+            elapsed_hours=tis_input.elapsed_hours,
+            is_valid=tis_input.is_valid,
+            invalidation_event=tis_input.invalidation_event,
+            evaluation_time=eval_time,
+        )
+    else:  # EVALUATION_STRATEGY_WHAT_IF_POLICY_REPLAY
+        # Same evidence (dim_scores + sub_factors + context_metadata)
+        # under a DIFFERENT policy. Isolates policy impact from
+        # evidence drift.
+        tis_input = tis_input_from_snapshot(source_snapshot, policy=profile)
+        tis_input = TISInput(
+            subject_id=tis_input.subject_id,
+            subject_type=tis_input.subject_type,
+            policy_profile=profile,
+            dimension_scores=tis_input.dimension_scores,
+            sub_factor_scores=tis_input.sub_factor_scores,
+            context_metadata=tis_input.context_metadata,
+            elapsed_hours=tis_input.elapsed_hours,
+            is_valid=tis_input.is_valid,
+            invalidation_event=tis_input.invalidation_event,
+            evaluation_time=eval_time,
+        )
+
     tis_result = compute_tis(tis_input)
     decision, requires_review = map_decision(tis_input, tis_result)
+
+    # Capture the actual TISInput used for THIS evaluation.
+    # Every evaluation (regardless of strategy) carries a snapshot so
+    # any future replay can reproduce it deterministically.
+    captured_snapshot = snapshot_tis_input(tis_input)
+    dim_scores = dict(tis_input.dimension_scores)
+    ctx = tis_input.context_metadata
 
     # Trust Certificate issuance:
     #   observe → TC issued, lifecycle_state="observed" (per D1)
@@ -456,7 +762,10 @@ def evaluate_artifact(
         policy_profile_snapshot=profile_snapshot,
         selected_standards=selected_standards,
         enabled_controls=enabled_controls,
-        rule_matches=ctx.get("governance_rule_matches"),
+        rule_matches=(
+            ctx.get("governance_rule_matches")
+            if isinstance(ctx, dict) else None
+        ),
         component_scores={k: round(v, 4) for k, v in dim_scores.items()},
         gate_results=dict(tis_result.gate_results_by_dim),
         s_base=round(tis_result.s_base, 4),
@@ -470,6 +779,8 @@ def evaluate_artifact(
         evaluator_identity=dict(evaluator_identity or {}),
         evaluation_completeness_score=1.0,
         evaluation_origin=origin,
+        evaluation_strategy=resolved_strategy,
+        governance_input_snapshot=captured_snapshot,
     )
     return evaluation, tc
 

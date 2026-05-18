@@ -52,6 +52,7 @@ from tcs.artifacts.evaluation import evaluate_artifact
 from tcs.artifacts.store import ArtifactNotFoundError, ArtifactStore
 from tcs.api.routes_evaluate import (
     BASELINE_PROFILE_ID,
+    _lookup_runtime_snapshot,
     _resolve_policy_profile_id,
 )
 
@@ -65,7 +66,7 @@ router = APIRouter()
 # --------------------------------------------------------------------------- #
 
 class ReplayConfiguration(BaseModel):
-    """One (mode, policy_profile_id) pair within a replay batch."""
+    """One (mode, policy_profile_id, strategy) tuple within a replay batch."""
 
     mode: str = Field(
         ...,
@@ -79,6 +80,17 @@ class ReplayConfiguration(BaseModel):
             "then baseline-no-pack as the documented fallback. Different "
             "configurations in one batch may target different profiles — "
             "that's the comparison use case."
+        ),
+    )
+    strategy: Optional[str] = Field(
+        None,
+        description=(
+            "Per-config strategy override (Slice 5.4a). Same semantics "
+            "as on /v2/evaluate: runtime_snapshot | artifact_metadata | "
+            "what_if_policy_replay. When omitted, auto-resolves: prefers "
+            "runtime_snapshot when a prior snapshot exists with the same "
+            "policy; what_if_policy_replay when the snapshot's policy "
+            "differs; artifact_metadata otherwise."
         ),
     )
 
@@ -119,6 +131,7 @@ class ReplayEvaluationSummary(BaseModel):
     component_scores: Dict[str, float]
     gate_results: Dict[str, str]
     evaluation_origin: str
+    evaluation_strategy: str
 
 
 class ReplayResponse(BaseModel):
@@ -186,6 +199,12 @@ def post_replay(body: ReplayRequest, request: Request) -> ReplayResponse:
     summaries: List[ReplayEvaluationSummary] = []
     cert_store = _certificate_store(request)
 
+    # Slice 5.4a: snapshot lookup is per-artifact, not per-config. We
+    # fetch once and reuse for every configuration in this batch.
+    source_snapshot = _lookup_runtime_snapshot(
+        artifact_store, body.artifact_id,
+    )
+
     for cfg in body.configurations:
         profile_id = _resolve_policy_profile_id(request, cfg.policy_profile_id)
         # what_if does NOT issue a TC, so we suppress the certificate
@@ -201,6 +220,8 @@ def post_replay(body: ReplayRequest, request: Request) -> ReplayResponse:
                 evaluator_identity=body.evaluator_identity,
                 certificate_store=store_for_this,
                 origin=EVALUATION_ORIGIN_REPLAY,
+                strategy=cfg.strategy,
+                source_snapshot=source_snapshot,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -222,6 +243,7 @@ def post_replay(body: ReplayRequest, request: Request) -> ReplayResponse:
             component_scores=dict(evaluation.component_scores),
             gate_results=dict(evaluation.gate_results),
             evaluation_origin=evaluation.evaluation_origin,
+            evaluation_strategy=evaluation.evaluation_strategy,
         ))
 
     return ReplayResponse(
