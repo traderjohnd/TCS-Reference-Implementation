@@ -1,30 +1,128 @@
+import { useEffect, useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import { useTheme } from '../hooks/useTheme';
 
-const NAV_ITEMS = [
-  { path: '/connections', label: 'Connections', view: 'connections' },
-  { path: '/policy', label: 'Policy Controls', view: 'policy' },
-  { path: '/chat', label: 'Governed Chat', view: 'chat' },
-  { path: '/replay', label: 'Artifacts & Replay', view: 'replay' },
-  { path: '/overview', label: 'Trust Overview', view: 'overview' },
-  { path: '/decisions', label: 'Live Decisions', view: 'decisions' },
-  { path: '/drift', label: 'Drift Monitoring', view: 'drift' },
-  { path: '/audit', label: 'Audit & Certificates', view: 'audit' },
-  { path: '/economic', label: 'Economic View', view: 'economic' },
-  { path: '/telemetry', label: 'Telemetry', view: 'telemetry' },
-  { path: '/archives', label: 'Archives', view: 'archives' },
-  { path: '/admin', label: 'Admin', view: 'admin' },
+// =============================================================================
+// Phase 5 demo-hardening — left-side collapsible nav with grouped sections.
+// =============================================================================
+//
+// Previously a 12-tab horizontal bar that exceeded legibility. The new
+// layout splits the nav into a persistent left column grouped into four
+// sections (RUN / MONITOR / AUDIT / SETUP) with a collapse-to-initials
+// toggle. The top bar keeps branding + user controls + theme.
+//
+// Section order and item order are user-pinned. Renames are intentional:
+// "Governed Chat" -> "Chat", "Trust Overview" -> "Overview", etc. The
+// whole product is about governance; we don't need to repeat the word in
+// every label.
+
+const NAV_SECTIONS = [
+  {
+    id: 'run',
+    label: 'RUN',
+    items: [
+      { path: '/chat',      label: 'Chat',      short: 'Ch', view: 'chat' },
+      { path: '/decisions', label: 'Live',      short: 'Li', view: 'decisions' },
+    ],
+  },
+  {
+    id: 'monitor',
+    label: 'MONITOR',
+    items: [
+      { path: '/overview',  label: 'Overview',       short: 'Ov', view: 'overview' },
+      { path: '/telemetry', label: 'Telemetry',      short: 'Te', view: 'telemetry' },
+      { path: '/drift',     label: 'Drift',          short: 'Dr', view: 'drift' },
+      { path: '/economic',  label: 'Economic View',  short: 'Ec', view: 'economic' },
+    ],
+  },
+  {
+    id: 'audit',
+    label: 'AUDIT',
+    items: [
+      { path: '/audit',     label: 'Certificates',        short: 'Ce', view: 'audit' },
+      { path: '/replay',    label: 'Governance Replay',   short: 'GR', view: 'replay' },
+      { path: '/archives',  label: 'Archives',            short: 'Ar', view: 'archives' },
+    ],
+  },
+  {
+    id: 'setup',
+    label: 'SETUP',
+    items: [
+      { path: '/connections', label: 'Connections',     short: 'Cn', view: 'connections' },
+      { path: '/policy',      label: 'Policy Controls', short: 'Po', view: 'policy' },
+      { path: '/admin',       label: 'Admin',           short: 'Ad', view: 'admin' },
+    ],
+  },
 ];
+
+function useCollapsedNav() {
+  const [collapsed, setCollapsed] = useState(() => {
+    return localStorage.getItem('tcs_nav_collapsed') === '1';
+  });
+  useEffect(() => {
+    localStorage.setItem('tcs_nav_collapsed', collapsed ? '1' : '0');
+  }, [collapsed]);
+  return [collapsed, () => setCollapsed((v) => !v)];
+}
+
+function NavItem({ item, collapsed }) {
+  return (
+    <NavLink
+      to={item.path}
+      title={collapsed ? item.label : undefined}
+      className={({ isActive }) => {
+        const base = collapsed
+          ? 'flex items-center justify-center w-10 h-10 mx-auto rounded text-xs font-mono transition-colors'
+          : 'flex items-center gap-2 px-3 py-1.5 rounded text-sm transition-colors';
+        const active = isActive
+          ? 'bg-blue-900/30 text-white border-l-2 border-blue-500'
+          : 'text-gray-400 hover:text-white hover:bg-gray-800';
+        return `${base} ${active}`;
+      }}
+    >
+      {collapsed ? (
+        <span className="font-semibold">{item.short}</span>
+      ) : (
+        <span>{item.label}</span>
+      )}
+    </NavLink>
+  );
+}
+
+function NavSection({ section, collapsed, canAccessView }) {
+  const visibleItems = section.items.filter((it) => canAccessView(it.view));
+  if (visibleItems.length === 0) return null;
+  return (
+    <div className="mb-4">
+      {collapsed ? (
+        // When collapsed, sections become a thin top-border divider
+        // instead of a labeled header — keeps the icons tight.
+        <div className="border-t border-gray-800 my-2 mx-2" />
+      ) : (
+        <div className="text-[10px] uppercase tracking-wider text-gray-600 px-3 mb-1.5 font-semibold">
+          {section.label}
+        </div>
+      )}
+      <div className={collapsed ? 'space-y-1' : 'space-y-0.5'}>
+        {visibleItems.map((it) => (
+          <NavItem key={it.path} item={it} collapsed={collapsed} />
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export default function Layout() {
   const { user, logout, canAccessView } = useAuth();
   const { theme, toggle } = useTheme();
+  const [collapsed, toggleCollapsed] = useCollapsedNav();
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
+      {/* ─── Top bar: branding + theme + user ───────────────────────────── */}
       <header className="bg-gray-900 border-b border-gray-800">
-        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div className="max-w-full mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center font-bold text-sm">
               TCS
@@ -67,27 +165,54 @@ export default function Layout() {
             </div>
           )}
         </div>
-        <nav className="max-w-7xl mx-auto px-4 flex gap-1 overflow-x-auto">
-          {NAV_ITEMS.filter(({ view }) => canAccessView(view)).map(({ path, label }) => (
-            <NavLink
-              key={path}
-              to={path}
-              className={({ isActive }) =>
-                `px-3 py-2 text-sm font-medium rounded-t transition-colors whitespace-nowrap ${
-                  isActive
-                    ? 'bg-gray-800 text-white border-b-2 border-blue-500'
-                    : 'text-gray-400 hover:text-white hover:bg-gray-800/50'
-                }`
-              }
-            >
-              {label}
-            </NavLink>
-          ))}
-        </nav>
       </header>
-      <main className="max-w-7xl mx-auto px-4 py-6">
-        <Outlet />
-      </main>
+
+      {/* ─── Body: left nav + content ───────────────────────────────────── */}
+      <div className="flex">
+        <aside
+          className={`bg-gray-900 border-r border-gray-800 min-h-[calc(100vh-57px)] transition-[width] duration-150 ${
+            collapsed ? 'w-14' : 'w-56'
+          }`}
+        >
+          <div className="sticky top-0 py-3">
+            <button
+              onClick={toggleCollapsed}
+              className={`mb-3 mx-auto flex items-center justify-center w-10 h-8 rounded text-xs text-gray-400 hover:text-white hover:bg-gray-800 transition-colors ${
+                collapsed ? '' : 'ml-auto mr-2'
+              }`}
+              title={collapsed ? 'Expand navigation' : 'Collapse navigation'}
+              aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'}
+            >
+              {collapsed ? (
+                /* chevron-double-right */
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
+                  <path fillRule="evenodd" d="M3.293 4.293a1 1 0 011.414 0L9 8.586l4.293-4.293a1 1 0 111.414 1.414L10.414 10l4.293 4.293a1 1 0 01-1.414 1.414L9 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L7.586 10 3.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" transform="rotate(45 10 10)" />
+                  <path fillRule="evenodd" d="M3 5a1 1 0 011-1h2a1 1 0 010 2H5v9h9V8a1 1 0 112 0v7a1 1 0 01-1 1H4a1 1 0 01-1-1V5z" clipRule="evenodd" />
+                </svg>
+              ) : (
+                /* chevron-double-left */
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
+                  <path fillRule="evenodd" d="M12.707 5.293a1 1 0 010 1.414L9.414 10l3.293 3.293a1 1 0 01-1.414 1.414l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0z" clipRule="evenodd" />
+                </svg>
+              )}
+            </button>
+            <nav className={collapsed ? 'px-1' : 'px-2'}>
+              {NAV_SECTIONS.map((section) => (
+                <NavSection
+                  key={section.id}
+                  section={section}
+                  collapsed={collapsed}
+                  canAccessView={canAccessView}
+                />
+              ))}
+            </nav>
+          </div>
+        </aside>
+
+        <main className="flex-1 min-w-0 px-6 py-6">
+          <Outlet />
+        </main>
+      </div>
     </div>
   );
 }
