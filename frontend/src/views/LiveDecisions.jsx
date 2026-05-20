@@ -63,8 +63,12 @@ function TCDetailPanel({ certificateId, onClose }) {
   );
 }
 
-function OverrideForm({ tcId, onDone }) {
-  const [decision, setDecision] = useState('Allow');
+// Single OverrideForm used for both Hold and Escalate queues. The
+// endpoint path and the allowed decision options differ; the rest is
+// identical. Override goes to the lifecycle_events table on the
+// backend; the original TC is never mutated.
+function OverrideForm({ tcId, endpoint, options, defaultOption, onDone }) {
+  const [decision, setDecision] = useState(defaultOption || options[0]);
   const [justification, setJustification] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
@@ -72,10 +76,12 @@ function OverrideForm({ tcId, onDone }) {
     e.preventDefault();
     setSubmitting(true);
     try {
-      await apiPost(`/govern/hold-queue/${tcId}/override`, {
+      await apiPost(`${endpoint}/${tcId}/override`, {
         override_decision: decision,
         justification,
-        override_by: localStorage.getItem('tcs_user') ? JSON.parse(localStorage.getItem('tcs_user')).username : 'unknown',
+        override_by: localStorage.getItem('tcs_user')
+          ? JSON.parse(localStorage.getItem('tcs_user')).username
+          : 'unknown',
       });
       onDone();
     } catch {
@@ -89,28 +95,78 @@ function OverrideForm({ tcId, onDone }) {
     <form onSubmit={handleSubmit} className="flex gap-2 items-end mt-2">
       <select value={decision} onChange={(e) => setDecision(e.target.value)}
         className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white">
-        <option value="Allow">Allow</option>
-        <option value="Escalate">Escalate</option>
+        {options.map((o) => (
+          <option key={o} value={o}>{o}</option>
+        ))}
       </select>
       <input value={justification} onChange={(e) => setJustification(e.target.value)}
         placeholder="Justification (min 10 chars)"
         className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white flex-1" />
       <button type="submit" disabled={submitting || justification.length < 10}
         className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-3 py-1 rounded text-xs">
-        Override
+        Submit
       </button>
     </form>
   );
 }
 
+// Small inline badge that surfaces override info on a Recent Decisions
+// row. The original TC content stays unchanged; this badge reads from
+// the new `override` field on the decisions-stream payload and shows
+// the reviewer who overrode and to what.
+function OverrideBadge({ override }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!override) return null;
+  const tone = override.override_decision === 'Allow'
+    ? 'border-green-700 text-green-300 bg-green-900/30'
+    : override.override_decision === 'Stop'
+    ? 'border-red-700 text-red-300 bg-red-900/30'
+    : 'border-blue-700 text-blue-300 bg-blue-900/30';
+  return (
+    <div className="inline-block">
+      <button
+        onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }}
+        className={`text-[10px] rounded border px-1.5 py-0.5 font-mono ${tone}`}
+        title="Click to expand override details"
+      >
+        Overridden → {override.override_decision || '?'}
+      </button>
+      {expanded && (
+        <div className="mt-1 text-[10px] text-gray-400 bg-gray-900/80 border border-gray-700 rounded p-2 max-w-md">
+          <div><span className="text-gray-500">actor:</span> <span className="text-gray-300">{override.override_actor || '—'}</span></div>
+          <div><span className="text-gray-500">at:</span> <span className="text-gray-300 font-mono">{override.override_at}</span></div>
+          {override.override_reason_text && (
+            <div className="mt-1">
+              <span className="text-gray-500">reason:</span>{' '}
+              <span className="text-gray-300">{override.override_reason_text}</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function LiveDecisions() {
   const { data, refetch } = usePolling('/govern/decisions/stream?limit=50', 3000);
-  const { data: holdData } = usePolling('/govern/hold-queue?limit=20', 5000);
+  const { data: holdData, refetch: refetchHolds } = usePolling('/govern/hold-queue?limit=20', 5000);
+  const { data: escData, refetch: refetchEsc } = usePolling('/govern/escalation-queue?limit=20', 5000);
   const [selectedTc, setSelectedTc] = useState(null);
   const [overrideId, setOverrideId] = useState(null);
 
   const decisions = data?.decisions || [];
   const holds = holdData?.holds || [];
+  const escalations = escData?.escalations || [];
+
+  // Common "refresh everything" after an override — the override
+  // affects the stream (badge appears), the source queue (TC drops
+  // out), and any cross-references downstream.
+  const onOverrideDone = () => {
+    setOverrideId(null);
+    refetch();
+    refetchHolds();
+    refetchEsc();
+  };
 
   return (
     <div className="space-y-6">
@@ -118,7 +174,11 @@ export default function LiveDecisions() {
 
       {holds.length > 0 && (
         <div className="bg-gray-900 rounded-lg border border-yellow-800 p-4">
-          <h3 className="text-sm font-medium text-yellow-400 mb-3">Hold Queue ({holds.length})</h3>
+          <h3 className="text-sm font-medium text-yellow-400 mb-1">Hold Queue ({holds.length})</h3>
+          <p className="text-[11px] text-gray-500 mb-3">
+            Remediable review. Reviewer can Allow (release for delivery)
+            or Escalate (push to senior review).
+          </p>
           <div className="space-y-2">
             {holds.map((h) => (
               <div key={h.certificate_id} className="bg-gray-800/50 rounded p-3">
@@ -136,7 +196,90 @@ export default function LiveDecisions() {
                 </div>
                 <div className="text-xs text-gray-500 mt-1">{h.blocking_reason}</div>
                 {overrideId === h.certificate_id && (
-                  <OverrideForm tcId={h.certificate_id} onDone={() => { setOverrideId(null); refetch(); }} />
+                  <OverrideForm
+                    tcId={h.certificate_id}
+                    endpoint="/govern/hold-queue"
+                    options={['Allow', 'Escalate']}
+                    defaultOption="Allow"
+                    onDone={onOverrideDone}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {escalations.length > 0 && (
+        <div className="bg-gray-900 rounded-lg border border-orange-800 p-4">
+          <h3 className="text-sm font-medium text-orange-400 mb-1">
+            Escalation Queue ({escalations.length})
+          </h3>
+          <p className="text-[11px] text-gray-500 mb-3">
+            Senior-reviewer queue. Different from Hold: the score or
+            policy condition warranted higher-authority review. Reviewer
+            chooses Allow (approve the higher-risk action), Stop (reject
+            outright), or Hold (return for more information).
+          </p>
+          <div className="space-y-2">
+            {escalations.map((e) => (
+              <div key={e.certificate_id} className="bg-gray-800/50 rounded p-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <StatusBadge decision="Escalate" />
+                    <span className="text-sm text-gray-300 font-mono">{e.subject_id}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => setSelectedTc(e.certificate_id)}
+                      className="text-xs text-blue-400 hover:text-blue-300">View TC</button>
+                    <button onClick={() => setOverrideId(overrideId === e.certificate_id ? null : e.certificate_id)}
+                      className="text-xs text-orange-400 hover:text-orange-300">Review</button>
+                  </div>
+                </div>
+                <div className="text-xs text-gray-500 mt-1">{e.blocking_reason}</div>
+                <div className="text-[10px] text-gray-400 mt-2 grid grid-cols-2 md:grid-cols-4 gap-2">
+                  {e.s_base != null && (
+                    <div><span className="text-gray-500">s_base:</span>{' '}
+                      <span className="font-mono">{Number(e.s_base).toFixed(4)}</span></div>
+                  )}
+                  {e.tis_current != null && (
+                    <div><span className="text-gray-500">TIS_current:</span>{' '}
+                      <span className="font-mono">{Number(e.tis_current).toFixed(4)}</span></div>
+                  )}
+                  {e.policy_set_id && (
+                    <div className="col-span-2"><span className="text-gray-500">profile:</span>{' '}
+                      <span className="font-mono text-gray-300">{e.policy_set_id}</span></div>
+                  )}
+                </div>
+                {e.escalation_routed_to && e.escalation_routed_to.length > 0 && (
+                  <div className="text-[10px] text-gray-400 mt-2">
+                    <span className="text-gray-500">routed to:</span>{' '}
+                    {e.escalation_routed_to.map((role) => (
+                      <span key={role} className="inline-block ml-1 px-1.5 py-0.5 rounded bg-orange-900/40 border border-orange-800 text-orange-200 font-mono">
+                        {role}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {e.identity_binding?.requesting_identity && (
+                  <div className="text-[10px] text-gray-400 mt-1">
+                    <span className="text-gray-500">requester:</span>{' '}
+                    <span className="font-mono text-gray-300">
+                      {e.identity_binding.requesting_identity}
+                    </span>
+                    {e.identity_binding.role && (
+                      <span className="text-gray-500"> ({e.identity_binding.role})</span>
+                    )}
+                  </div>
+                )}
+                {overrideId === e.certificate_id && (
+                  <OverrideForm
+                    tcId={e.certificate_id}
+                    endpoint="/govern/escalation-queue"
+                    options={['Allow', 'Stop', 'Hold']}
+                    defaultOption="Allow"
+                    onDone={onOverrideDone}
+                  />
                 )}
               </div>
             ))}
@@ -171,7 +314,12 @@ export default function LiveDecisions() {
                   : '';
                 return (
                 <tr key={d.certificate_id} className={`border-b border-gray-800/50 hover:bg-gray-800/30 ${rowBg}`}>
-                  <td className="py-2 pr-3"><StatusBadge decision={d.decision} /></td>
+                  <td className="py-2 pr-3">
+                    <div className="flex items-center gap-1.5">
+                      <StatusBadge decision={d.decision} />
+                      <OverrideBadge override={d.override} />
+                    </div>
+                  </td>
                   <td className="py-2 pr-3 font-mono text-xs text-gray-400">{d.subject_id}</td>
                   <td className="py-2 pr-3 font-mono text-xs">{d.tis_current?.toFixed(4)}</td>
                   <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.B?.toFixed(2)}</td>

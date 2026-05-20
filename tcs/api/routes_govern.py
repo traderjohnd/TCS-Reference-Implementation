@@ -143,6 +143,59 @@ def post_govern(body: GovernRequestBody, request: Request) -> Dict[str, Any]:
 # /v2/govern/decisions/stream — recent decisions feed                          #
 # --------------------------------------------------------------------------- #
 
+def _override_records_by_tc(store, tc_ids: list) -> Dict[str, Dict[str, Any]]:
+    """
+    Bulk-fetch the most-recent override_applied lifecycle_events row
+    per certificate_id. Returns {tc_id: {decision, actor, at, reason}}.
+
+    Used by /govern/decisions/stream to surface override badges
+    inline without N+1 round-trips. The override metadata is parsed
+    from the lifecycle_events.reason string written by the
+    override endpoint: "{decision}: {justification} (by {actor})".
+    """
+    if not tc_ids:
+        return {}
+    placeholders = ",".join("?" * len(tc_ids))
+    rows = store._conn.execute(
+        f"""
+        SELECT certificate_id, reason, occurred_at
+        FROM lifecycle_events
+        WHERE to_state = 'override_applied'
+          AND certificate_id IN ({placeholders})
+        ORDER BY occurred_at DESC
+        """,
+        tc_ids,
+    ).fetchall()
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        cid = r["certificate_id"]
+        if cid in out:
+            continue  # keep the most recent only
+        reason_str = r["reason"] or ""
+        # Parse "{decision}: {justification} (by {actor})"
+        decision = None
+        justification = reason_str
+        actor = None
+        if ":" in reason_str:
+            decision, _, rest = reason_str.partition(":")
+            decision = decision.strip()
+            rest = rest.strip()
+            if rest.endswith(")") and "(by " in rest:
+                justification, _, by_tail = rest.rpartition("(by ")
+                justification = justification.strip().rstrip()
+                actor = by_tail.rstrip(")").strip()
+            else:
+                justification = rest
+        out[cid] = {
+            "override_decision": decision,
+            "override_actor": actor,
+            "override_at": r["occurred_at"],
+            "override_reason_text": justification,
+            "raw_reason": reason_str,
+        }
+    return out
+
+
 @router.get("/govern/decisions/stream")
 def decisions_stream(
     request: Request,
@@ -153,9 +206,17 @@ def decisions_stream(
 
     Polling endpoint (not SSE) — returns the most recent TCs with
     decision, scores, and timestamps.
+
+    Each row also carries an ``override`` field. When the TC has had
+    a Hold or Escalate override applied, ``override`` is a dict with
+    decision / actor / at / reason. When no override has been
+    applied, ``override`` is None. The original TC content
+    (``decision``, ``blocking_reason``, etc.) is preserved verbatim —
+    the override is a separate annotation, never a mutation.
     """
     store = request.app.state.store
     tcs = store.list_recent(limit=limit)
+    overrides = _override_records_by_tc(store, [tc.certificate_id for tc in tcs])
     decisions = []
     for tc in tcs:
         d = tc.to_dict()
@@ -171,6 +232,7 @@ def decisions_stream(
             "evaluation_timestamp": d["evaluation_timestamp"],
             "domain": d["domain"],
             "risk_tier": d["risk_tier"],
+            "override": overrides.get(d["certificate_id"]),
         })
     return {"count": len(decisions), "decisions": decisions}
 
@@ -317,3 +379,158 @@ def submit_override(
         "status": "applied",
     }
     return override_record
+
+
+# --------------------------------------------------------------------------- #
+# /v2/govern/escalation-queue — open Escalate decisions                        #
+# --------------------------------------------------------------------------- #
+#
+# Mirrors hold_queue but filters decision == "Escalate". The two are
+# structurally similar in the TC schema (both have requires_human_review,
+# both share lifecycle_state="computed") but operationally distinct:
+#
+#   HOLD       — remediable review; reviewer can typically Allow or
+#                Escalate (push it up) the original decision.
+#   ESCALATE   — already pushed up; senior reviewer chooses Allow,
+#                Stop, or return to Hold for more information.
+#
+# Escalation TCs carry an ``escalation_routed_to`` list (roles) populated
+# at TC generation time. The queue surfaces that list so a reviewer
+# knows whether this case was meant for them.
+
+@router.get("/govern/escalation-queue")
+def escalation_queue(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+) -> Dict[str, Any]:
+    """
+    Return Escalate decisions awaiting senior review.
+
+    Filters recent TCs where decision == "Escalate" and excludes any
+    TC that already has an ``override_applied`` lifecycle event
+    (same exclusion mechanism the Hold Queue uses).
+    """
+    store = request.app.state.store
+    tcs = store.list_recent(limit=limit * 3)
+    overridden = _overridden_tc_ids(store)
+    escalations = []
+    for tc in tcs:
+        if tc.decision != "Escalate":
+            continue
+        if tc.certificate_id in overridden:
+            continue
+        d = tc.to_dict()
+        escalations.append({
+            "certificate_id":      d["certificate_id"],
+            "subject_id":          d["subject_id"],
+            "tis_current":         d["tis_current"],
+            "s_base":              d.get("s_base"),
+            "component_scores":    d["component_scores"],
+            "gate_results":        d.get("gate_results"),
+            "blocking_reason":     d.get("blocking_reason"),
+            "evaluation_timestamp": d["evaluation_timestamp"],
+            "domain":              d["domain"],
+            "risk_tier":           d["risk_tier"],
+            "policy_set_id":       d.get("policy_set_id"),
+            # The reviewer-routing list. Empty list means the
+            # generator didn't populate it; non-empty names the
+            # roles the escalation was routed to.
+            "escalation_routed_to": d.get("escalation_routed_to", []),
+            # Identity context if available so a reviewer knows
+            # whose action this was.
+            "identity_binding":    d.get("identity_binding"),
+            "override_status":     "pending",
+        })
+        if len(escalations) >= limit:
+            break
+    return {"count": len(escalations), "escalations": escalations}
+
+
+class EscalationOverrideBody(BaseModel):
+    override_decision: str = Field(
+        ...,
+        description="Reviewer's decision: 'Allow' | 'Stop' | 'Hold'.",
+    )
+    justification: str = Field(
+        ..., min_length=10, description="Reason for the escalation decision",
+    )
+    override_by: str = Field(
+        ..., description="Identity of the senior reviewer",
+    )
+
+
+@router.post("/govern/escalation-queue/{tc_id}/override")
+def submit_escalation_override(
+    tc_id: str,
+    body: EscalationOverrideBody,
+    request: Request,
+) -> Dict[str, Any]:
+    """
+    Submit a senior-reviewer decision for an Escalate TC.
+
+    Allowed override_decision values:
+      - Allow : reviewer approves the higher-risk action
+      - Stop  : reviewer rejects it outright
+      - Hold  : reviewer returns to Hold pending more information
+
+    Persistence is identical to the Hold-queue override path: writes
+    a single ``lifecycle_events`` row with ``to_state='override_applied'``
+    and a reason string capturing the decision, justification, and
+    actor. The original TC is never mutated (append-only invariant).
+    Both queues use the same override exclusion mechanism, so once
+    written, the TC drops out of /govern/escalation-queue on the
+    next poll.
+    """
+    from tcs.persistence import CertificateNotFoundError
+
+    store = request.app.state.store
+    try:
+        tc = store.get(tc_id)
+    except CertificateNotFoundError:
+        raise HTTPException(status_code=404, detail=f"TC {tc_id!r} not found")
+
+    if tc.decision != "Escalate":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"TC {tc_id!r} decision is {tc.decision!r}, not Escalate "
+                "(use /v2/govern/hold-queue/{tc_id}/override for Hold TCs)"
+            ),
+        )
+
+    if body.override_decision not in ("Allow", "Stop", "Hold"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "override_decision must be 'Allow', 'Stop', or 'Hold' "
+                "for escalation-queue overrides"
+            ),
+        )
+
+    occurred_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reason = (
+        f"{body.override_decision}: {body.justification} "
+        f"(by {body.override_by})"
+    )
+    try:
+        store._conn.execute(
+            "INSERT INTO lifecycle_events "
+            "(certificate_id, from_state, to_state, reason, occurred_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (tc_id, tc.lifecycle_state, "override_applied", reason, occurred_at),
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to persist escalation override: {e}",
+        )
+
+    return {
+        "certificate_id":    tc_id,
+        "original_decision": tc.decision,
+        "override_decision": body.override_decision,
+        "justification":     body.justification,
+        "override_by":       body.override_by,
+        "override_at":       occurred_at,
+        "status":            "applied",
+    }

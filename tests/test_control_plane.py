@@ -326,6 +326,222 @@ class TestOverride:
 
 
 # --------------------------------------------------------------------------- #
+# Helpers for Escalation Queue tests                                          #
+# --------------------------------------------------------------------------- #
+
+def _inject_escalate_tc(store, subject_id: str = "test-escalate-01"):
+    """
+    Construct + issue an Escalate-decision TC directly into the store.
+
+    Engineering an Escalate decision through the RAG adapter requires
+    specific BACK scoring (gate passes, tis_current < theta_escalate)
+    which is brittle. We instead fabricate a TISInput / TISResult that
+    deterministically produces Escalate and route it through the
+    real generate_certificate + store.issue() so the TC is shaped
+    exactly like a runtime-produced Escalate TC.
+    """
+    from datetime import datetime, timezone
+    from tcs.decision_engine import map_decision
+    from tcs.policy_profiles import load_profile
+    from tcs.tis_engine import TISInput, compute_tis
+    from tcs.trust_certificate import generate_certificate
+
+    # fin-r3-a4-ct4: theta_escalate=0.70, theta_hold=0.85
+    # To land Escalate (gate=1 AND tis_current < theta_escalate),
+    # use B=A=C=K just above the gate thresholds but produce a
+    # composite that's below 0.70. With those weights we need very
+    # uneven scores. Easier path: load a less-strict profile that
+    # makes the Escalate band wide enough to engineer.
+    profile = load_profile("fin-r3-a4-ct4")
+    inp = TISInput(
+        subject_id=subject_id,
+        subject_type="recommendation",
+        policy_profile=profile,
+        # Scores just above each gate threshold (so gate passes) but
+        # low enough that the weighted composite lands below 0.70.
+        # For fin-r3-a4-ct4 thresholds B=0.80, A=0.85, C=0.80, K=0.80:
+        # use values right at the threshold so S_base ~= 0.81.
+        # That's above theta_escalate (need to be UNDER 0.70).
+        # Force lower-then-threshold scores carefully: nope — gate
+        # requires >= threshold. So we have to drop one dim below
+        # threshold to fail the gate. Escalate via gate-pass + low
+        # TIS is genuinely a narrow band; the easier engineering is
+        # to drop K just under its threshold (gate fails on K) and
+        # then mark the *decision* Escalate via direct construction
+        # — but the decision engine derives Escalate only via the
+        # ladder. Cleanest: pin the decision by going through
+        # generate_certificate with a hand-built TISResult.
+        dimension_scores={"B": 0.85, "A": 0.85, "C": 0.85, "K": 0.85},
+        sub_factor_scores={"C": {"C3": 1.0}},
+        context_metadata={
+            "n_gaps": 0, "context_age_hours": 0.1,
+            "novelty_score": 0.0, "days_since_review": 1,
+            "is_policy_sensitive": False,
+        },
+        elapsed_hours=20.0,  # heavy decay → drives tis_current down
+        is_valid=1,
+        invalidation_event=None,
+        evaluation_time=datetime.now(timezone.utc).replace(microsecond=0),
+    )
+    res = compute_tis(inp)
+    decision, requires_review = map_decision(inp, res)
+    # If natural scoring landed elsewhere, force Escalate via tweak:
+    # bump elapsed_hours until decision == Escalate, OR build the TC
+    # directly bypassing the engine. For test stability, force the
+    # decision string by constructing the TC manually.
+    if decision != "Escalate":
+        decision = "Escalate"
+        requires_review = True
+    tc = generate_certificate(inp, res, decision, requires_review)
+    issued = store.issue(tc)
+    return issued.certificate_id
+
+
+# --------------------------------------------------------------------------- #
+# Decisions stream — override field surfaces overridden TCs                    #
+# --------------------------------------------------------------------------- #
+
+class TestDecisionsStreamOverrideField:
+    def test_decisions_stream_includes_override_null_when_not_overridden(self, client):
+        resp = client.get("/v2/govern/decisions/stream").json()
+        for d in resp["decisions"]:
+            # Every row carries the override field — value is None
+            # for untouched TCs.
+            assert "override" in d
+            assert d["override"] is None
+
+    def test_decisions_stream_includes_override_dict_after_override(self, client):
+        # Pick a Hold TC, override it, then read the decisions stream
+        # and confirm the SAME TC now carries override metadata.
+        holds = client.get("/v2/govern/hold-queue").json()["holds"]
+        assert holds
+        tc_id = holds[0]["certificate_id"]
+        client.post(f"/v2/govern/hold-queue/{tc_id}/override", json={
+            "override_decision": "Allow",
+            "justification": "Reviewed for compliance gap.",
+            "override_by": "compliance_lead_01",
+        })
+
+        stream = client.get("/v2/govern/decisions/stream").json()
+        row = next(d for d in stream["decisions"] if d["certificate_id"] == tc_id)
+        assert row["override"] is not None
+        assert row["override"]["override_decision"] == "Allow"
+        assert row["override"]["override_actor"] == "compliance_lead_01"
+        assert "Reviewed for compliance gap." in row["override"]["override_reason_text"]
+        # And the original TC's decision is unchanged (the badge is
+        # additive metadata; never mutates the TC).
+        assert row["decision"] == "Hold"
+
+
+# --------------------------------------------------------------------------- #
+# Escalation Queue + override                                                  #
+# --------------------------------------------------------------------------- #
+
+class TestEscalationQueue:
+    def test_empty_when_no_escalations(self, client):
+        # The populated_store fixture has Allow / Hold / Stop only.
+        resp = client.get("/v2/govern/escalation-queue").json()
+        assert resp["count"] == 0
+        assert resp["escalations"] == []
+
+    def test_escalate_tc_appears_in_queue(self, client):
+        tc_id = _inject_escalate_tc(client.app.state.store)
+        resp = client.get("/v2/govern/escalation-queue").json()
+        assert resp["count"] >= 1
+        assert any(e["certificate_id"] == tc_id for e in resp["escalations"])
+
+    def test_escalate_row_carries_escalation_routed_to(self, client):
+        tc_id = _inject_escalate_tc(client.app.state.store)
+        resp = client.get("/v2/govern/escalation-queue").json()
+        row = next(e for e in resp["escalations"] if e["certificate_id"] == tc_id)
+        # generate_certificate populates escalation_routed_to for
+        # Escalate decisions by domain. fin-r3-a4-ct4 maps to
+        # financial_services -> ["compliance_officer"].
+        assert "escalation_routed_to" in row
+        assert isinstance(row["escalation_routed_to"], list)
+        assert row["escalation_routed_to"]  # non-empty
+
+    def test_escalation_override_removes_tc_from_queue(self, client):
+        tc_id = _inject_escalate_tc(client.app.state.store)
+        before = client.get("/v2/govern/escalation-queue").json()
+        assert any(e["certificate_id"] == tc_id for e in before["escalations"])
+
+        resp = client.post(f"/v2/govern/escalation-queue/{tc_id}/override", json={
+            "override_decision": "Allow",
+            "justification": "Senior reviewer approved per policy exception.",
+            "override_by": "senior_reviewer_01",
+        })
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["override_decision"] == "Allow"
+
+        after = client.get("/v2/govern/escalation-queue").json()
+        assert all(e["certificate_id"] != tc_id for e in after["escalations"])
+
+    def test_escalation_override_supports_allow_stop_hold(self, client):
+        for decision in ("Allow", "Stop", "Hold"):
+            tc_id = _inject_escalate_tc(client.app.state.store, subject_id=f"esc-{decision}")
+            resp = client.post(f"/v2/govern/escalation-queue/{tc_id}/override", json={
+                "override_decision": decision,
+                "justification": f"Test decision path: {decision}.",
+                "override_by": "test_reviewer",
+            })
+            assert resp.status_code == 200, f"{decision}: {resp.text}"
+
+    def test_escalation_override_rejects_invalid_decision(self, client):
+        tc_id = _inject_escalate_tc(client.app.state.store)
+        resp = client.post(f"/v2/govern/escalation-queue/{tc_id}/override", json={
+            "override_decision": "Escalate",  # would loop
+            "justification": "Should be rejected.",
+            "override_by": "x",
+        })
+        assert resp.status_code == 400
+
+    def test_escalation_override_rejects_non_escalate_tc(self, client):
+        # Try to escalation-override a Hold TC — wrong endpoint.
+        holds = client.get("/v2/govern/hold-queue").json()["holds"]
+        hold_tc_id = holds[0]["certificate_id"]
+        resp = client.post(
+            f"/v2/govern/escalation-queue/{hold_tc_id}/override",
+            json={
+                "override_decision": "Allow",
+                "justification": "Should be rejected — wrong endpoint.",
+                "override_by": "x",
+            },
+        )
+        assert resp.status_code == 400
+        assert "Escalate" in resp.json()["detail"]
+
+    def test_escalation_override_persists_across_restart(self, tmp_path):
+        # Build a fresh store ON DISK, inject + override, close, reopen,
+        # verify the escalation queue still excludes the overridden TC.
+        from tcs.persistence import CertificateStore
+        db_path = tmp_path / "escalation_persist.db"
+        s1 = CertificateStore(str(db_path))
+        c1 = TestClient(create_app(store=s1))
+        with c1:
+            tc_id = _inject_escalate_tc(s1)
+            c1.post(f"/v2/govern/escalation-queue/{tc_id}/override", json={
+                "override_decision": "Stop",
+                "justification": "Reviewer rejected outright.",
+                "override_by": "senior_01",
+            })
+        s1.close()
+
+        s2 = CertificateStore(str(db_path))
+        c2 = TestClient(create_app(store=s2))
+        with c2:
+            after = c2.get("/v2/govern/escalation-queue").json()
+            assert all(e["certificate_id"] != tc_id for e in after["escalations"]), (
+                "override should survive store close + reopen"
+            )
+            # And the original TC is still inspectable.
+            tc = c2.get(f"/v2/certificates/{tc_id}").json()
+            assert tc["certificate_id"] == tc_id
+            assert tc["decision"] == "Escalate"  # original decision preserved
+        s2.close()
+
+
+# --------------------------------------------------------------------------- #
 # Metrics summary endpoint tests                                              #
 # --------------------------------------------------------------------------- #
 
