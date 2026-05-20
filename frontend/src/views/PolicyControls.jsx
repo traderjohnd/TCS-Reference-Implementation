@@ -635,9 +635,10 @@ export default function PolicyControls() {
 
   return (
     <div className="space-y-6">
-      <StandardsLibrary />
-      <StandardsComposer onDeployed={handlePackDeployed} hasEditAccess={hasEditAccess()} />
-
+      {/* Reordered per user spec: the currently active pack is the
+          most operationally important fact on this page, so it leads.
+          Standards Composer comes next (the deploy workflow), then
+          Standards Library (read-only reference). */}
       <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
         <h3 className="text-sm font-medium text-gray-400 mb-3">Active Risk Tolerance Profile</h3>
         {active ? (
@@ -684,6 +685,9 @@ export default function PolicyControls() {
           <p className="text-gray-600 text-sm">No regulatory pack deployed. Using base policy profiles.</p>
         )}
       </div>
+
+      <StandardsComposer onDeployed={handlePackDeployed} hasEditAccess={hasEditAccess()} />
+      <StandardsLibrary />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
