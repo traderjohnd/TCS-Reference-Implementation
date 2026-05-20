@@ -114,33 +114,96 @@ function OverrideForm({ tcId, endpoint, options, defaultOption, onDone }) {
 // row. The original TC content stays unchanged; this badge reads from
 // the new `override` field on the decisions-stream payload and shows
 // the reviewer who overrode and to what.
-function OverrideBadge({ override }) {
+function OverrideBadge({ override, certificateId }) {
   const [expanded, setExpanded] = useState(false);
+  // History is fetched lazily on first expand. The badge in
+  // /govern/decisions/stream carries only the most recent override;
+  // the full audit list comes from the dedicated history endpoint.
+  const [history, setHistory] = useState(null);
+  const [historyError, setHistoryError] = useState(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
   if (!override) return null;
   const tone = override.override_decision === 'Allow'
     ? 'border-green-700 text-green-300 bg-green-900/30'
     : override.override_decision === 'Stop'
     ? 'border-red-700 text-red-300 bg-red-900/30'
     : 'border-blue-700 text-blue-300 bg-blue-900/30';
+
+  const onToggle = (e) => {
+    e.stopPropagation();
+    const nextExpanded = !expanded;
+    setExpanded(nextExpanded);
+    if (nextExpanded && history === null && !loadingHistory && certificateId) {
+      setLoadingHistory(true);
+      setHistoryError(null);
+      apiFetch(`/govern/decisions/${certificateId}/override-history`)
+        .then((data) => setHistory(data?.events || []))
+        .catch((err) => setHistoryError(String(err)))
+        .finally(() => setLoadingHistory(false));
+    }
+  };
+
+  // What we render in the expanded panel: the history list when we
+  // have it, otherwise the single override the row already carries.
+  // This keeps the panel populated immediately on expand even before
+  // the history fetch completes.
+  const eventsToRender = history && history.length > 0 ? history : [override];
+  const showingHistory = history !== null && history.length > 1;
+
   return (
     <div className="inline-block">
       <button
-        onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }}
+        onClick={onToggle}
         className={`text-[10px] rounded border px-1.5 py-0.5 font-mono ${tone}`}
         title="Click to expand override details"
       >
         Overridden → {override.override_decision || '?'}
       </button>
       {expanded && (
-        <div className="mt-1 text-[10px] text-gray-400 bg-gray-900/80 border border-gray-700 rounded p-2 max-w-md">
-          <div><span className="text-gray-500">actor:</span> <span className="text-gray-300">{override.override_actor || '—'}</span></div>
-          <div><span className="text-gray-500">at:</span> <span className="text-gray-300 font-mono">{override.override_at}</span></div>
-          {override.override_reason_text && (
-            <div className="mt-1">
-              <span className="text-gray-500">reason:</span>{' '}
-              <span className="text-gray-300">{override.override_reason_text}</span>
+        <div className="mt-1 text-[10px] text-gray-400 bg-gray-900/80 border border-gray-700 rounded p-2 max-w-md space-y-2">
+          {loadingHistory && (
+            <div className="text-gray-500 italic">Loading history…</div>
+          )}
+          {historyError && (
+            <div className="text-red-400">Failed to load history: {historyError}</div>
+          )}
+          {showingHistory && (
+            <div className="text-[10px] text-gray-500 uppercase tracking-wide">
+              Override history ({history.length}) — newest first
             </div>
           )}
+          {eventsToRender.map((ev, i) => (
+            <div
+              key={`${ev.override_at || 'evt'}-${i}`}
+              className={
+                showingHistory
+                  ? 'border-l-2 border-gray-700 pl-2'
+                  : ''
+              }
+            >
+              <div>
+                <span className="text-gray-500">decision:</span>{' '}
+                <span className="text-gray-300 font-mono">
+                  {ev.override_decision || '—'}
+                </span>
+              </div>
+              <div>
+                <span className="text-gray-500">actor:</span>{' '}
+                <span className="text-gray-300">{ev.override_actor || '—'}</span>
+              </div>
+              <div>
+                <span className="text-gray-500">at:</span>{' '}
+                <span className="text-gray-300 font-mono">{ev.override_at}</span>
+              </div>
+              {ev.override_reason_text && (
+                <div>
+                  <span className="text-gray-500">reason:</span>{' '}
+                  <span className="text-gray-300">{ev.override_reason_text}</span>
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -172,13 +235,17 @@ export default function LiveDecisions() {
     <div className="space-y-6">
       {selectedTc && <TCDetailPanel certificateId={selectedTc} onClose={() => setSelectedTc(null)} />}
 
-      {holds.length > 0 && (
-        <div className="bg-gray-900 rounded-lg border border-yellow-800 p-4">
-          <h3 className="text-sm font-medium text-yellow-400 mb-1">Hold Queue ({holds.length})</h3>
-          <p className="text-[11px] text-gray-500 mb-3">
-            Remediable review. Reviewer can Allow (release for delivery)
-            or Escalate (push to senior review).
-          </p>
+      <div className="bg-gray-900 rounded-lg border border-yellow-800 p-4">
+        <h3 className="text-sm font-medium text-yellow-400 mb-1">Hold Queue ({holds.length})</h3>
+        <p className="text-[11px] text-gray-500 mb-3">
+          Remediable review. Reviewer can Allow (release for delivery)
+          or Escalate (push to senior review).
+        </p>
+        {holds.length === 0 ? (
+          <div className="text-xs text-gray-500 italic px-2 py-3">
+            No items pending review.
+          </div>
+        ) : (
           <div className="space-y-2">
             {holds.map((h) => (
               <div key={h.certificate_id} className="bg-gray-800/50 rounded p-3">
@@ -207,20 +274,24 @@ export default function LiveDecisions() {
               </div>
             ))}
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
-      {escalations.length > 0 && (
-        <div className="bg-gray-900 rounded-lg border border-orange-800 p-4">
-          <h3 className="text-sm font-medium text-orange-400 mb-1">
-            Escalation Queue ({escalations.length})
-          </h3>
-          <p className="text-[11px] text-gray-500 mb-3">
-            Senior-reviewer queue. Different from Hold: the score or
-            policy condition warranted higher-authority review. Reviewer
-            chooses Allow (approve the higher-risk action), Stop (reject
-            outright), or Hold (return for more information).
-          </p>
+      <div className="bg-gray-900 rounded-lg border border-orange-800 p-4">
+        <h3 className="text-sm font-medium text-orange-400 mb-1">
+          Escalation Queue ({escalations.length})
+        </h3>
+        <p className="text-[11px] text-gray-500 mb-3">
+          Senior-reviewer queue. Different from Hold: the score or
+          policy condition warranted higher-authority review. Reviewer
+          chooses Allow (approve the higher-risk action), Stop (reject
+          outright), or Hold (return for more information).
+        </p>
+        {escalations.length === 0 ? (
+          <div className="text-xs text-gray-500 italic px-2 py-3">
+            No escalations pending senior review.
+          </div>
+        ) : (
           <div className="space-y-2">
             {escalations.map((e) => (
               <div key={e.certificate_id} className="bg-gray-800/50 rounded p-3">
@@ -284,8 +355,8 @@ export default function LiveDecisions() {
               </div>
             ))}
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
         <h3 className="text-sm font-medium text-gray-400 mb-3">Recent Decisions ({decisions.length})</h3>
@@ -317,7 +388,10 @@ export default function LiveDecisions() {
                   <td className="py-2 pr-3">
                     <div className="flex items-center gap-1.5">
                       <StatusBadge decision={d.decision} />
-                      <OverrideBadge override={d.override} />
+                      <OverrideBadge
+                        override={d.override}
+                        certificateId={d.certificate_id}
+                      />
                     </div>
                   </td>
                   <td className="py-2 pr-3 font-mono text-xs text-gray-400">{d.subject_id}</td>
