@@ -66,6 +66,29 @@ function useCollapsedNav() {
   return [collapsed, () => setCollapsed((v) => !v)];
 }
 
+// Per-section expand/collapse. Stores the set of section ids that
+// are currently COLLAPSED (default = all expanded). Persisted as a
+// comma-separated list in localStorage.
+function useSectionCollapse() {
+  const [collapsedIds, setCollapsedIds] = useState(() => {
+    const raw = localStorage.getItem('tcs_nav_collapsed_sections') || '';
+    return new Set(raw.split(',').filter(Boolean));
+  });
+  useEffect(() => {
+    localStorage.setItem(
+      'tcs_nav_collapsed_sections',
+      Array.from(collapsedIds).join(','),
+    );
+  }, [collapsedIds]);
+  const toggle = (id) => setCollapsedIds((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  });
+  return [collapsedIds, toggle];
+}
+
 function NavItem({ item, collapsed }) {
   return (
     <NavLink
@@ -90,25 +113,60 @@ function NavItem({ item, collapsed }) {
   );
 }
 
-function NavSection({ section, collapsed, canAccessView }) {
+function NavSection({
+  section, collapsed, canAccessView,
+  sectionCollapsed, onToggleSection,
+}) {
   const visibleItems = section.items.filter((it) => canAccessView(it.view));
   if (visibleItems.length === 0) return null;
-  return (
-    <div className="mb-4">
-      {collapsed ? (
-        // When collapsed, sections become a thin top-border divider
-        // instead of a labeled header — keeps the icons tight.
+
+  // When the WHOLE nav is collapsed (icon-only mode), per-section
+  // expand/collapse doesn't apply — all items render as icons.
+  if (collapsed) {
+    return (
+      <div className="mb-4">
         <div className="border-t border-gray-800 my-2 mx-2" />
-      ) : (
-        <div className="text-[10px] uppercase tracking-wider text-gray-600 px-3 mb-1.5 font-semibold">
-          {section.label}
+        <div className="space-y-1">
+          {visibleItems.map((it) => (
+            <NavItem key={it.path} item={it} collapsed={collapsed} />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // Expanded nav: section header is a clickable toggle.
+  return (
+    <div className="mb-3">
+      <button
+        onClick={() => onToggleSection(section.id)}
+        className="w-full flex items-center justify-between px-3 py-1.5 rounded text-[11px] uppercase tracking-wider font-bold text-blue-300 hover:bg-gray-800/60 transition-colors"
+        title={sectionCollapsed ? `Expand ${section.label}` : `Collapse ${section.label}`}
+        aria-expanded={!sectionCollapsed}
+      >
+        <span>{section.label}</span>
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 20 20"
+          fill="currentColor"
+          className={`w-3 h-3 transition-transform ${
+            sectionCollapsed ? '-rotate-90' : ''
+          }`}
+        >
+          <path
+            fillRule="evenodd"
+            d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"
+            clipRule="evenodd"
+          />
+        </svg>
+      </button>
+      {!sectionCollapsed && (
+        <div className="space-y-0.5 mt-1">
+          {visibleItems.map((it) => (
+            <NavItem key={it.path} item={it} collapsed={collapsed} />
+          ))}
         </div>
       )}
-      <div className={collapsed ? 'space-y-1' : 'space-y-0.5'}>
-        {visibleItems.map((it) => (
-          <NavItem key={it.path} item={it} collapsed={collapsed} />
-        ))}
-      </div>
     </div>
   );
 }
@@ -117,6 +175,7 @@ export default function Layout() {
   const { user, logout, canAccessView } = useAuth();
   const { theme, toggle } = useTheme();
   const [collapsed, toggleCollapsed] = useCollapsedNav();
+  const [collapsedSections, toggleSection] = useSectionCollapse();
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
@@ -203,6 +262,8 @@ export default function Layout() {
                   section={section}
                   collapsed={collapsed}
                   canAccessView={canAccessView}
+                  sectionCollapsed={collapsedSections.has(section.id)}
+                  onToggleSection={toggleSection}
                 />
               ))}
             </nav>
