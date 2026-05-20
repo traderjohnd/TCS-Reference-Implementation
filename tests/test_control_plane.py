@@ -254,6 +254,76 @@ class TestOverride:
         })
         assert resp.status_code == 400
 
+    def test_override_removes_tc_from_hold_queue(self, client):
+        """
+        Regression for the demo-hardening bug where the override endpoint
+        returned 200 but didn't persist anything — the overridden TC kept
+        re-appearing in the Hold Queue on every poll, making the override
+        button look broken to anyone exercising it from the UI.
+
+        Fix: the endpoint now inserts a lifecycle_events row with
+        to_state='override_applied'; the hold-queue endpoint filters
+        those out.
+        """
+        # Find a Hold TC.
+        resp = client.get("/v2/govern/hold-queue")
+        holds_before = resp.json()["holds"]
+        assert len(holds_before) >= 1
+        tc_id = holds_before[0]["certificate_id"]
+        ids_before = {h["certificate_id"] for h in holds_before}
+
+        # Submit the override.
+        resp = client.post(f"/v2/govern/hold-queue/{tc_id}/override", json={
+            "override_decision": "Allow",
+            "justification": "Reviewed and approved for delivery.",
+            "override_by": "compliance_officer_42",
+        })
+        assert resp.status_code == 200
+
+        # Hold queue must no longer contain this TC.
+        resp = client.get("/v2/govern/hold-queue")
+        holds_after = resp.json()["holds"]
+        ids_after = {h["certificate_id"] for h in holds_after}
+        assert tc_id not in ids_after, (
+            "overridden TC should drop out of /govern/hold-queue; "
+            f"still present: {tc_id}"
+        )
+        # And all OTHER pre-existing holds should still be visible
+        # (we didn't accidentally over-filter).
+        assert ids_after == ids_before - {tc_id}, (
+            "override filter should remove ONLY the overridden TC; "
+            f"before={ids_before}, after={ids_after}"
+        )
+
+    def test_override_persisted_as_lifecycle_event(self, client):
+        """The override is recorded in lifecycle_events with the
+        justification + override_by captured in the reason string,
+        so the audit trail is complete even though the TC itself
+        is append-only."""
+        resp = client.get("/v2/govern/hold-queue")
+        holds = resp.json()["holds"]
+        assert holds
+        tc_id = holds[0]["certificate_id"]
+
+        client.post(f"/v2/govern/hold-queue/{tc_id}/override", json={
+            "override_decision": "Escalate",
+            "justification": "Needs senior reviewer attention.",
+            "override_by": "rep_jane_doe",
+        })
+
+        # Walk the persistence layer directly to verify the row exists.
+        store = client.app.state.store
+        rows = store._conn.execute(
+            "SELECT to_state, reason FROM lifecycle_events "
+            "WHERE certificate_id = ? AND to_state = 'override_applied'",
+            (tc_id,),
+        ).fetchall()
+        assert len(rows) == 1
+        reason = rows[0]["reason"]
+        assert "Escalate" in reason
+        assert "Needs senior reviewer attention." in reason
+        assert "rep_jane_doe" in reason
+
 
 # --------------------------------------------------------------------------- #
 # Metrics summary endpoint tests                                              #

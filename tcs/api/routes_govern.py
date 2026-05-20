@@ -179,6 +179,19 @@ def decisions_stream(
 # /v2/govern/hold-queue — open Hold decisions                                  #
 # --------------------------------------------------------------------------- #
 
+def _overridden_tc_ids(store) -> set:
+    """
+    Return the set of certificate_ids that have an ``override_applied``
+    lifecycle event. Used by the Hold Queue endpoint to filter out
+    TCs that have already been overridden.
+    """
+    rows = store._conn.execute(
+        "SELECT DISTINCT certificate_id FROM lifecycle_events "
+        "WHERE to_state = 'override_applied'"
+    ).fetchall()
+    return {r["certificate_id"] for r in rows}
+
+
 @router.get("/govern/hold-queue")
 def hold_queue(
     request: Request,
@@ -187,26 +200,33 @@ def hold_queue(
     """
     Return Hold decisions awaiting review.
 
-    Filters recent TCs to only those with decision == "Hold".
+    Filters recent TCs to only those with decision == "Hold" AND
+    no recorded override_applied lifecycle event (the override
+    endpoint writes that event; once it's present, the TC drops
+    out of the queue).
     """
     store = request.app.state.store
     tcs = store.list_recent(limit=limit * 3)  # over-fetch to find holds
+    overridden = _overridden_tc_ids(store)
     holds = []
     for tc in tcs:
-        if tc.decision == "Hold":
-            d = tc.to_dict()
-            holds.append({
-                "certificate_id": d["certificate_id"],
-                "subject_id": d["subject_id"],
-                "tis_current": d["tis_current"],
-                "component_scores": d["component_scores"],
-                "blocking_reason": d.get("blocking_reason"),
-                "evaluation_timestamp": d["evaluation_timestamp"],
-                "domain": d["domain"],
-                "override_status": "pending",
-            })
-            if len(holds) >= limit:
-                break
+        if tc.decision != "Hold":
+            continue
+        if tc.certificate_id in overridden:
+            continue
+        d = tc.to_dict()
+        holds.append({
+            "certificate_id": d["certificate_id"],
+            "subject_id": d["subject_id"],
+            "tis_current": d["tis_current"],
+            "component_scores": d["component_scores"],
+            "blocking_reason": d.get("blocking_reason"),
+            "evaluation_timestamp": d["evaluation_timestamp"],
+            "domain": d["domain"],
+            "override_status": "pending",
+        })
+        if len(holds) >= limit:
+            break
     return {"count": len(holds), "holds": holds}
 
 
@@ -259,13 +279,41 @@ def submit_override(
             detail="override_decision must be 'Allow' or 'Escalate'",
         )
 
+    occurred_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Persist the override as a lifecycle_events row. The TC itself is
+    # append-only (C-R.18 / C-P.14) — corrections never mutate the
+    # original certificate. lifecycle_events IS append-only too, but
+    # it accepts new rows recording state transitions, which is
+    # exactly what an override is: a transition from the TC's
+    # original decision to an override_applied state.
+    #
+    # The Hold Queue's filter (_overridden_tc_ids) checks for
+    # to_state='override_applied' rows; this insert is what makes
+    # the held TC drop out of the queue on next poll.
+    reason = (
+        f"{body.override_decision}: {body.justification} "
+        f"(by {body.override_by})"
+    )
+    try:
+        store._conn.execute(
+            "INSERT INTO lifecycle_events "
+            "(certificate_id, from_state, to_state, reason, occurred_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (tc_id, tc.lifecycle_state, "override_applied", reason, occurred_at),
+        )
+    except Exception as e:  # noqa: BLE001 — surface to caller
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to persist override: {e}",
+        )
+
     override_record = {
         "certificate_id": tc_id,
         "original_decision": tc.decision,
         "override_decision": body.override_decision,
         "justification": body.justification,
         "override_by": body.override_by,
-        "override_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "override_at": occurred_at,
         "status": "applied",
     }
     return override_record
