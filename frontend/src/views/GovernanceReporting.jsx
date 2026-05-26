@@ -6,24 +6,26 @@ import {
 import { useApi } from '../hooks/useApi';
 
 // =============================================================================
-// Phase 5 — Runtime governance reporting and trust telemetry.
+// Governance Reporting & Trust Telemetry — frontend view
 //
-// This view is the sibling of Live (now), Audit (one decision) and
-// Replay (cross-policy). It answers "how is governance behaving over
-// time?" using read-only aggregates over the existing TC + lifecycle_event
-// store. Eight panels:
+// Aggregate, read-only views over the existing Trust Certificate +
+// GovernanceEvaluation + lifecycle archive. Distinct from:
 //
-//   1. Decisions over time             (stacked area)
-//   2. Score averages over time        (two-line: S_base, TIS_current)
-//   3. Non-allow trends                (line: Hold / Escalate / Stop)
-//   4. Failed BACK dimensions          (horizontal bars: B / A / C / K)
-//   5. Decisions by policy / pack      (table)
-//   6. Override rate by policy         (table)
-//   7. Top triggered governance rules  (table)
-//   8. Recent override activity        (table)
+//   Live     — what is happening right now
+//   Audit    — what happened in one specific decision
+//   Replay   — how the same artifact behaves under different policies
+//   Reporting (this view) — how governance behaves over time
 //
-// No mutation. No drill-down editing. No charts beyond what `recharts`
-// already provides.
+// Eight panels grouped into four sections:
+//
+//   A. Decision Outcomes        — Decisions over time, Decisions by policy
+//   B. Trust Quality            — Score averages, Failed BACK dimensions
+//   C. Policy & Rule Behavior   — Top rules, Non-allow trends
+//   D. Human Review & Overrides — Override rate by policy, Override activity
+//
+// Read-only by construction. No mutation endpoints under /v2/reporting/*,
+// no edit buttons in this view, and no POST imports from useApi. Charts
+// use only the already-installed `recharts` library — no new dependencies.
 // =============================================================================
 
 const WINDOW_OPTIONS = [
@@ -71,15 +73,38 @@ function WindowSelector({ window, onChange }) {
   );
 }
 
+// ── Section banner ──────────────────────────────────────────────────────────
+//
+// Small visual hierarchy element used between the header and each pair of
+// panels: a mono letter chip (A/B/C/D) + section name + one-line gloss.
+
+function SectionHeader({ letter, title, description }) {
+  return (
+    <div className="flex items-baseline gap-3 px-1 mb-3">
+      <span className="text-[11px] font-mono uppercase tracking-wider text-gray-300 bg-gray-800 border border-gray-700 px-2 py-0.5 rounded">
+        {letter}
+      </span>
+      <h3 className="text-sm font-semibold text-white">{title}</h3>
+      <p className="text-[11px] text-gray-500">{description}</p>
+    </div>
+  );
+}
+
 // ── Panel shell + states ────────────────────────────────────────────────────
+//
+// `subtitle` carries the three-sentence helper text shown under the
+// panel title. The helper answers: what am I looking at, why does it
+// matter, what should a reviewer notice. Kept concise per the spec.
 
 function PanelShell({ title, subtitle, children }) {
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 flex flex-col min-h-[18rem]">
       <div className="mb-3">
-        <h3 className="text-sm font-medium text-white">{title}</h3>
+        <h4 className="text-sm font-medium text-white">{title}</h4>
         {subtitle && (
-          <p className="text-[11px] text-gray-500 mt-0.5">{subtitle}</p>
+          <p className="text-[11px] text-gray-500 leading-relaxed mt-1">
+            {subtitle}
+          </p>
         )}
       </div>
       <div className="flex-1 min-h-0">{children}</div>
@@ -89,7 +114,7 @@ function PanelShell({ title, subtitle, children }) {
 
 function EmptyState({ message }) {
   return (
-    <div className="h-full flex items-center justify-center text-xs text-gray-500 italic">
+    <div className="h-full flex items-center justify-center text-xs text-gray-500 italic px-3 text-center">
       {message || 'No governance activity in the selected window.'}
     </div>
   );
@@ -114,8 +139,7 @@ function ErrorState({ error }) {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function shortTime(iso) {
-  // Display ISO timestamps compactly. For hour-bucketed data we want
-  // "MM-DD HH:00"; for day-bucketed data "MM-DD".
+  // For hour-bucketed data show "MM/DD HH:00"; for day-bucketed data "MM/DD".
   if (!iso) return '';
   const datePart = iso.slice(5, 10).replace('-', '/');
   const hour = iso.slice(11, 13);
@@ -127,12 +151,6 @@ function fmtPct(x) {
   return `${(Number(x) * 100).toFixed(1)}%`;
 }
 
-function fmtScore(x) {
-  if (x == null) return '—';
-  return Number(x).toFixed(4);
-}
-
-// Hover text combining pack name + raw policy id, so a reader sees both.
 function packLabel(row) {
   if (row.pack_name) return row.pack_name;
   return row.policy_set_id || '—';
@@ -144,10 +162,6 @@ function packTitle(row) {
   return row.policy_set_id || '';
 }
 
-// Flatten { buckets: [{t, counts:{Allow:12, Hold:1}}] } into the
-// shape recharts expects: [{t, Allow:12, Hold:1, ...}]. Series list is
-// derived from the union of all keys so chart layout adapts to the
-// decisions actually present in the window.
 function flattenStacked(buckets) {
   if (!Array.isArray(buckets)) return { data: [], series: [] };
   const seriesSet = new Set();
@@ -172,7 +186,9 @@ function DecisionsOverTimePanel({ window }) {
   if (loading) return <LoadingState />;
   if (error)   return <ErrorState error={error} />;
   const { data: flat, series } = flattenStacked(data?.buckets);
-  if (flat.length === 0) return <EmptyState />;
+  if (flat.length === 0) {
+    return <EmptyState message="No governance activity in the selected window." />;
+  }
   return (
     <ResponsiveContainer width="100%" height={240}>
       <AreaChart data={flat}>
@@ -210,7 +226,9 @@ function ScoreAveragesPanel({ window }) {
   if (loading) return <LoadingState />;
   if (error)   return <ErrorState error={error} />;
   const buckets = data?.buckets || [];
-  if (buckets.length === 0) return <EmptyState />;
+  if (buckets.length === 0) {
+    return <EmptyState message="No governance activity in the selected window." />;
+  }
   return (
     <ResponsiveContainer width="100%" height={240}>
       <LineChart data={buckets}>
@@ -243,7 +261,9 @@ function NonAllowTrendsPanel({ window }) {
   if (loading) return <LoadingState />;
   if (error)   return <ErrorState error={error} />;
   const buckets = data?.buckets || [];
-  if (buckets.length === 0) return <EmptyState />;
+  if (buckets.length === 0) {
+    return <EmptyState message="No Hold / Escalate / Stop decisions in this window." />;
+  }
   return (
     <ResponsiveContainer width="100%" height={240}>
       <LineChart data={buckets}>
@@ -274,7 +294,9 @@ function FailedBackPanel({ window }) {
   if (error)   return <ErrorState error={error} />;
   const dims = data?.dims || [];
   const allZero = dims.every((d) => d.fail_count === 0 && d.evaluated === 0);
-  if (allZero) return <EmptyState />;
+  if (allZero) {
+    return <EmptyState message="No failed BACK gates in this window." />;
+  }
   return (
     <ResponsiveContainer width="100%" height={240}>
       <BarChart data={dims} layout="vertical" margin={{ left: 20 }}>
@@ -308,14 +330,16 @@ function DecisionsByPolicyPanel({ window }) {
   if (loading) return <LoadingState />;
   if (error)   return <ErrorState error={error} />;
   const rows = data?.rows || [];
-  if (rows.length === 0) return <EmptyState />;
+  if (rows.length === 0) {
+    return <EmptyState message="No governance activity in the selected window." />;
+  }
   return (
     <div className="overflow-auto max-h-64">
       <table className="w-full text-xs">
         <thead className="text-left text-gray-500 uppercase tracking-wide">
           <tr className="border-b border-gray-800">
             <th className="pb-1 pr-2">Pack / Profile</th>
-            <th className="pb-1 pr-2 text-right">Total</th>
+            <th className="pb-1 pr-2 text-right" title="Decision count in window">Total (count)</th>
             <th className="pb-1 pr-2 text-right">Allow</th>
             <th className="pb-1 pr-2 text-right">Hold</th>
             <th className="pb-1 pr-2 text-right">Escalate</th>
@@ -342,6 +366,9 @@ function DecisionsByPolicyPanel({ window }) {
           ))}
         </tbody>
       </table>
+      <p className="text-[10px] text-gray-600 mt-2 italic">
+        Each value is a count of decisions in the selected window.
+      </p>
     </div>
   );
 }
@@ -356,16 +383,28 @@ function OverrideRatePanel({ window }) {
   if (loading) return <LoadingState />;
   if (error)   return <ErrorState error={error} />;
   const rows = data?.rows || [];
-  if (rows.length === 0) return <EmptyState />;
+  if (rows.length === 0) {
+    return <EmptyState message="No overrides recorded in this window." />;
+  }
+  // Sub-empty: there's policy activity but no overrides happened anywhere.
+  // We still render the rows (with 0 / 0 / 0.0%) because the policy
+  // breakdown itself is informative — the "rate is zero" reading is the
+  // story.
   return (
     <div className="overflow-auto max-h-64">
       <table className="w-full text-xs">
         <thead className="text-left text-gray-500 uppercase tracking-wide">
           <tr className="border-b border-gray-800">
             <th className="pb-1 pr-2">Pack / Profile</th>
-            <th className="pb-1 pr-2 text-right">Total</th>
-            <th className="pb-1 pr-2 text-right">Overridden</th>
-            <th className="pb-1 pr-2 text-right">Rate</th>
+            <th className="pb-1 pr-2 text-right" title="Decision count in window">
+              Total (count)
+            </th>
+            <th className="pb-1 pr-2 text-right" title="Override count in window">
+              Overridden (count)
+            </th>
+            <th className="pb-1 pr-2 text-right" title="Overridden / total, as percent">
+              Override rate (%)
+            </th>
           </tr>
         </thead>
         <tbody className="font-mono">
@@ -381,6 +420,10 @@ function OverrideRatePanel({ window }) {
           ))}
         </tbody>
       </table>
+      <p className="text-[10px] text-gray-600 mt-2 italic">
+        Total and Overridden are counts. Override rate is a percentage of
+        decisions made under the policy in the selected window.
+      </p>
     </div>
   );
 }
@@ -395,14 +438,18 @@ function TopRulesPanel({ window }) {
   if (loading) return <LoadingState />;
   if (error)   return <ErrorState error={error} />;
   const rules = data?.rules || [];
-  if (rules.length === 0) return <EmptyState />;
+  if (rules.length === 0) {
+    return <EmptyState message="No rule matches recorded in this window." />;
+  }
   return (
     <div className="overflow-auto max-h-64">
       <table className="w-full text-xs">
         <thead className="text-left text-gray-500 uppercase tracking-wide">
           <tr className="border-b border-gray-800">
             <th className="pb-1 pr-2">Rule</th>
-            <th className="pb-1 pr-2 text-right">Fires</th>
+            <th className="pb-1 pr-2 text-right" title="Number of times the rule fired in window">
+              Fires (count)
+            </th>
             <th className="pb-1 pr-2">Top decision</th>
             <th className="pb-1 pr-2">Top pack</th>
           </tr>
@@ -447,7 +494,9 @@ function OverrideActivityPanel({ window }) {
   if (loading) return <LoadingState />;
   if (error)   return <ErrorState error={error} />;
   const events = data?.events || [];
-  if (events.length === 0) return <EmptyState />;
+  if (events.length === 0) {
+    return <EmptyState message="No overrides recorded in this window." />;
+  }
   return (
     <div className="overflow-auto max-h-64">
       <table className="w-full text-xs">
@@ -498,80 +547,116 @@ export default function GovernanceReporting() {
   const [window, setWindow] = useState('7d');
 
   return (
-    <div className="space-y-4">
-      {/* Header bar with window selector + framing note */}
+    <div className="space-y-6">
+      {/* Header: title + subtitle + window selector */}
       <div className="flex items-center justify-between bg-gray-900 border border-gray-800 rounded-lg px-4 py-3">
         <div>
           <h2 className="text-base font-semibold text-white">
-            Runtime governance reporting and trust telemetry
+            Governance Reporting &amp; Trust Telemetry
           </h2>
-          <p className="text-[11px] text-gray-500 mt-0.5">
-            How governance behaves over time. Aggregate, read-only views over the
-            existing Trust Certificate + lifecycle archive. Distinct from Live
-            (now), Audit (one decision), and Replay (cross-policy).
+          <p className="text-[11px] text-gray-500 mt-0.5 max-w-3xl">
+            Aggregate reporting across Trust Certificates, Governance Evaluations,
+            policy profiles, rule matches, overrides, and enforcement outcomes.
           </p>
         </div>
         <WindowSelector window={window} onChange={setWindow} />
       </div>
 
-      {/* 2-column grid on lg+, 1-column on small */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <PanelShell
-          title="Decisions over time"
-          subtitle="Stacked counts per decision outcome."
-        >
-          <DecisionsOverTimePanel window={window} />
-        </PanelShell>
+      {/* ── A. Decision Outcomes ────────────────────────────────────────── */}
+      <section>
+        <SectionHeader
+          letter="A"
+          title="Decision Outcomes"
+          description="What governance decided and which policy profiles governed those decisions."
+        />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <PanelShell
+            title="Decisions over time"
+            subtitle="Stacked count of every governance decision rendered per time bucket. Shows how activity is distributed across routine Allows, review Holds, escalations, and blocked Stops. Watch for sudden spikes in Hold, Escalate, or Stop because they may signal a policy, source, workflow, or upstream behavior change."
+          >
+            <DecisionsOverTimePanel window={window} />
+          </PanelShell>
 
-        <PanelShell
-          title="Score averages over time"
-          subtitle="S_base and TIS_current, bucket-averaged."
-        >
-          <ScoreAveragesPanel window={window} />
-        </PanelShell>
+          <PanelShell
+            title="Decisions by policy / pack"
+            subtitle="Decision counts grouped by active policy profile or composed pack. Reveals which policy profiles are governing the most activity and which are most restrictive. A pack with high Hold or Stop counts may be seeing riskier inputs, stricter controls, or possible over-tuning."
+          >
+            <DecisionsByPolicyPanel window={window} />
+          </PanelShell>
+        </div>
+      </section>
 
-        <PanelShell
-          title="Non-allow trends"
-          subtitle="Hold, Escalate, and Stop counts per bucket."
-        >
-          <NonAllowTrendsPanel window={window} />
-        </PanelShell>
+      {/* ── B. Trust Quality ────────────────────────────────────────────── */}
+      <section>
+        <SectionHeader
+          letter="B"
+          title="Trust Quality"
+          description="Underlying scoring strength and which BACK gates most often block delivery."
+        />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <PanelShell
+            title="Score averages over time"
+            subtitle="Bucket-averaged S_base and TIS_current. Indicates the trust quality of governed outputs over time. Drops may suggest weaker evidence quality, attribution problems, calibration issues, policy changes, or upstream workflow changes."
+          >
+            <ScoreAveragesPanel window={window} />
+          </PanelShell>
 
-        <PanelShell
-          title="Failed BACK dimensions"
-          subtitle="Per-dimension gate failure counts. not_applicable rows are not counted."
-        >
-          <FailedBackPanel window={window} />
-        </PanelShell>
+          <PanelShell
+            title="Top failed BACK dimensions"
+            subtitle="Per-dimension count of failed governance gates across Boundedness, Attribution, Compliance, and Known. Shows which governance dimension most often blocks or delays delivery. A dominant dimension, such as Attribution, usually points to provenance or source-quality problems upstream."
+          >
+            <FailedBackPanel window={window} />
+          </PanelShell>
+        </div>
+      </section>
 
-        <PanelShell
-          title="Decisions by policy / pack"
-          subtitle="Decision distribution per active policy set."
-        >
-          <DecisionsByPolicyPanel window={window} />
-        </PanelShell>
+      {/* ── C. Policy & Rule Behavior ──────────────────────────────────── */}
+      <section>
+        <SectionHeader
+          letter="C"
+          title="Policy & Rule Behavior"
+          description="Which deterministic rules and intervention paths are doing the work."
+        />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <PanelShell
+            title="Top triggered governance rules"
+            subtitle="Most-fired term-group and typed-context governance rules, including their common decisions and policy profiles. Shows which deterministic controls are doing the most work. Unexpected rule frequency may indicate risky inputs, mis-scoped rules, or a policy profile that needs review."
+          >
+            <TopRulesPanel window={window} />
+          </PanelShell>
 
-        <PanelShell
-          title="Override rate by policy"
-          subtitle="Of decisions made in this window, the share that were overridden."
-        >
-          <OverrideRatePanel window={window} />
-        </PanelShell>
+          <PanelShell
+            title="Non-allow trends"
+            subtitle="Time-bucketed counts of Hold, Escalate, and Stop decisions. Shows intervention pressure over time. Sustained increases may indicate riskier prompts, stricter policies, degraded evidence, or upstream workflow changes."
+          >
+            <NonAllowTrendsPanel window={window} />
+          </PanelShell>
+        </div>
+      </section>
 
-        <PanelShell
-          title="Top triggered governance rules"
-          subtitle="Most-fired rules with the decision and policy each is most associated with."
-        >
-          <TopRulesPanel window={window} />
-        </PanelShell>
+      {/* ── D. Human Review & Overrides ────────────────────────────────── */}
+      <section>
+        <SectionHeader
+          letter="D"
+          title="Human Review & Overrides"
+          description="Where human reviewers stepped in and what they decided."
+        />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <PanelShell
+            title="Override rate by policy"
+            subtitle="Share of governed decisions that were overridden by human reviewers, grouped by policy profile. High override rates may indicate human disagreement with policy behavior, approved exception patterns, or profiles that need calibration. Review repeated overrides by the same role, policy, or decision type."
+          >
+            <OverrideRatePanel window={window} />
+          </PanelShell>
 
-        <PanelShell
-          title="Recent override activity"
-          subtitle="Latest override events. Original TC is preserved; this is additive audit."
-        >
-          <OverrideActivityPanel window={window} />
-        </PanelShell>
-      </div>
+          <PanelShell
+            title="Recent override activity"
+            subtitle="Latest override events, newest first. Shows the audit trail of human intervention on held, escalated, or stopped decisions. Watch for repeated overrides involving the same actor, policy profile, or original decision."
+          >
+            <OverrideActivityPanel window={window} />
+          </PanelShell>
+        </div>
+      </section>
     </div>
   );
 }
