@@ -1,17 +1,56 @@
 import { useState, useEffect } from 'react';
 import { usePolling, apiFetch, apiPost } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
+import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
 
 function TCDetailPanel({ certificateId, onClose }) {
   const [tcData, setTcData] = useState(null);
   const [loadingTc, setLoadingTc] = useState(true);
+  // Phase 5 artifact linked to this TC (when present). For TCs issued
+  // via the artifact tier, tc.subject_id == artifact.artifact_id. For
+  // older legacy TCs, the artifact endpoint will 404 and we render a
+  // "Prompt not available" placeholder.
+  const [artifact, setArtifact] = useState(null);
+  // Override events for the TC, from the existing
+  // /v2/govern/decisions/{tc_id}/override-history endpoint. Drives the
+  // "Human override" block inside PlainLanguageExplanation.
+  const [overrides, setOverrides] = useState([]);
+  // Collapsible technical 11-layer section. Default closed so the
+  // casual reader sees only the prompt + plain-language summary.
+  const [technicalOpen, setTechnicalOpen] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     setLoadingTc(true);
-    apiFetch(`/certificates/${certificateId}`)
-      .then(setTcData)
-      .catch(() => setTcData(null))
-      .finally(() => setLoadingTc(false));
+    setArtifact(null);
+    setOverrides([]);
+    setTechnicalOpen(false);
+    (async () => {
+      try {
+        const tc = await apiFetch(`/certificates/${certificateId}`);
+        if (cancelled) return;
+        setTcData(tc);
+        if (tc?.subject_id) {
+          try {
+            const art = await apiFetch(`/artifacts/${tc.subject_id}`);
+            if (!cancelled) setArtifact(art);
+          } catch {
+            if (!cancelled) setArtifact(null);
+          }
+        }
+        try {
+          const hist = await apiFetch(`/govern/decisions/${certificateId}/override-history`);
+          if (!cancelled) setOverrides(hist?.events || []);
+        } catch {
+          if (!cancelled) setOverrides([]);
+        }
+      } catch {
+        if (!cancelled) setTcData(null);
+      } finally {
+        if (!cancelled) setLoadingTc(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, [certificateId]);
 
   if (loadingTc || !tcData) return <div className="text-gray-500 p-4">Loading TC...</div>;
@@ -33,31 +72,88 @@ function TCDetailPanel({ certificateId, onClose }) {
   return (
     <div className="fixed inset-y-0 right-0 w-full max-w-lg bg-gray-900 border-l border-gray-800 overflow-y-auto z-50 shadow-2xl">
       <div className="sticky top-0 bg-gray-900 border-b border-gray-800 p-4 flex justify-between items-center">
-        <h3 className="text-lg font-semibold text-white">Trust Certificate Detail</h3>
+        <div className="flex items-center gap-2">
+          <StatusBadge decision={tcData.decision} />
+          <h3 className="text-lg font-semibold text-white">Decision Summary</h3>
+        </div>
         <button onClick={onClose} className="text-gray-400 hover:text-white text-xl">&times;</button>
       </div>
       <div className="p-4 space-y-4">
-        {sections.map(({ title, fields, data }) => (
-          <div key={title} className="border border-gray-800 rounded-lg p-3">
-            <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider mb-2">{title}</h4>
-            {fields ? (
-              <dl className="space-y-1">
-                {fields.map((f) => (
-                  <div key={f} className="flex justify-between text-sm">
-                    <dt className="text-gray-500">{f}</dt>
-                    <dd className="text-gray-300 font-mono text-xs max-w-[60%] text-right truncate">
-                      {JSON.stringify(tcData[f]) ?? 'null'}
-                    </dd>
-                  </div>
-                ))}
-              </dl>
-            ) : data ? (
-              <pre className="text-xs text-gray-400 font-mono overflow-x-auto">
-                {JSON.stringify(data, null, 2)}
-              </pre>
-            ) : null}
+
+        {/* ── ① What was asked ─────────────────────────────────────── */}
+        <div className="bg-gray-900 border border-gray-700 rounded-lg p-3">
+          <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1.5">
+            What was asked
           </div>
-        ))}
+          {artifact?.prompt ? (
+            <blockquote className="text-sm text-gray-200 italic border-l-2 border-gray-700 pl-3 whitespace-pre-wrap leading-relaxed">
+              “{artifact.prompt}”
+            </blockquote>
+          ) : artifact?.raw_output && artifact?.generation_mode === 'human_composed' ? (
+            <div>
+              <div className="text-[10px] text-gray-500 mb-1">Human-composed draft (no prompt)</div>
+              <blockquote className="text-sm text-gray-200 italic border-l-2 border-gray-700 pl-3 whitespace-pre-wrap leading-relaxed">
+                “{artifact.raw_output}”
+              </blockquote>
+            </div>
+          ) : (
+            <p className="text-xs text-gray-500 italic">
+              Prompt not available — this certificate predates the
+              artifact tier or was issued through a non-artifact path.
+            </p>
+          )}
+        </div>
+
+        {/* ── ② Plain-language summary (with override block if any) ── */}
+        <PlainLanguageExplanation tc={tcData} overrides={overrides} />
+
+        {/* ── ③ Collapsible technical sections ─────────────────────── */}
+        <div className="border border-gray-800 rounded-lg">
+          <button
+            onClick={() => setTechnicalOpen((v) => !v)}
+            className="w-full flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-blue-400 hover:bg-gray-800/60 transition-colors"
+            aria-expanded={technicalOpen}
+          >
+            <span>Technical Detail (all 11 layers)</span>
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 20 20"
+              fill="currentColor"
+              className={`w-3 h-3 transition-transform ${technicalOpen ? '' : '-rotate-90'}`}
+            >
+              <path
+                fillRule="evenodd"
+                d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"
+                clipRule="evenodd"
+              />
+            </svg>
+          </button>
+          {technicalOpen && (
+            <div className="space-y-3 p-3 border-t border-gray-800">
+              {sections.map(({ title, fields, data }) => (
+                <div key={title} className="border border-gray-800 rounded p-2">
+                  <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider mb-2">{title}</h4>
+                  {fields ? (
+                    <dl className="space-y-1">
+                      {fields.map((f) => (
+                        <div key={f} className="flex justify-between text-sm">
+                          <dt className="text-gray-500">{f}</dt>
+                          <dd className="text-gray-300 font-mono text-xs max-w-[60%] text-right truncate">
+                            {JSON.stringify(tcData[f]) ?? 'null'}
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+                  ) : data ? (
+                    <pre className="text-xs text-gray-400 font-mono overflow-x-auto">
+                      {JSON.stringify(data, null, 2)}
+                    </pre>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

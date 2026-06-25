@@ -207,14 +207,29 @@ function failedGatePhrase({ dim, score, threshold }) {
   return `the ${name} (${dim}) gate failed`;
 }
 
+// Format an override event timestamp for display. Same compact form used
+// elsewhere in the UI ("MM/DD HH:MM").
+function shortOverrideTime(iso) {
+  if (!iso) return '';
+  const datePart = iso.slice(5, 10).replace('-', '/');
+  const timePart = iso.slice(11, 16);
+  return `${datePart} ${timePart}`;
+}
+
 // Top-level renderer. Returns a self-contained block that the caller
 // drops into its layout.
 //
 // Props:
-//   tc       — the TC or evaluation-like record to summarize.
-//   compact  — when true, render in a smaller footprint suitable for
-//              inline use under a row (Replay view). Default false.
-export default function PlainLanguageExplanation({ tc, compact = false }) {
+//   tc         — the TC or evaluation-like record to summarize.
+//   overrides  — optional array of override events from
+//                /v2/govern/decisions/{tc_id}/override-history. Each
+//                entry: { override_decision, override_actor,
+//                override_at, override_reason_text }. When present and
+//                non-empty, a "Human override" block is appended to the
+//                summary listing every event newest-first.
+//   compact    — when true, render in a smaller footprint suitable for
+//                inline use under a row (Replay view). Default false.
+export default function PlainLanguageExplanation({ tc, overrides, compact = false }) {
   if (!tc) return null;
 
   const decision = tc.decision || 'Unknown';
@@ -331,6 +346,13 @@ export default function PlainLanguageExplanation({ tc, compact = false }) {
     ? 'bg-gray-900/60 border border-gray-800 rounded'
     : 'bg-gray-900 border border-gray-700 rounded-lg';
 
+  // ---- Override section (if any) --------------------------------------- //
+  // Listed newest-first so the most recent decision-effecting event sits
+  // at the top. Each line: actor + when + decision + reason. The block
+  // is rendered as its own outlined sub-card so it visually separates
+  // from the original decision narrative.
+  const overrideList = Array.isArray(overrides) ? overrides.filter(Boolean) : [];
+
   return (
     <div className={`${blockClass} ${containerPad}`}>
       <div className={`${headerSize} uppercase tracking-wide text-gray-500 mb-1.5`}>
@@ -346,6 +368,47 @@ export default function PlainLanguageExplanation({ tc, compact = false }) {
         <p className={`${textSize} text-gray-400 leading-relaxed mt-1.5 italic`}>
           {sentenceNext}
         </p>
+      )}
+
+      {overrideList.length > 0 && (
+        <div className={`mt-3 border border-blue-800/60 bg-blue-900/15 rounded ${compact ? 'p-2' : 'p-3'}`}>
+          <div className={`${headerSize} uppercase tracking-wide text-blue-300 mb-1.5`}>
+            {overrideList.length === 1
+              ? 'Human override applied'
+              : `Human override history (${overrideList.length})`}
+          </div>
+          <div className="space-y-2">
+            {overrideList.map((ev, i) => {
+              const ovrTone = DECISION_TONE[ev.override_decision] || 'text-gray-200';
+              return (
+                <div key={`${ev.override_at || 'ovr'}-${i}`} className="border-l-2 border-blue-700 pl-2">
+                  <p className={`${textSize} text-gray-200 leading-relaxed`}>
+                    A reviewer changed this decision to{' '}
+                    <span className={`font-semibold ${ovrTone}`}>
+                      {ev.override_decision || 'an override decision'}
+                    </span>
+                    {ev.override_actor
+                      ? <> — actor <span className="font-mono">{ev.override_actor}</span></>
+                      : null}
+                    {ev.override_at
+                      ? <> at <span className="font-mono">{shortOverrideTime(ev.override_at)}</span></>
+                      : null}
+                    .
+                  </p>
+                  {ev.override_reason_text && (
+                    <p className={`${textSize} text-gray-300 leading-relaxed mt-0.5`}>
+                      Reason: <span className="italic">{ev.override_reason_text}</span>
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <p className={`${headerSize} text-gray-500 italic mt-2`}>
+            The original Trust Certificate is preserved (append-only).
+            Overrides are recorded as additive lifecycle events.
+          </p>
+        </div>
       )}
     </div>
   );

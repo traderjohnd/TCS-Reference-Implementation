@@ -275,6 +275,10 @@ export default function AuditCertificates() {
   // TCs that pre-date the artifact tier. Used to surface the original
   // prompt above the plain-language summary.
   const [tcArtifact, setTcArtifact] = useState(null);
+  // Override events for the selected TC, pulled from
+  // /v2/govern/decisions/{tc_id}/override-history. Drives the
+  // "Human override" section inside PlainLanguageExplanation.
+  const [tcOverrides, setTcOverrides] = useState([]);
   // Collapsible technical 11-layer dump. Default closed so casual readers
   // see only the prompt + plain-language summary; auditors expand.
   const [technicalOpen, setTechnicalOpen] = useState(false);
@@ -308,9 +312,19 @@ export default function AuditCertificates() {
           setTcArtifact(null);
         }
       }
+      // Override history: existing endpoint returns 200 with count=0
+      // when the TC has no overrides (or is unknown), so no try/catch
+      // needed for the empty case.
+      try {
+        const hist = await apiFetch(`/govern/decisions/${id}/override-history`);
+        setTcOverrides(hist?.events || []);
+      } catch {
+        setTcOverrides([]);
+      }
     } catch {
       setTcDetail(null);
       setTcArtifact(null);
+      setTcOverrides([]);
     }
   };
 
@@ -540,7 +554,7 @@ export default function AuditCertificates() {
                   <StatusBadge decision={tcDetail.decision} />
                   <h3 className="text-sm font-medium text-white">Decision Summary</h3>
                 </div>
-                <button onClick={() => { setSelectedTc(null); setTcDetail(null); setTcArtifact(null); }}
+                <button onClick={() => { setSelectedTc(null); setTcDetail(null); setTcArtifact(null); setTcOverrides([]); }}
                   className="text-gray-400 hover:text-white">&times;</button>
               </div>
               <div className="space-y-3 max-h-[75vh] overflow-y-auto">
@@ -569,7 +583,7 @@ export default function AuditCertificates() {
                 </div>
 
                 {/* ── ② Plain-language summary ─────────────────────────── */}
-                <PlainLanguageExplanation tc={tcDetail} />
+                <PlainLanguageExplanation tc={tcDetail} overrides={tcOverrides} />
 
                 {/* ── ③ Collapsible technical detail ───────────────────── */}
                 <div className="border border-gray-800 rounded">
