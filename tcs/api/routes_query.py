@@ -27,6 +27,32 @@ router = APIRouter()
 
 
 # --------------------------------------------------------------------------- #
+# Off-topic guard                                                              #
+# --------------------------------------------------------------------------- #
+#
+# A query is "off-topic" for the active pack when the top-K retrieval from
+# the active corpus produces no chunk above ``OFF_TOPIC_SIMILARITY_THRESHOLD``.
+# When that happens the route short-circuits BEFORE the LLM is invoked:
+#
+#   - builds a Hold TC with blocking_reason="query_off_topic_to_active_pack:..."
+#   - persists ResponseArtifact + GovernanceEvaluation as usual
+#   - returns the QueryResponse with no raw_output (the LLM was not called)
+#
+# This avoids the visually-confusing case where asking an off-topic question
+# under the MedDev pack (say "what is Paris at night like") returns clinical
+# chunks with weak similarity, an LLM hallucination, and a K-borderline Hold.
+# The guard surfaces the situation explicitly and saves the LLM call.
+#
+# The threshold is conservative by default — embeddings vary in scale across
+# corpora. Override with the env var if your demo corpus has loose
+# similarity scoring:
+#     $env:TCS_OFF_TOPIC_SIMILARITY_THRESHOLD = "0.65"
+OFF_TOPIC_SIMILARITY_THRESHOLD: float = float(
+    os.environ.get("TCS_OFF_TOPIC_SIMILARITY_THRESHOLD", "0.50")
+)
+
+
+# --------------------------------------------------------------------------- #
 # Request / Response models                                                    #
 # --------------------------------------------------------------------------- #
 
@@ -435,6 +461,240 @@ def _persist_query_artifact_and_evaluation(
     artifact_store.insert_evaluation(evaluation)
 
 
+def _build_off_topic_query_response(
+    *,
+    body: "QueryRequest",
+    store,
+    artifact_store,
+    provider_name: str,
+    model_name: str,
+    industry: Optional[str],
+    composer_metadata: Optional[Dict[str, Any]],
+    preview_chunks: List[Dict[str, Any]],
+    max_similarity: float,
+    threshold: float,
+    latency: Dict[str, float],
+) -> "QueryResponse":
+    """
+    Short-circuit return for queries the active corpus cannot answer.
+
+    Detected by the off-topic guard at the top of ``_run_query_via_trace``
+    when ``max_similarity_across_top_K < OFF_TOPIC_SIMILARITY_THRESHOLD``.
+
+    Constructs a Hold TC with:
+      - ``decision = "Hold"`` (off-topic should pause for human inspection,
+        not silently allow or hard-stop)
+      - ``blocking_reason = "query_off_topic_to_active_pack:..."`` —
+        the frontend's PlainLanguageExplanation paraphrases this
+        marker into reviewer-friendly prose.
+      - A is pinned low (no relevant attribution available); other
+        dimensions left neutral. This is internally consistent with
+        the BACK math (Attribution measures source backing; an
+        off-topic retrieval has none).
+
+    Persists a ResponseArtifact + GovernanceEvaluation in the same
+    shape as the normal /v2/query path so the Audit / Reporting
+    surfaces show the request and the decision uniformly. The
+    artifact carries ``raw_output = None`` and
+    ``generation_error = "off_topic_guard:no_llm_call"`` so an
+    auditor can tell at a glance that the LLM was not invoked.
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone
+    from tcs.artifacts.evaluation import (
+        _snapshot_profile,
+        snapshot_tis_input,
+    )
+    from tcs.artifacts.models import (
+        EVALUATION_MODE_ENFORCE,
+        EVALUATION_ORIGIN_QUERY,
+        EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+        GENERATION_MODE_AGENT_WORKFLOW,
+        GovernanceEvaluation,
+        ResponseArtifact,
+    )
+    from tcs.decision_engine import map_decision
+    from tcs.policy_profiles import load_profile
+    from tcs.tis_engine import TISInput, compute_tis
+    from tcs.trust_certificate import generate_certificate
+
+    # Resolve the profile the same way the normal path does. Caller's
+    # explicit body.profile_id wins; otherwise the active pack; otherwise
+    # the documented baseline. Default to the financial demo profile if
+    # none of those resolve — matches the rest of routes_query.
+    profile_id = body.profile_id
+    if not profile_id:
+        try:
+            from tcs.packs.pack_manager import get_active_pack
+            active = get_active_pack() or {}
+            profile_id = (active.get("profile_config") or {}).get("profile_id")
+        except Exception:  # noqa: BLE001
+            profile_id = None
+    if not profile_id:
+        profile_id = "fin-r3-a4-ct4"
+    profile = load_profile(profile_id)
+
+    blocking_reason = (
+        f"query_off_topic_to_active_pack:"
+        f"max_similarity={max_similarity:.4f}"
+        f"_threshold={threshold:.2f}"
+    )
+
+    inp = TISInput(
+        subject_id=str(_uuid.uuid4()),
+        subject_type="off_topic_query",
+        policy_profile=profile,
+        # A reflects source-attribution quality. With no sufficiently-
+        # relevant sources in the active corpus, A is effectively zero
+        # — pin it low so the engine surfaces this as an attribution
+        # problem rather than a calibration borderline.
+        dimension_scores={"B": 1.00, "A": 0.10, "C": 1.00, "K": 0.80},
+        sub_factor_scores={"C": {"C3": 1.0}},
+        context_metadata={
+            "off_topic_query": True,
+            "off_topic_max_similarity": round(max_similarity, 4),
+            "off_topic_threshold": float(threshold),
+            "active_policy_profile_id": profile_id,
+            "n_gaps": 0,
+            "context_age_hours": 0.1,
+            "novelty_score": 0.0,
+            "days_since_review": 1,
+            "is_policy_sensitive": False,
+        },
+        elapsed_hours=0.0,
+        is_valid=1,
+        invalidation_event=None,
+        evaluation_time=datetime.now(timezone.utc).replace(microsecond=0),
+    )
+    if composer_metadata:
+        inp.context_metadata["composer_metadata"] = dict(composer_metadata)
+
+    result = compute_tis(inp)
+    decision, requires = map_decision(inp, result)
+    # Force HOLD framing — off-topic should clearly pause for review,
+    # not silently allow or hard-stop. The TC's blocking_reason carries
+    # the off-topic marker the frontend renders against.
+    if decision != "Hold":
+        decision = "Hold"
+        requires = True
+
+    tc = generate_certificate(inp, result, decision, requires)
+    # Replace the engine-derived blocking_reason with the off-topic
+    # marker so the frontend can recognize the case and produce
+    # reviewer-friendly prose. TC dataclass is not frozen; this is
+    # the same pattern other helpers use to override post-generation
+    # fields (see tcs/artifacts/evaluation.py).
+    object.__setattr__(tc, "blocking_reason", blocking_reason)
+
+    issued_tc = store.issue(tc)
+
+    # Persist the artifact + evaluation if the app has the store
+    # wired (test paths may construct a bare app without one).
+    if artifact_store is not None:
+        retrieved_sources = [
+            {
+                "chunk_id":         c.get("chunk_id"),
+                "source_doc":       c.get("source_doc"),
+                "version":          c.get("version"),
+                "similarity_score": c.get("similarity_score"),
+            }
+            for c in preview_chunks if isinstance(c, dict)
+        ]
+        artifact = ResponseArtifact(
+            artifact_id=issued_tc.subject_id,
+            generation_mode=GENERATION_MODE_AGENT_WORKFLOW,
+            prompt=body.query,
+            raw_output=None,
+            provider=provider_name,
+            model=model_name,
+            system_prompt_used=None,
+            rag_enabled=True,
+            rag_context=None,
+            retrieved_sources=retrieved_sources,
+            workflow_trace_id=None,
+            workflow_trace=None,
+            recipient_context=(
+                {"industry_hint": industry} if industry else {}
+            ),
+            generation_identity={
+                "requesting_identity": "query_endpoint",
+                "identity_type": "system",
+                "role": "off_topic_guard",
+            },
+            generation_error="off_topic_guard:no_llm_call",
+        )
+        artifact_store.insert_artifact(artifact)
+
+        snapshot = _snapshot_profile(profile)
+        runtime_snapshot = snapshot_tis_input(inp)
+        evaluation = GovernanceEvaluation(
+            artifact_id=artifact.artifact_id,
+            mode=EVALUATION_MODE_ENFORCE,
+            policy_profile_id=profile.profile_id,
+            policy_profile_snapshot=snapshot,
+            selected_standards=list(
+                (composer_metadata or {}).get("standards") or []
+            ),
+            enabled_controls=[],
+            rule_matches=None,
+            component_scores={
+                k: round(v, 4) for k, v in inp.dimension_scores.items()
+            },
+            gate_results=dict(result.gate_results_by_dim),
+            s_base=round(result.s_base, 4),
+            s_adjusted=round(result.s_adj, 4),
+            tis_current=round(result.tis_current, 4),
+            decision=decision,
+            trust_certificate_id=issued_tc.certificate_id,
+            evaluator_identity={
+                "requesting_identity": "query_endpoint",
+                "identity_type": "system",
+                "role": "off_topic_guard",
+            },
+            evaluation_completeness_score=1.0,
+            evaluation_origin=EVALUATION_ORIGIN_QUERY,
+            evaluation_strategy=EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+            governance_input_snapshot=runtime_snapshot,
+        )
+        artifact_store.insert_evaluation(evaluation)
+
+    latency["total_ms"] = latency.get("preview_ms", 0.0)
+    return QueryResponse(
+        query=body.query,
+        response=None,
+        blocked=True,
+        decision=decision,
+        certificate_id=issued_tc.certificate_id,
+        tis_current=issued_tc.tis_current,
+        tis_raw=issued_tc.tis_raw,
+        s_base=issued_tc.s_base,
+        gate_passed=issued_tc.gate_passed,
+        blocking_reason=blocking_reason,
+        requires_human_review=True,
+        retrieval_chunks=[
+            {
+                "chunk_id":         c.get("chunk_id"),
+                "source_doc":       c.get("source_doc"),
+                "version":          c.get("version"),
+                "content":          c.get("content"),
+                "similarity_score": c.get("similarity_score"),
+                "tags":             c.get("tags", []),
+            }
+            for c in preview_chunks if isinstance(c, dict)
+        ],
+        latency_ms=latency,
+        llm_provider=provider_name,
+        llm_model=model_name,
+        component_scores=dict(issued_tc.component_scores),
+        component_weights=dict(issued_tc.component_weights),
+        gate_results=dict(issued_tc.gate_results),
+        thresholds=dict(issued_tc.thresholds),
+        workflow_trace=None,
+        policy_profile_id=issued_tc.policy_set_id,
+        connection_type="CT-4",
+    )
+
+
 def _run_query_via_trace(
     body: "QueryRequest",
     store,
@@ -476,6 +736,41 @@ def _run_query_via_trace(
     latency: Dict[str, float] = {}
 
     vector_store = _get_vector_store(industry)
+
+    # ── Off-topic guard ────────────────────────────────────────────── #
+    # Quick standalone retrieval check against the active corpus.
+    # If no chunk in the top-K exceeds OFF_TOPIC_SIMILARITY_THRESHOLD,
+    # the query is treated as outside the active pack's scope: build
+    # a Hold TC explicitly and return without invoking the LLM.
+    try:
+        preview_chunks = vector_store.retrieve(body.query, k=5) or []
+    except Exception:  # noqa: BLE001 — preview is best-effort
+        preview_chunks = []
+    max_sim = max(
+        (
+            float(c.get("similarity_score") or 0.0)
+            for c in preview_chunks
+            if isinstance(c, dict)
+        ),
+        default=0.0,
+    )
+    if preview_chunks and max_sim < OFF_TOPIC_SIMILARITY_THRESHOLD:
+        latency["preview_ms"] = round(
+            (time.perf_counter() - t_total) * 1000, 1
+        )
+        return _build_off_topic_query_response(
+            body=body,
+            store=store,
+            artifact_store=artifact_store,
+            provider_name=provider_name,
+            model_name=model_name,
+            industry=industry,
+            composer_metadata=composer_metadata,
+            preview_chunks=preview_chunks,
+            max_similarity=max_sim,
+            threshold=OFF_TOPIC_SIMILARITY_THRESHOLD,
+            latency=latency,
+        )
 
     rag_connector = RAGConnector(store=vector_store, retrieval_k=5)
     llm_connector = LLMConnector(

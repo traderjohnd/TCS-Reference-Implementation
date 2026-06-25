@@ -128,7 +128,8 @@ function failedGateDetails(tc) {
 }
 
 // Paraphrase a structured ``blocking_reason`` into plain prose. Used
-// almost exclusively for the Stop decision narrative.
+// for Stop and Hold narratives where the engine emitted a marker
+// string the UI should translate.
 function paraphraseBlockingReason(raw) {
   if (!raw) return null;
   const lower = String(raw).toLowerCase();
@@ -140,8 +141,27 @@ function paraphraseBlockingReason(raw) {
     return 'the request matches a prohibited-action pattern under the active policy';
   if (lower.includes('context_expansion'))
     return 'new context arrived after the answer was evaluated, invalidating the original decision';
+  if (lower.startsWith('query_off_topic_to_active_pack'))
+    return "the question doesn't relate to the content the active policy pack governs — the system couldn't find sufficiently relevant sources in the active corpus to ground an answer, so the LLM was not invoked";
   // Generic cleanup as a last resort.
   return null;
+}
+
+// Detect the structured off-topic marker so we can short-circuit the
+// usual gate-failure narrative and lead with "this is out of scope"
+// framing instead. Returns null when the TC isn't off-topic.
+function offTopicInfo(tc) {
+  const raw = tc?.blocking_reason;
+  if (typeof raw !== 'string') return null;
+  if (!raw.startsWith('query_off_topic_to_active_pack')) return null;
+  // marker shape:
+  //   query_off_topic_to_active_pack:max_similarity=0.1234_threshold=0.50
+  const simMatch = raw.match(/max_similarity=([0-9.]+)/);
+  const thrMatch = raw.match(/threshold=([0-9.]+)/);
+  return {
+    maxSimilarity: simMatch ? parseFloat(simMatch[1]) : null,
+    threshold:     thrMatch ? parseFloat(thrMatch[1]) : null,
+  };
 }
 
 // Look for a rule-supplied human explanation. Typed-context and
@@ -186,6 +206,7 @@ export default function PlainLanguageExplanation({
   const ruleSays = ruleExplanation(tc);
   const sBase = typeof tc.s_base === 'number' ? tc.s_base : null;
   const kappa = tc.policy_profile_snapshot?.soft_hold_ceiling;
+  const offTopic = offTopicInfo(tc);
 
   // ---- Lead sentence: "what happened" + reference to the prompt --------- //
   // For Allow/Observe we frame positively ("This {topic} was delivered.").
@@ -206,6 +227,18 @@ export default function PlainLanguageExplanation({
     leadJsx = (
       <>
         This {profile.topic} was {verbSpan('delivered with monitoring')}. The decision was recorded as evidence; no human intervention applied.
+      </>
+    );
+  } else if (decision === 'Hold' && offTopic) {
+    leadJsx = promptRef ? (
+      <>
+        The question{' '}
+        “<span className="italic">{promptRef}</span>”{' '}
+        is {verbSpan('out of scope')} for the active policy pack. The system held the request before invoking the LLM.
+      </>
+    ) : (
+      <>
+        This request is {verbSpan('out of scope')} for the active policy pack. The system held it before invoking the LLM.
       </>
     );
   } else if (decision === 'Hold') {
@@ -265,7 +298,28 @@ export default function PlainLanguageExplanation({
   let whyJsx = null;
   let supplementJsx = null;
 
-  if (ruleSays && (decision === 'Stop' || decision === 'Hold' || decision === 'Escalate')) {
+  if (offTopic && decision === 'Hold') {
+    // Off-topic gets its own narrative — leads with "out of scope"
+    // and explains the system did not call the LLM, instead of the
+    // generic A-gate-failure framing.
+    whyJsx = (
+      <>
+        The reason: the question doesn't relate to the content the active
+        policy pack governs. Retrieved sources from the active corpus were
+        weak matches, so the system held the request rather than invoking
+        the LLM on content it isn't prepared to ground.
+      </>
+    );
+    if (offTopic.maxSimilarity != null && offTopic.threshold != null) {
+      supplementJsx = (
+        <span className="text-gray-500">
+          {' '}(best retrieval match: similarity{' '}
+          {offTopic.maxSimilarity.toFixed(3)}; off-topic threshold{' '}
+          {offTopic.threshold.toFixed(2)})
+        </span>
+      );
+    }
+  } else if (ruleSays && (decision === 'Stop' || decision === 'Hold' || decision === 'Escalate')) {
     whyJsx = <>The reason: {ruleSays}</>;
   } else if (decision === 'Stop') {
     const paraphrased = paraphraseBlockingReason(tc.blocking_reason);
@@ -323,7 +377,9 @@ export default function PlainLanguageExplanation({
 
   // ---- Next-step sentence: domain-friendly action --------------------- //
   let nextJsx = null;
-  if (decision === 'Hold') {
+  if (offTopic && decision === 'Hold') {
+    nextJsx = <>Next step: switch to a policy pack whose corpus covers this topic, ask a question that fits the current pack, or let a {profile.reviewer} review and (where appropriate) approve the off-topic request via the Hold Queue.</>;
+  } else if (decision === 'Hold') {
     nextJsx = <>Next step: a {profile.reviewer} can release the response if it looks accurate, or escalate it if it needs revision. The action lives in the Hold Queue on the Live page.</>;
   } else if (decision === 'Escalate') {
     nextJsx = <>Next step: a senior {profile.reviewer} can approve, hold, or stop the response from the Escalation Queue on the Live page.</>;

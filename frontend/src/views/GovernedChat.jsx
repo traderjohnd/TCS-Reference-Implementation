@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { apiPost, useApi } from '../hooks/useApi';
 import { useConnections } from '../hooks/useConnections';
+import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
 
 // ─── Sample queries by active pack domain ──────────────────────────────────
 // Each list is curated to demonstrate the three governance outcomes (Allow
@@ -357,7 +358,7 @@ function GovernancePanel({ r, defaultOpen }) {
       </button>
       {open && (
         <div className="border-t border-gray-800 bg-gray-900/40 p-3 space-y-3">
-          <DecisionReason r={r} />
+          <PlainLanguageExplanation tc={r} prompt={r?.query} />
           <WorkflowTracePanel trace={r?.workflow_trace} />
           <BackScoresPanel r={r} />
           <ProvenancePanel r={r} />
