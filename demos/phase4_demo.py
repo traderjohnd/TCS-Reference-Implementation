@@ -83,7 +83,7 @@ DEMOS: List[Dict[str, Any]] = [
         # elevated 0.85 MedDev K threshold), while attribution stays
         # clean (every chunk has source_doc + version → S_base stays
         # above κ=0.90). Deterministic HOLD via Priority 4.
-        "query": "Pneumonia treatment guidelines for pediatric patients with respiratory failure and sepsis",
+        "query": "What are the pneumonia treatment guidelines for pediatric patients with respiratory failure and sepsis?",
         "expected_decision": "Hold",
     },
     {

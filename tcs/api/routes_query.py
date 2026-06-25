@@ -351,6 +351,15 @@ def _persist_query_artifact_and_evaluation(
     # field will populate. The artifact persists faithfully whatever
     # the scoring path actually saw.
     artifact = ResponseArtifact(
+        # Bind the artifact's id to the TC's subject_id so the existing
+        # frontend lookup ``GET /v2/artifacts/{tc.subject_id}`` resolves.
+        # This restores parity with the /v2/evaluate path, which already
+        # uses ``subject_id == artifact.artifact_id`` (see
+        # tcs/artifacts/evaluation.py::evaluate_artifact). Without this,
+        # /v2/query-issued TCs have no discoverable artifact handle from
+        # the TC alone, so the Audit / Live "What was asked" panel cannot
+        # surface the prompt.
+        artifact_id=issued_tc.subject_id,
         generation_mode=GENERATION_MODE_AGENT_WORKFLOW,
         prompt=body.query,
         raw_output=trace.final_output,
