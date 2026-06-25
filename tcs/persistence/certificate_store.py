@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
@@ -100,6 +101,18 @@ class CertificateStore:
         else:
             self._conn = init_db(db_path)
             self._owns_conn = True
+        # Reentrant lock guards all access to ``self._conn``. The
+        # original Phase 2 docstring marked this class as thread-unsafe,
+        # but FastAPI's run_in_threadpool dispatches sync route handlers
+        # to a worker pool, and dashboard polling endpoints can hit the
+        # same store from multiple worker threads concurrently. Without
+        # this lock, sqlite3 raises InterfaceError ("bad parameter or
+        # other API misuse") or fetchone() returns None mid-cursor.
+        #
+        # RLock so methods that call other locked methods (e.g.
+        # all_chains_verify -> verify_chain -> list_chain) do not
+        # deadlock on the same thread.
+        self._lock: threading.RLock = threading.RLock()
 
     # ---- Context manager plumbing --------------------------------------- #
 
@@ -121,14 +134,29 @@ class CertificateStore:
         """
         Wrap a block in an explicit BEGIN/COMMIT. On any exception we
         ROLLBACK so a failed insert does not leave a half-committed TC.
+
+        Acquires ``self._lock`` for the duration so concurrent writers
+        do not collide on the shared SQLite connection.
         """
-        self._conn.execute("BEGIN")
-        try:
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    @contextmanager
+    def _read(self) -> Iterator[sqlite3.Connection]:
+        """
+        Acquire the connection lock for a read-only operation. Use
+        this for any code path that calls ``self._conn.execute(...)``
+        without a transaction (the failing metrics-endpoint paths
+        are all read-only).
+        """
+        with self._lock:
             yield self._conn
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
 
     # ---- Core: issue ---------------------------------------------------- #
 
@@ -221,11 +249,12 @@ class CertificateStore:
 
         Raises :class:`CertificateNotFoundError` if no row matches.
         """
-        row = self._conn.execute(
-            "SELECT content_json FROM trust_certificates "
-            "WHERE certificate_id = ?",
-            (certificate_id,),
-        ).fetchone()
+        with self._read():
+            row = self._conn.execute(
+                "SELECT content_json FROM trust_certificates "
+                "WHERE certificate_id = ?",
+                (certificate_id,),
+            ).fetchone()
         if row is None:
             raise CertificateNotFoundError(
                 f"No certificate with certificate_id={certificate_id!r}"
@@ -239,18 +268,25 @@ class CertificateStore:
         The returned list is empty if no TCs exist for the chain_id —
         verify_chain() will still return True for empty input (vacuous).
         """
-        rows = self._conn.execute(
-            "SELECT content_json FROM trust_certificates "
-            "WHERE chain_id = ? ORDER BY chain_sequence ASC",
-            (chain_id,),
-        ).fetchall()
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT content_json FROM trust_certificates "
+                "WHERE chain_id = ? ORDER BY chain_sequence ASC",
+                (chain_id,),
+            ).fetchall()
         return [_tc_from_json(r["content_json"]) for r in rows]
 
     def count(self) -> int:
         """Return total number of TCs in the archive."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM trust_certificates"
-        ).fetchone()
+        with self._read():
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM trust_certificates"
+            ).fetchone()
+        # Defensive: ``row`` is always non-None for COUNT(*), but a
+        # concurrent cursor disruption could in theory reset it.
+        # Return 0 in that case rather than raising.
+        if row is None:
+            return 0
         return int(row["n"])
 
     def list_recent(self, limit: int = 20) -> List[TrustCertificate]:
@@ -259,12 +295,13 @@ class CertificateStore:
         ordered by evaluation_timestamp DESC. Used by the dashboard
         feed to show live activity.
         """
-        rows = self._conn.execute(
-            "SELECT content_json FROM trust_certificates "
-            "ORDER BY evaluation_timestamp DESC, chain_sequence DESC "
-            "LIMIT ?",
-            (int(limit),),
-        ).fetchall()
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT content_json FROM trust_certificates "
+                "ORDER BY evaluation_timestamp DESC, chain_sequence DESC "
+                "LIMIT ?",
+                (int(limit),),
+            ).fetchall()
         return [_tc_from_json(r["content_json"]) for r in rows]
 
     # ---- Windowed queries (Phase 3 dynamics) ------------------------------ #
@@ -371,10 +408,11 @@ class CertificateStore:
 
     def list_chain_ids(self) -> List[str]:
         """Return every distinct chain_id in the archive."""
-        rows = self._conn.execute(
-            "SELECT DISTINCT chain_id FROM trust_certificates "
-            "ORDER BY chain_id"
-        ).fetchall()
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT DISTINCT chain_id FROM trust_certificates "
+                "ORDER BY chain_id"
+            ).fetchall()
         return [str(r["chain_id"]) for r in rows]
 
     def decision_counts(self) -> Dict[str, int]:
@@ -382,10 +420,11 @@ class CertificateStore:
         Return a mapping of ``decision -> count`` across every TC in
         the archive. Keys follow the canonical decision vocabulary.
         """
-        rows = self._conn.execute(
-            "SELECT decision, COUNT(*) AS n FROM trust_certificates "
-            "GROUP BY decision"
-        ).fetchall()
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT decision, COUNT(*) AS n FROM trust_certificates "
+                "GROUP BY decision"
+            ).fetchall()
         return {str(r["decision"]): int(r["n"]) for r in rows}
 
     def tis_distribution(self) -> Dict[str, Any]:
@@ -406,9 +445,10 @@ class CertificateStore:
         same row counts in both if it is a hard stop. The fields are
         for dashboards, not for governance arithmetic.
         """
-        rows = self._conn.execute(
-            "SELECT tis_current, lifecycle_state FROM trust_certificates"
-        ).fetchall()
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT tis_current, lifecycle_state FROM trust_certificates"
+            ).fetchall()
         if not rows:
             return {
                 "count": 0,
@@ -464,17 +504,18 @@ class CertificateStore:
 
         Returns 0.0 if the archive is empty.
         """
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM trust_certificates"
-        ).fetchone()
-        total = int(row["n"])
-        if total == 0:
-            return 0.0
-        row_fail = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM trust_certificates "
-            "WHERE decision IN ('Stop', 'Hold', 'Escalate')"
-        ).fetchone()
-        return round(int(row_fail["n"]) / total, 4)
+        with self._read():
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM trust_certificates"
+            ).fetchone()
+            total = int(row["n"]) if row else 0
+            if total == 0:
+                return 0.0
+            row_fail = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM trust_certificates "
+                "WHERE decision IN ('Stop', 'Hold', 'Escalate')"
+            ).fetchone()
+        return round(int(row_fail["n"]) / total, 4) if row_fail else 0.0
 
     def governance_integrity_score(self) -> float:
         """
@@ -502,9 +543,10 @@ class CertificateStore:
         Return mean score for each dimension (B, A, C, U) across all
         TCs in the archive. Parsed from content_json.
         """
-        rows = self._conn.execute(
-            "SELECT content_json FROM trust_certificates"
-        ).fetchall()
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT content_json FROM trust_certificates"
+            ).fetchall()
         if not rows:
             return {"B": 0.0, "A": 0.0, "C": 0.0, "K": 0.0}
 
