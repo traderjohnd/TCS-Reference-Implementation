@@ -141,26 +141,37 @@ function paraphraseBlockingReason(raw) {
     return 'the request matches a prohibited-action pattern under the active policy';
   if (lower.includes('context_expansion'))
     return 'new context arrived after the answer was evaluated, invalidating the original decision';
+  if (lower.startsWith('routed_via_baseline_off_topic_for_pack'))
+    return "the question wasn't covered by the active policy pack's content, so the system routed it through the baseline governance profile and answered it under that profile's permissive thresholds";
   if (lower.startsWith('query_off_topic_to_active_pack'))
     return "the question doesn't relate to the content the active policy pack governs — the system couldn't find sufficiently relevant sources in the active corpus to ground an answer, so the LLM was not invoked";
   // Generic cleanup as a last resort.
   return null;
 }
 
-// Detect the structured off-topic marker so we can short-circuit the
-// usual gate-failure narrative and lead with "this is out of scope"
-// framing instead. Returns null when the TC isn't off-topic.
+// Detect scope-aware-routing markers in blocking_reason so the summary
+// can lead with "routed via baseline" framing instead of the generic
+// gate-failure narrative. Returns null when the TC isn't off-topic.
+//
+// Recognizes both the current marker (routed_via_baseline_off_topic_for_pack:...)
+// and the prior legacy marker (query_off_topic_to_active_pack:...).
 function offTopicInfo(tc) {
   const raw = tc?.blocking_reason;
   if (typeof raw !== 'string') return null;
-  if (!raw.startsWith('query_off_topic_to_active_pack')) return null;
-  // marker shape:
-  //   query_off_topic_to_active_pack:max_similarity=0.1234_threshold=0.50
+  const isRouted = raw.startsWith('routed_via_baseline_off_topic_for_pack');
+  const isLegacy = raw.startsWith('query_off_topic_to_active_pack');
+  if (!isRouted && !isLegacy) return null;
   const simMatch = raw.match(/max_similarity=([0-9.]+)/);
   const thrMatch = raw.match(/threshold=([0-9.]+)/);
+  // Original active pack id when present (routed marker only).
+  const packMatch = isRouted
+    ? raw.match(/for_pack:([^:]+):/)
+    : null;
   return {
-    maxSimilarity: simMatch ? parseFloat(simMatch[1]) : null,
-    threshold:     thrMatch ? parseFloat(thrMatch[1]) : null,
+    routedViaBaseline: isRouted,
+    maxSimilarity:     simMatch ? parseFloat(simMatch[1]) : null,
+    threshold:         thrMatch ? parseFloat(thrMatch[1]) : null,
+    originalPackId:    packMatch ? packMatch[1] : null,
   };
 }
 
@@ -216,7 +227,21 @@ export default function PlainLanguageExplanation({
   let leadJsx = null;
   const verbSpan = (txt) => <span className={`font-semibold ${tone}`}>{txt}</span>;
 
-  if (decision === 'Allow') {
+  if (decision === 'Allow' && offTopic?.routedViaBaseline) {
+    // Routed via baseline: the question was outside the active pack's
+    // scope, so it was answered under the baseline (permissive) profile.
+    leadJsx = promptRef ? (
+      <>
+        The question{' '}
+        “<span className="italic">{promptRef}</span>”{' '}
+        wasn't covered by the active policy pack — it was {verbSpan('routed through the baseline profile')} and answered there.
+      </>
+    ) : (
+      <>
+        This request wasn't covered by the active policy pack — it was {verbSpan('routed through the baseline profile')} and answered there.
+      </>
+    );
+  } else if (decision === 'Allow') {
     leadJsx = (
       <>
         This {profile.topic} was {verbSpan('answered and delivered')}.
@@ -298,10 +323,32 @@ export default function PlainLanguageExplanation({
   let whyJsx = null;
   let supplementJsx = null;
 
-  if (offTopic && decision === 'Hold') {
-    // Off-topic gets its own narrative — leads with "out of scope"
-    // and explains the system did not call the LLM, instead of the
-    // generic A-gate-failure framing.
+  if (offTopic?.routedViaBaseline && decision === 'Allow') {
+    // Routed-via-baseline Allow: explain the routing.
+    whyJsx = (
+      <>
+        The reason: the active policy pack governs a specific domain, and
+        this question wasn't covered by that domain's content. Rather than
+        applying the active pack's strict bar to a question it wasn't
+        designed for, the system routed the request through baseline
+        governance, which applies a permissive (general-purpose) policy.
+      </>
+    );
+    if (offTopic.maxSimilarity != null && offTopic.threshold != null) {
+      supplementJsx = (
+        <span className="text-gray-500">
+          {' '}(best retrieval match against the active corpus: similarity{' '}
+          {offTopic.maxSimilarity.toFixed(3)}; off-topic threshold{' '}
+          {offTopic.threshold.toFixed(2)}
+          {offTopic.originalPackId
+            ? <>; original active pack: <span className="font-mono">{offTopic.originalPackId}</span></>
+            : null})
+        </span>
+      );
+    }
+  } else if (offTopic && decision === 'Hold') {
+    // Legacy off-topic Hold path (pre-Option-B). Preserved so older
+    // TCs in the archive still render with appropriate language.
     whyJsx = (
       <>
         The reason: the question doesn't relate to the content the active
@@ -377,7 +424,9 @@ export default function PlainLanguageExplanation({
 
   // ---- Next-step sentence: domain-friendly action --------------------- //
   let nextJsx = null;
-  if (offTopic && decision === 'Hold') {
+  if (offTopic?.routedViaBaseline && decision === 'Allow') {
+    nextJsx = <>Next step: none. The answer was delivered under the baseline profile. To get the active pack's strict governance applied, ask a question within its domain.</>;
+  } else if (offTopic && decision === 'Hold') {
     nextJsx = <>Next step: switch to a policy pack whose corpus covers this topic, ask a question that fits the current pack, or let a {profile.reviewer} review and (where appropriate) approve the off-topic request via the Hold Queue.</>;
   } else if (decision === 'Hold') {
     nextJsx = <>Next step: a {profile.reviewer} can release the response if it looks accurate, or escalate it if it needs revision. The action lives in the Hold Queue on the Live page.</>;

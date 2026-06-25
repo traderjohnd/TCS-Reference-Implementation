@@ -2,18 +2,27 @@
 tests/test_off_topic_guard.py
 =============================
 
-Coverage for the /v2/query off-topic guard
-(tcs.api.routes_query.OFF_TOPIC_SIMILARITY_THRESHOLD).
+Coverage for /v2/query scope-aware routing (off-topic guard).
 
-The guard short-circuits before the LLM is called when the active
-corpus has no chunk above the configured similarity threshold. The
-test stubs the vector store so the retrieval returns a known low-
-similarity result and patches the LLM provider clients to raise — if
-the guard is broken (LLM ends up being invoked), these tests fail
-loudly with a provider-call exception.
+When the top-K retrieval from the active corpus produces no chunk
+above ``OFF_TOPIC_SIMILARITY_THRESHOLD``, the request is treated as
+out-of-scope for the active pack and routed through
+``baseline-no-pack`` instead:
 
-All tests are frontend-agnostic — they only exercise the backend
-behavior introduced by ``_build_off_topic_query_response``.
+  - The LLM is invoked normally (no RAG context — the active corpus
+    is irrelevant by definition).
+  - The response is scored against baseline-no-pack (permissive
+    thresholds, K not in gate set).
+  - A TC is issued under ``policy_set_id = "baseline-no-pack"`` with
+    ``blocking_reason`` containing the
+    ``routed_via_baseline_off_topic_for_pack:...`` marker the frontend
+    paraphrases.
+  - The LLM answer flows back to the caller (response field
+    populated, blocked = False for the typical Allow decision).
+
+These tests stub the vector store so the off-topic guard fires
+deterministically; the mock LLM provider returns its canned answer
+which is enough to drive the scoring through.
 """
 
 from __future__ import annotations
@@ -33,16 +42,12 @@ from tcs.persistence import CertificateStore
 # --------------------------------------------------------------------------- #
 
 class _LowSimVectorStore:
-    """
-    Minimal vector store stub. Returns a fixed set of low-similarity
-    chunks for any query — mimics an off-topic retrieval.
-    """
+    """Stub: returns three chunks all well below the default 0.50 threshold."""
 
     def __init__(self, max_similarity: float = 0.20):
         self._max_similarity = max_similarity
 
     def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        # Three chunks all well below the default 0.50 threshold.
         return [
             {
                 "chunk_id": f"low-{i}",
@@ -57,7 +62,7 @@ class _LowSimVectorStore:
 
 
 class _OnTopicVectorStore:
-    """High-similarity stub for the negative case (guard should NOT fire)."""
+    """Stub: returns one chunk above the default threshold (guard does NOT fire)."""
 
     def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         return [
@@ -74,7 +79,6 @@ class _OnTopicVectorStore:
 
 @pytest.fixture
 def app_with_store(tmp_path):
-    """Fresh in-memory CertificateStore + an empty ArtifactStore."""
     db_path = tmp_path / "off_topic_guard.db"
     store = CertificateStore(str(db_path))
     app = create_app(store=store)
@@ -93,27 +97,19 @@ def client(app_with_store):
 # --------------------------------------------------------------------------- #
 
 class TestOffTopicGuard:
-    def test_guard_fires_for_low_similarity_retrieval(self, client, monkeypatch):
+    def test_guard_routes_low_similarity_via_baseline(self, client, monkeypatch):
         """
-        Patch the vector store so retrieval returns low-similarity
-        chunks (max 0.20). The guard's default threshold is 0.50.
-        Expect: decision=Hold, blocking_reason starts with
-        ``query_off_topic_to_active_pack``, response body is empty,
-        and crucially the LLM provider was NOT invoked.
+        Stub the vector store to return low-similarity chunks
+        (max 0.20). Guard fires; request is routed through
+        baseline-no-pack; LLM is still called (mock provider returns
+        canned output); the response flows back to the caller as
+        Allow because baseline-no-pack's thresholds (K = 0.60 and
+        K not in gate set) are permissive enough.
         """
-        # Force the trace path so the off-topic guard's _run_query_via_trace
-        # is exercised. Without this flag, /v2/query uses the legacy
-        # GovernedRAGPipeline path which doesn't have the guard.
         monkeypatch.setenv("TCS_WORKFLOW_TRACE_ENABLED", "true")
 
         from tcs.api import routes_query
 
-        # Stub the vector store. We do NOT patch the LLM clients —
-        # the guard is enforced by the architectural ordering (guard
-        # runs BEFORE the orchestrator that owns the LLMConnector).
-        # If the guard fires, workflow_trace is None and certificate
-        # carries the off-topic blocking_reason; that's the signal
-        # the LLM was not invoked.
         with patch.object(
             routes_query, "_get_vector_store",
             return_value=_LowSimVectorStore(max_similarity=0.20),
@@ -126,34 +122,32 @@ class TestOffTopicGuard:
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["decision"] == "Hold"
-        assert body["blocked"] is True
-        assert body["response"] is None
-        assert body["blocking_reason"].startswith("query_off_topic_to_active_pack:")
-        assert "max_similarity=0.2000" in body["blocking_reason"]
-        assert "threshold=0.50" in body["blocking_reason"]
-        # The guard returned five retrieval chunks (the preview the
-        # similarity check ran against), all with similarity below 0.50.
-        assert isinstance(body["retrieval_chunks"], list)
-        assert body["retrieval_chunks"]  # non-empty
-        assert all(
-            float(c.get("similarity_score") or 0.0) < 0.50
-            for c in body["retrieval_chunks"]
+        # Routed via baseline — the policy_set_id on the issued TC
+        # must be the baseline profile, NOT the active pack.
+        assert body["policy_profile_id"] == "baseline-no-pack"
+        # Decision is Allow under baseline-no-pack's permissive thresholds.
+        assert body["decision"] == "Allow"
+        assert body["blocked"] is False
+        # Response is populated — the LLM was called and the answer
+        # flowed back through.
+        assert body["response"] is not None
+        # blocking_reason carries the routing marker so the frontend
+        # can render "routed via baseline" prose.
+        assert body["blocking_reason"].startswith(
+            "routed_via_baseline_off_topic_for_pack:"
         )
-        # A TC was issued.
-        assert body["certificate_id"]
-        # Workflow trace is None — the orchestrator did NOT run, which
-        # is the structural proof that the LLM connector was never
-        # invoked.
-        assert body.get("workflow_trace") is None
+        assert "max_similarity=0.2000" in body["blocking_reason"]
+        # No RAG chunks are surfaced to the UI (baseline routing
+        # skips RAG entirely; the active corpus was irrelevant).
+        assert body["retrieval_chunks"] == []
+        # workflow_trace is None — the orchestrator was bypassed.
+        assert body["workflow_trace"] is None
 
     def test_guard_does_not_fire_for_high_similarity(self, client, monkeypatch):
         """
-        Negative case: when retrieval returns high-similarity chunks,
-        the guard must NOT fire and the normal workflow runs. We
-        verify by asserting the response is NOT the off-topic shape:
-        no off-topic blocking_reason, response present, workflow_trace
-        non-null.
+        Negative case: high-similarity retrieval keeps the request on
+        the normal workflow path. policy_set_id reflects the active
+        pack (or fallback), not baseline-no-pack.
         """
         monkeypatch.setenv("TCS_WORKFLOW_TRACE_ENABLED", "true")
 
@@ -171,23 +165,20 @@ class TestOffTopicGuard:
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        # Not the off-topic shape — guard skipped.
+        # Did not get the off-topic routing marker.
         if body.get("blocking_reason"):
             assert not body["blocking_reason"].startswith(
-                "query_off_topic_to_active_pack:"
+                "routed_via_baseline_off_topic_for_pack:"
             )
-        # Workflow trace populated (normal path runs the orchestrator).
+        # Normal workflow ran (orchestrator populated the trace).
         assert body.get("workflow_trace") is not None
 
     def test_guard_threshold_env_override(self, client, monkeypatch):
         """
-        The threshold is configurable via TCS_OFF_TOPIC_SIMILARITY_THRESHOLD.
-        Setting it to 0.99 should make even a 0.92-similarity chunk
-        trigger the guard.
-
-        Note: the env var is read at module load. We monkey-patch the
-        module-level constant directly to exercise the override path
-        without reloading the module.
+        Setting TCS_OFF_TOPIC_SIMILARITY_THRESHOLD higher than the
+        stub's 0.92 should cause even an on-topic-looking retrieval
+        to be treated as off-topic. We monkey-patch the constant
+        directly rather than reload the module.
         """
         monkeypatch.setenv("TCS_WORKFLOW_TRACE_ENABLED", "true")
 
@@ -207,14 +198,16 @@ class TestOffTopicGuard:
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["decision"] == "Hold"
-        assert body["blocking_reason"].startswith("query_off_topic_to_active_pack:")
+        assert body["policy_profile_id"] == "baseline-no-pack"
+        assert body["blocking_reason"].startswith(
+            "routed_via_baseline_off_topic_for_pack:"
+        )
 
-    def test_guard_persists_artifact_and_evaluation(self, client, monkeypatch):
+    def test_routed_request_persists_artifact_with_llm_answer(self, client, monkeypatch):
         """
-        When the guard fires, an artifact + evaluation must be persisted
-        so the Audit / Reporting surfaces show the request the same way
-        a normal /v2/query call would.
+        The routed request must persist a ResponseArtifact carrying
+        the LLM's actual answer so the Audit / Reporting surfaces
+        show the request + response uniformly.
         """
         monkeypatch.setenv("TCS_WORKFLOW_TRACE_ENABLED", "true")
 
@@ -225,7 +218,7 @@ class TestOffTopicGuard:
             return_value=_LowSimVectorStore(max_similarity=0.20),
         ):
             resp = client.post("/v2/query", json={
-                "query": "Unrelated demo question.",
+                "query": "Off-topic demo question.",
                 "provider": "mock",
                 "model": "deterministic",
             })
@@ -233,18 +226,13 @@ class TestOffTopicGuard:
         body = resp.json()
         tc_id = body["certificate_id"]
 
-        # The artifact lookup convention (tc.subject_id == artifact_id)
-        # introduced in commit 636dbbb means we can fetch the artifact
-        # via the TC subject_id directly. First fetch the TC to get its
-        # subject_id.
         tc = client.get(f"/v2/certificates/{tc_id}").json()
-        assert tc["decision"] == "Hold"
-        assert tc["blocking_reason"].startswith(
-            "query_off_topic_to_active_pack:"
-        )
-        # Confirm the artifact was persisted and surfaces the original
-        # prompt so the frontend "What was asked" panel reads cleanly.
+        assert tc["policy_set_id"] == "baseline-no-pack"
+
+        # Artifact lookup convention (tc.subject_id == artifact_id).
         art = client.get(f"/v2/artifacts/{tc['subject_id']}").json()
-        assert art["prompt"] == "Unrelated demo question."
-        assert art["raw_output"] is None
-        assert art["generation_error"] == "off_topic_guard:no_llm_call"
+        assert art["prompt"] == "Off-topic demo question."
+        # raw_output carries the mock LLM's answer (not None).
+        assert art["raw_output"] is not None
+        assert art["generation_mode"] == "agent_workflow"
+        assert art["rag_enabled"] is False

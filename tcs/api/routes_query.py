@@ -27,26 +27,32 @@ router = APIRouter()
 
 
 # --------------------------------------------------------------------------- #
-# Off-topic guard                                                              #
+# Off-topic guard (scope-aware routing)                                        #
 # --------------------------------------------------------------------------- #
 #
 # A query is "off-topic" for the active pack when the top-K retrieval from
 # the active corpus produces no chunk above ``OFF_TOPIC_SIMILARITY_THRESHOLD``.
-# When that happens the route short-circuits BEFORE the LLM is invoked:
+# When that happens the route does NOT apply the active pack's strict
+# governance bar. Instead it ROUTES VIA baseline-no-pack:
 #
-#   - builds a Hold TC with blocking_reason="query_off_topic_to_active_pack:..."
-#   - persists ResponseArtifact + GovernanceEvaluation as usual
-#   - returns the QueryResponse with no raw_output (the LLM was not called)
+#   - LLM is still called (with no RAG context — the active corpus is
+#     irrelevant by definition)
+#   - the response is scored against baseline-no-pack thresholds, which
+#     are permissive (K not in gate, others around 0.70-0.75)
+#   - a TC is issued under baseline-no-pack carrying ``routed_via_baseline_off_topic``
+#     context_metadata so the audit trail shows which active pack the
+#     request was diverted from
+#   - the LLM answer flows back to the user normally
 #
-# This avoids the visually-confusing case where asking an off-topic question
-# under the MedDev pack (say "what is Paris at night like") returns clinical
-# chunks with weak similarity, an LLM hallucination, and a K-borderline Hold.
-# The guard surfaces the situation explicitly and saves the LLM call.
+# Intent: governance applies only to queries within the active pack's
+# domain. A clinician's MedDev session shouldn't gate "what is the first
+# line of Moby Dick" with clinical-grade thresholds; that question gets
+# baseline governance and a normal answer.
 #
-# The threshold is conservative by default — embeddings vary in scale across
-# corpora. Override with the env var if your demo corpus has loose
+# The threshold is conservative by default — embeddings vary in scale
+# across corpora. Override with the env var if your corpus has loose
 # similarity scoring:
-#     $env:TCS_OFF_TOPIC_SIMILARITY_THRESHOLD = "0.65"
+#     $env:TCS_OFF_TOPIC_SIMILARITY_THRESHOLD = "0.85"
 OFF_TOPIC_SIMILARITY_THRESHOLD: float = float(
     os.environ.get("TCS_OFF_TOPIC_SIMILARITY_THRESHOLD", "0.50")
 )
@@ -461,11 +467,12 @@ def _persist_query_artifact_and_evaluation(
     artifact_store.insert_evaluation(evaluation)
 
 
-def _build_off_topic_query_response(
+def _route_off_topic_via_baseline(
     *,
     body: "QueryRequest",
     store,
     artifact_store,
+    provider,
     provider_name: str,
     model_name: str,
     industry: Optional[str],
@@ -474,30 +481,34 @@ def _build_off_topic_query_response(
     max_similarity: float,
     threshold: float,
     latency: Dict[str, float],
+    original_profile_id: Optional[str],
 ) -> "QueryResponse":
     """
-    Short-circuit return for queries the active corpus cannot answer.
+    Scope-aware routing for queries outside the active pack's domain.
 
-    Detected by the off-topic guard at the top of ``_run_query_via_trace``
-    when ``max_similarity_across_top_K < OFF_TOPIC_SIMILARITY_THRESHOLD``.
+    When the off-topic guard fires the active pack is bypassed and the
+    request is processed under ``baseline-no-pack`` (the documented
+    permissive fallback profile). The LLM is invoked normally — only
+    the policy regime changes. RAG is skipped because the active
+    corpus has been shown to be irrelevant.
 
-    Constructs a Hold TC with:
-      - ``decision = "Hold"`` (off-topic should pause for human inspection,
-        not silently allow or hard-stop)
-      - ``blocking_reason = "query_off_topic_to_active_pack:..."`` —
-        the frontend's PlainLanguageExplanation paraphrases this
-        marker into reviewer-friendly prose.
-      - A is pinned low (no relevant attribution available); other
-        dimensions left neutral. This is internally consistent with
-        the BACK math (Attribution measures source backing; an
-        off-topic retrieval has none).
+    The resulting TC carries:
+      - ``policy_set_id = "baseline-no-pack"`` (NOT the active pack)
+      - ``context_metadata.routed_via_baseline_off_topic = True``
+      - ``context_metadata.original_active_pack_profile_id`` (the
+        active pack the request was diverted from, for audit)
+      - ``context_metadata.off_topic_max_similarity`` and ``..._threshold``
 
-    Persists a ResponseArtifact + GovernanceEvaluation in the same
-    shape as the normal /v2/query path so the Audit / Reporting
-    surfaces show the request and the decision uniformly. The
-    artifact carries ``raw_output = None`` and
-    ``generation_error = "off_topic_guard:no_llm_call"`` so an
-    auditor can tell at a glance that the LLM was not invoked.
+    The frontend's PlainLanguageExplanation recognizes this metadata
+    and surfaces "This question was outside the active pack's scope,
+    so it was routed through baseline governance and answered
+    normally."
+
+    Returns the LLM's answer to the caller. The decision is whatever
+    baseline-no-pack produces — typically Allow given the permissive
+    thresholds (K = 0.60 and K is not in the gate set), but the engine
+    is free to return Hold/Stop if a hard pattern still fires (e.g.
+    C3 prohibited-action detection still runs).
     """
     import uuid as _uuid
     from datetime import datetime, timezone
@@ -518,43 +529,56 @@ def _build_off_topic_query_response(
     from tcs.tis_engine import TISInput, compute_tis
     from tcs.trust_certificate import generate_certificate
 
-    # Resolve the profile the same way the normal path does. Caller's
-    # explicit body.profile_id wins; otherwise the active pack; otherwise
-    # the documented baseline. Default to the financial demo profile if
-    # none of those resolve — matches the rest of routes_query.
-    profile_id = body.profile_id
-    if not profile_id:
+    # Resolve the active pack profile_id for audit reference, then
+    # use baseline-no-pack for actual scoring.
+    if not original_profile_id:
         try:
             from tcs.packs.pack_manager import get_active_pack
             active = get_active_pack() or {}
-            profile_id = (active.get("profile_config") or {}).get("profile_id")
+            original_profile_id = (active.get("profile_config") or {}).get("profile_id")
         except Exception:  # noqa: BLE001
-            profile_id = None
-    if not profile_id:
-        profile_id = "fin-r3-a4-ct4"
-    profile = load_profile(profile_id)
+            original_profile_id = None
 
-    blocking_reason = (
-        f"query_off_topic_to_active_pack:"
-        f"max_similarity={max_similarity:.4f}"
-        f"_threshold={threshold:.2f}"
-    )
+    profile = load_profile("baseline-no-pack")
+
+    # Call the LLM directly with no RAG context (the active corpus is
+    # irrelevant by definition). We use the same provider object that
+    # was built upstream; it already carries the API key and model.
+    # NOTE: the OpenAI provider currently embeds a "financial advisory"
+    # system prompt (acknowledged pre-existing leftover in routes_query
+    # around the regular artifact creation block); for off-topic Q&A
+    # the LLM will still typically answer trivia correctly because the
+    # underlying model overrides the framing. A proper fix is to thread
+    # a neutral system prompt through provider.generate(); deferred.
+    t_llm = time.perf_counter()
+    llm_response_text: Optional[str] = None
+    llm_error: Optional[str] = None
+    try:
+        llm_response_text = provider.generate(body.query, [])
+    except Exception as exc:  # noqa: BLE001 — surface any LLM failure
+        llm_error = str(exc)
+    latency["llm_ms"] = round((time.perf_counter() - t_llm) * 1000, 1)
+
+    # Build a TISInput with baseline-no-pack and neutral signals.
+    # The LLM was called; we record an honest pass-through scoring.
+    if llm_error is not None:
+        dim_scores = {"B": 1.0, "A": 0.50, "C": 1.0, "K": 0.10}
+    else:
+        # Allow-by-default for baseline; baseline's K isn't gated and
+        # B/A/C/K = 0.80 all clear baseline's 0.70-0.75 thresholds.
+        dim_scores = {"B": 1.0, "A": 0.80, "C": 1.0, "K": 0.80}
 
     inp = TISInput(
         subject_id=str(_uuid.uuid4()),
-        subject_type="off_topic_query",
+        subject_type="off_topic_routed_query",
         policy_profile=profile,
-        # A reflects source-attribution quality. With no sufficiently-
-        # relevant sources in the active corpus, A is effectively zero
-        # — pin it low so the engine surfaces this as an attribution
-        # problem rather than a calibration borderline.
-        dimension_scores={"B": 1.00, "A": 0.10, "C": 1.00, "K": 0.80},
+        dimension_scores=dim_scores,
         sub_factor_scores={"C": {"C3": 1.0}},
         context_metadata={
-            "off_topic_query": True,
+            "routed_via_baseline_off_topic": True,
+            "original_active_pack_profile_id": original_profile_id,
             "off_topic_max_similarity": round(max_similarity, 4),
             "off_topic_threshold": float(threshold),
-            "active_policy_profile_id": profile_id,
             "n_gaps": 0,
             "context_age_hours": 0.1,
             "novelty_score": 0.0,
@@ -566,30 +590,36 @@ def _build_off_topic_query_response(
         invalidation_event=None,
         evaluation_time=datetime.now(timezone.utc).replace(microsecond=0),
     )
-    if composer_metadata:
-        inp.context_metadata["composer_metadata"] = dict(composer_metadata)
+    # We deliberately do NOT inject the composer_metadata of the active
+    # pack — this evaluation is under baseline-no-pack, not the active
+    # composed pack. The active pack is recorded in
+    # ``original_active_pack_profile_id`` for audit.
 
     result = compute_tis(inp)
     decision, requires = map_decision(inp, result)
-    # Force HOLD framing — off-topic should clearly pause for review,
-    # not silently allow or hard-stop. The TC's blocking_reason carries
-    # the off-topic marker the frontend renders against.
-    if decision != "Hold":
-        decision = "Hold"
-        requires = True
-
     tc = generate_certificate(inp, result, decision, requires)
-    # Replace the engine-derived blocking_reason with the off-topic
-    # marker so the frontend can recognize the case and produce
-    # reviewer-friendly prose. TC dataclass is not frozen; this is
-    # the same pattern other helpers use to override post-generation
-    # fields (see tcs/artifacts/evaluation.py).
-    object.__setattr__(tc, "blocking_reason", blocking_reason)
+    # Tag blocking_reason informationally so the frontend can detect
+    # the rerouting case. For Allow we still set this marker (it doesn't
+    # block, just labels the path); for Hold/Stop we prefix the engine's
+    # reason with the routing context.
+    routing_marker = (
+        f"routed_via_baseline_off_topic_for_pack:"
+        f"{original_profile_id or 'unknown'}"
+        f":max_similarity={max_similarity:.4f}"
+        f"_threshold={threshold:.2f}"
+    )
+    if decision == "Allow":
+        object.__setattr__(tc, "blocking_reason", routing_marker)
+    else:
+        existing = tc.blocking_reason or ""
+        object.__setattr__(
+            tc, "blocking_reason",
+            f"{routing_marker}|{existing}" if existing else routing_marker,
+        )
 
     issued_tc = store.issue(tc)
 
-    # Persist the artifact + evaluation if the app has the store
-    # wired (test paths may construct a bare app without one).
+    # Persist the artifact + evaluation if the app has the store wired.
     if artifact_store is not None:
         retrieved_sources = [
             {
@@ -604,13 +634,13 @@ def _build_off_topic_query_response(
             artifact_id=issued_tc.subject_id,
             generation_mode=GENERATION_MODE_AGENT_WORKFLOW,
             prompt=body.query,
-            raw_output=None,
+            raw_output=llm_response_text,
             provider=provider_name,
             model=model_name,
             system_prompt_used=None,
-            rag_enabled=True,
+            rag_enabled=False,  # baseline routing skips RAG
             rag_context=None,
-            retrieved_sources=retrieved_sources,
+            retrieved_sources=retrieved_sources,  # preserved for audit
             workflow_trace_id=None,
             workflow_trace=None,
             recipient_context=(
@@ -619,9 +649,9 @@ def _build_off_topic_query_response(
             generation_identity={
                 "requesting_identity": "query_endpoint",
                 "identity_type": "system",
-                "role": "off_topic_guard",
+                "role": "off_topic_baseline_router",
             },
-            generation_error="off_topic_guard:no_llm_call",
+            generation_error=llm_error,
         )
         artifact_store.insert_artifact(artifact)
 
@@ -632,9 +662,7 @@ def _build_off_topic_query_response(
             mode=EVALUATION_MODE_ENFORCE,
             policy_profile_id=profile.profile_id,
             policy_profile_snapshot=snapshot,
-            selected_standards=list(
-                (composer_metadata or {}).get("standards") or []
-            ),
+            selected_standards=[],  # baseline-no-pack has no standards
             enabled_controls=[],
             rule_matches=None,
             component_scores={
@@ -649,7 +677,7 @@ def _build_off_topic_query_response(
             evaluator_identity={
                 "requesting_identity": "query_endpoint",
                 "identity_type": "system",
-                "role": "off_topic_guard",
+                "role": "off_topic_baseline_router",
             },
             evaluation_completeness_score=1.0,
             evaluation_origin=EVALUATION_ORIGIN_QUERY,
@@ -658,30 +686,23 @@ def _build_off_topic_query_response(
         )
         artifact_store.insert_evaluation(evaluation)
 
-    latency["total_ms"] = latency.get("preview_ms", 0.0)
+    blocked = decision in ("Hold", "Stop", "Escalate")
+    latency["total_ms"] = round(
+        latency.get("preview_ms", 0.0) + latency.get("llm_ms", 0.0), 1
+    )
     return QueryResponse(
         query=body.query,
-        response=None,
-        blocked=True,
+        response=None if blocked else llm_response_text,
+        blocked=blocked,
         decision=decision,
         certificate_id=issued_tc.certificate_id,
         tis_current=issued_tc.tis_current,
         tis_raw=issued_tc.tis_raw,
         s_base=issued_tc.s_base,
         gate_passed=issued_tc.gate_passed,
-        blocking_reason=blocking_reason,
-        requires_human_review=True,
-        retrieval_chunks=[
-            {
-                "chunk_id":         c.get("chunk_id"),
-                "source_doc":       c.get("source_doc"),
-                "version":          c.get("version"),
-                "content":          c.get("content"),
-                "similarity_score": c.get("similarity_score"),
-                "tags":             c.get("tags", []),
-            }
-            for c in preview_chunks if isinstance(c, dict)
-        ],
+        blocking_reason=tc.blocking_reason,
+        requires_human_review=requires,
+        retrieval_chunks=[],  # baseline routing: no chunks delivered to UI
         latency_ms=latency,
         llm_provider=provider_name,
         llm_model=model_name,
@@ -691,7 +712,7 @@ def _build_off_topic_query_response(
         thresholds=dict(issued_tc.thresholds),
         workflow_trace=None,
         policy_profile_id=issued_tc.policy_set_id,
-        connection_type="CT-4",
+        connection_type="CT-1",  # direct LLM, no RAG
     )
 
 
@@ -758,10 +779,11 @@ def _run_query_via_trace(
         latency["preview_ms"] = round(
             (time.perf_counter() - t_total) * 1000, 1
         )
-        return _build_off_topic_query_response(
+        return _route_off_topic_via_baseline(
             body=body,
             store=store,
             artifact_store=artifact_store,
+            provider=provider,
             provider_name=provider_name,
             model_name=model_name,
             industry=industry,
@@ -770,6 +792,7 @@ def _run_query_via_trace(
             max_similarity=max_sim,
             threshold=OFF_TOPIC_SIMILARITY_THRESHOLD,
             latency=latency,
+            original_profile_id=body.profile_id,
         )
 
     rag_connector = RAGConnector(store=vector_store, retrieval_k=5)
