@@ -193,30 +193,76 @@ def _build_provider(provider_name: str, api_key: Optional[str], model: Optional[
 
         class RequestScopedOpenAI:
             def generate(self, query, context):
-                context_text = "\n\n".join(context)
+                context_text = "\n\n".join(context) if context else ""
+                # Neutral, domain-agnostic system prompt. The previous
+                # hardcoded "financial advisory AI" framing made GPT-5
+                # refuse clinical and other non-finance questions even
+                # when the active policy pack governed that domain.
+                # Domain-specific framing belongs in the policy pack,
+                # not in the LLM connector.
+                if context_text:
+                    system_msg = (
+                        "You are a careful, domain-aware assistant. "
+                        "Answer the user's question based on the provided "
+                        "context. Cite sources when possible. If the context "
+                        "does not cover the question, answer from general "
+                        "knowledge while making clear that the answer is not "
+                        "grounded in the supplied sources."
+                    )
+                    user_msg = f"Context:\n{context_text}\n\nQuestion: {query}"
+                else:
+                    system_msg = (
+                        "You are a careful, helpful assistant. Answer the "
+                        "user's question directly and concisely."
+                    )
+                    user_msg = query
                 messages = [
-                    {"role": "system", "content": (
-                        "You are a financial advisory AI. Answer based strictly "
-                        "on the provided context. Cite sources when possible."
-                    )},
-                    {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"},
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": user_msg},
                 ]
 
                 kwargs = {"model": api_model, "messages": messages}
 
-                # GPT-5.x and reasoning models require max_completion_tokens
-                is_new_model = api_model.startswith("gpt-5") or api_model.startswith("gpt-4.1")
-
+                # GPT-5.x and reasoning models require max_completion_tokens.
+                is_new_model = (
+                    api_model.startswith("gpt-5") or api_model.startswith("gpt-4.1")
+                )
                 if is_reasoning_model or is_thinking or is_new_model:
-                    # GPT-5.x, GPT-4.1, and reasoning models: max_completion_tokens, no temperature
-                    kwargs["max_completion_tokens"] = 2000 if (is_reasoning_model or is_thinking) else 500
+                    # New / reasoning models silently spend tokens on
+                    # internal reasoning before any visible output.
+                    # 500 was empirically too tight: complex clinical
+                    # questions returned message.content = "" because
+                    # the reasoning phase consumed the whole budget.
+                    # Bumped to 2000 for Instant and 4000 for Thinking
+                    # so visible output has headroom.
+                    kwargs["max_completion_tokens"] = (
+                        4000 if (is_reasoning_model or is_thinking) else 2000
+                    )
                 else:
-                    # Legacy models (gpt-4o, etc): standard completion
-                    kwargs["max_tokens"] = 500
+                    # Legacy models (gpt-4o, etc): standard completion.
+                    kwargs["max_tokens"] = 1000
                     kwargs["temperature"] = 0.3
 
                 response = client.chat.completions.create(**kwargs)
-                return response.choices[0].message.content or ""
+                content = response.choices[0].message.content
+                if content:
+                    return content
+                # Defensive: surface why the response was empty so the
+                # user sees a clear diagnostic rather than a silent
+                # "No response" in the chat. This indicates either a
+                # content-policy block or a token-budget exhaustion on
+                # the model side; either way the user needs to know.
+                finish_reason = getattr(
+                    response.choices[0], "finish_reason", "unknown"
+                )
+                return (
+                    f"[{api_model} returned no content. "
+                    f"finish_reason={finish_reason}. "
+                    "This usually means the model spent its token budget "
+                    "on internal reasoning before producing output, or a "
+                    "content policy intervened. Try Thinking mode, switch "
+                    "to gpt-4o, or restate the question.]"
+                )
 
         return RequestScopedOpenAI(), display_name
 
@@ -229,19 +275,33 @@ def _build_provider(provider_name: str, api_key: Optional[str], model: Optional[
 
         class RequestScopedAnthropic:
             def generate(self, query, context):
-                context_text = "\n\n".join(context)
+                context_text = "\n\n".join(context) if context else ""
+                if context_text:
+                    user_content = (
+                        "You are a careful, domain-aware assistant. "
+                        "Answer based on the provided context. Cite sources "
+                        "when possible. If the context does not cover the "
+                        "question, answer from general knowledge while making "
+                        "clear that the answer is not grounded in the supplied "
+                        "sources.\n\n"
+                        f"Context:\n{context_text}\n\nQuestion: {query}"
+                    )
+                else:
+                    user_content = (
+                        "You are a careful, helpful assistant. Answer the "
+                        f"user's question directly and concisely.\n\n{query}"
+                    )
                 response = client.messages.create(
                     model=model_name,
-                    max_tokens=500,
+                    max_tokens=2000,
                     messages=[
-                        {"role": "user", "content": (
-                            f"You are a financial advisory AI. Answer based strictly "
-                            f"on the provided context.\n\nContext:\n{context_text}\n\n"
-                            f"Question: {query}"
-                        )},
+                        {"role": "user", "content": user_content},
                     ],
                 )
-                return response.content[0].text
+                return response.content[0].text if response.content else (
+                    f"[{model_name} returned no content. "
+                    "Try restating the question or switching providers.]"
+                )
 
         return RequestScopedAnthropic(), model_name
 
