@@ -1,22 +1,25 @@
 // =============================================================================
 // PlainLanguageExplanation
 //
-// User-friendly summary of a governance decision. Shared between the Audit
-// Certificates view (where it sits above the technical 11-layer dump) and
-// the Governance Replay view (where it sits inline under each evaluation
+// A reviewer-friendly summary of a governance decision. Used by the Audit
+// Certificates view (above the technical 11-layer dump), the LiveDecisions
+// TC drawer, and the Governance Replay view (inline under each evaluation
 // row).
 //
-// Accepts a record that may be either:
+// Goal: a non-technical reviewer should read three short paragraphs and
+// understand (1) what the user asked for, (2) why the system decided what
+// it decided, in domain language, and (3) what should happen next. The
+// raw governance math is demoted to a small parenthetical so an auditor
+// can still see the numbers without them dominating the page.
+//
+// Accepts a record that may be:
 //   - a full Trust Certificate (from GET /v2/certificates/{id})
-//   - a full GovernanceEvaluation (from GET /v2/evaluations/{id} or
-//     GET /v2/artifacts/{id}/evaluations)
+//   - a full GovernanceEvaluation (from GET /v2/evaluations/{id})
 //   - a slim replay summary (from POST /v2/replay)
 //
-// The generator is tolerant of missing fields: richer input yields richer
-// language; slim input still produces a useful paragraph.
-//
-// No backend calls, no mutation, no behavior change. Pure presentation
-// over data the caller already has.
+// The generator is tolerant of missing fields. No backend calls, no
+// mutation, no LLM call — pure presentation over data the caller already
+// has.
 // =============================================================================
 
 const DIMENSION_NAME = {
@@ -24,18 +27,6 @@ const DIMENSION_NAME = {
   A: 'Attribution',
   C: 'Compliance',
   K: 'Known',
-};
-
-const DECISION_VERB = {
-  Allow:               'allowed',
-  Observe:             'delivered with monitoring',
-  Hold:                'held for human review',
-  Escalate:            'escalated for senior review',
-  Stop:                'blocked',
-  Allow_with_logging:  'allowed (with enhanced logging)',
-  Allow_with_redaction:'allowed (with redaction applied)',
-  Allow_with_step_up:  'allowed (after step-up verification)',
-  Rollback:            'rolled back',
 };
 
 const DECISION_TONE = {
@@ -50,129 +41,79 @@ const DECISION_TONE = {
   Rollback:            'text-red-300',
 };
 
-// Translate machine sub-factor labels to short human phrases. Returns the
-// raw label if no translation is known — that keeps unfamiliar sub-factors
-// surfaced rather than silently dropped.
-const SUBFACTOR_PHRASE = {
-  B1: 'request-time policy bounding',
-  B2: 'authorization tier check',
-  B3: 'request-time identity verification',
-  A1: 'source attribution',
-  A2: 'source quality',
-  A3: 'integration-boundary attribution',
-  C1: 'general compliance check',
-  C2: 'standards-specific compliance',
-  C3: 'prohibited-pattern detection',
-  K1: 'calibration confidence',
-  K2: 'evidence freshness',
-  K3: 'chain calibration',
+// Map TC.domain to a reviewer role and a topic phrase used in the
+// lead sentence. Unknown domains fall back to neutral language so the
+// summary never looks broken.
+const DOMAIN_PROFILE = {
+  financial_services:    { reviewer: 'compliance officer',  topic: 'financial-advisory question' },
+  investment_advisory:   { reviewer: 'compliance officer',  topic: 'financial-advisory question' },
+  life_sciences:         { reviewer: 'clinical reviewer',    topic: 'clinical question' },
+  healthcare:            { reviewer: 'clinical reviewer',    topic: 'clinical question' },
+  medical_devices:       { reviewer: 'clinical reviewer',    topic: 'clinical-decision-support question' },
+  clinical_cds:          { reviewer: 'clinical reviewer',    topic: 'clinical-decision-support question' },
+  pharmacovigilance:     { reviewer: 'pharmacovigilance reviewer', topic: 'pharmacovigilance question' },
+  pharma:                { reviewer: 'pharmacovigilance reviewer', topic: 'pharmacovigilance question' },
+  enterprise_ops:        { reviewer: 'operations lead',      topic: 'operations question' },
+  federal_public:        { reviewer: 'policy reviewer',      topic: 'policy question' },
+  general_ai_governance: { reviewer: 'reviewer',             topic: 'request' },
+  unknown:               { reviewer: 'reviewer',             topic: 'request' },
 };
 
-// Paraphrase the structured ``blocking_reason`` string into a short
-// human phrase. Examples:
-//
-//   "C3_prohibited_pattern_prompt_injection_pattern:prohibited_prompt_injection_pattern"
-//     -> "a prohibited prompt-injection pattern"
-//   "C3_prohibited_pattern_credentials_pattern:prohibited_credentials_pattern"
-//     -> "a prohibited credential-exposure pattern"
-//   "gate_failure_K"
-//     -> "a Known-dimension gate failure"
-//   "context_expansion_invalidation"
-//     -> "a context-expansion invalidation"
-//
-// Falls back to a softly-cleaned version of the raw string.
-function paraphraseBlockingReason(raw) {
-  if (!raw) return null;
-  const s = String(raw);
-  const lower = s.toLowerCase();
-  if (lower.includes('prompt_injection')) return 'a prohibited prompt-injection pattern';
-  if (lower.includes('credentials_pattern') || lower.includes('credential_exposure'))
-    return 'a prohibited credential-exposure pattern';
-  if (lower.includes('prohibited_action'))
-    return 'a prohibited action pattern';
-  if (lower.includes('context_expansion'))
-    return 'a context-expansion invalidation (new evidence arrived after evaluation)';
-  if (lower.startsWith('gate_failure_')) {
-    const dim = lower.slice('gate_failure_'.length).toUpperCase();
-    const name = DIMENSION_NAME[dim] || dim;
-    return `a ${name}-dimension gate failure`;
-  }
-  // Generic cleanup: take the part after ':' if present, replace underscores.
-  const last = s.includes(':') ? s.split(':').pop() : s;
-  return last.replace(/_/g, ' ').toLowerCase();
+function profileFor(domain) {
+  if (!domain) return DOMAIN_PROFILE.unknown;
+  return DOMAIN_PROFILE[domain] || DOMAIN_PROFILE.unknown;
 }
 
-// Pick a single "primary cause" string from whatever evidence the TC /
-// evaluation carries. Priority order, highest first:
-//   1. governance_rule_matches[*].effect.explanation (already human prose)
-//   2. blocking_reason (paraphrased)
-//   3. failing_dimension_subfactors (mapped to phrase)
-//   4. identity_binding shortfall (verified=false or low confidence)
-//   5. key_concerns[0] (Layer E)
-//   6. null
-function primaryCause(tc) {
-  const ruleMatches = Array.isArray(tc.governance_rule_matches)
-    ? tc.governance_rule_matches
-    : Array.isArray(tc.rule_matches) ? tc.rule_matches : [];
-  for (const m of ruleMatches) {
-    const explanation = m?.effect?.explanation;
-    if (typeof explanation === 'string' && explanation.trim()) {
-      return explanation.trim();
-    }
-  }
+// What each gated dimension represents in domain language. Used to
+// describe gate failures without leaking the dimension code (B/A/C/K)
+// as the primary noun.
+const DIMENSION_PLAIN = {
+  B: { short: 'authorization',  long: "the requester's authorization for this kind of request" },
+  A: { short: 'source backing', long: 'the evidence and source attribution behind the answer' },
+  C: { short: 'policy compliance', long: 'the policy-compliance check on the question or answer' },
+  K: { short: 'answer confidence', long: "the system's calibration confidence in the answer" },
+};
 
-  const para = paraphraseBlockingReason(tc.blocking_reason);
-  if (para) return para;
-
-  const failing = tc.failing_dimension_subfactors || {};
-  const entries = Object.entries(failing);
-  if (entries.length > 0) {
-    const phrases = [];
-    for (const [dim, subs] of entries) {
-      const subKeys = subs && typeof subs === 'object' ? Object.keys(subs) : [];
-      for (const key of subKeys) {
-        const phrase = SUBFACTOR_PHRASE[key];
-        if (phrase) {
-          phrases.push(`weak ${phrase}`);
-        } else if (key) {
-          phrases.push(`${DIMENSION_NAME[dim] || dim} sub-factor ${key} below threshold`);
-        }
-      }
-    }
-    if (phrases.length > 0) {
-      return phrases.slice(0, 2).join('; ');
-    }
-  }
-
-  const ib = tc.identity_binding;
-  if (ib) {
-    if (ib.identity_verified === false) {
-      return 'no verified identity for the requesting party';
-    }
-    if (typeof ib.identity_confidence === 'number' && ib.identity_confidence < 0.5) {
-      return `low identity confidence (${ib.identity_confidence.toFixed(2)})`;
-    }
-  }
-
-  if (Array.isArray(tc.key_concerns) && tc.key_concerns.length > 0) {
-    return String(tc.key_concerns[0]);
-  }
-  return null;
+// Trim a prompt to a short reference phrase suitable for a single
+// sentence. Keeps full prompts up to ~70 chars verbatim; longer ones
+// get a tail-trim ellipsis.
+function shortPromptRef(prompt) {
+  if (!prompt) return null;
+  const trimmed = String(prompt).replace(/\s+/g, ' ').trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= 70) return trimmed;
+  return trimmed.slice(0, 67).replace(/[\s.,;:]+$/, '') + '…';
 }
 
-// Find which BACK dimensions failed their gate, if any. Returns a list of
-// {dim, score, threshold} where score/threshold may be null if the input
-// shape doesn't carry them (slim replay summary case).
+// Number formatters used in the optional supplementary parenthetical.
+function fmtScore(n) {
+  if (typeof n !== 'number' || Number.isNaN(n)) return '—';
+  return n.toFixed(4);
+}
+function fmtThreshold(n) {
+  if (typeof n !== 'number' || Number.isNaN(n)) return '—';
+  return n.toFixed(2);
+}
+
+// Format an override event timestamp for display. Compact form
+// matching the rest of the UI ("MM/DD HH:MM").
+function shortOverrideTime(iso) {
+  if (!iso) return '';
+  const datePart = iso.slice(5, 10).replace('-', '/');
+  const timePart = iso.slice(11, 16);
+  return `${datePart} ${timePart}`;
+}
+
+// Find which BACK dimensions failed their gate, if any. Returns
+// {dim, score, threshold} entries (score/threshold may be null when
+// the input shape doesn't carry them, e.g. slim replay summary).
 function failedGateDetails(tc) {
   const gateResults = tc.gate_results || {};
   const componentScores = tc.component_scores || {};
-  // Thresholds may be top-level (TC) or under a policy snapshot
-  // (evaluation row). Try both.
   const thresholds =
     tc.thresholds
     || tc.policy_profile_snapshot?.thresholds
     || {};
-
   const out = [];
   for (const [dim, result] of Object.entries(gateResults)) {
     if (result === 'fail') {
@@ -186,158 +127,216 @@ function failedGateDetails(tc) {
   return out;
 }
 
-function fmtScore(n) {
-  if (typeof n !== 'number' || Number.isNaN(n)) return '—';
-  return n.toFixed(4);
-}
-function fmtThreshold(n) {
-  if (typeof n !== 'number' || Number.isNaN(n)) return '—';
-  return n.toFixed(2);
+// Paraphrase a structured ``blocking_reason`` into plain prose. Used
+// almost exclusively for the Stop decision narrative.
+function paraphraseBlockingReason(raw) {
+  if (!raw) return null;
+  const lower = String(raw).toLowerCase();
+  if (lower.includes('prompt_injection'))
+    return 'the question contains a prohibited prompt-injection pattern — language that tries to get the model to ignore safety policy';
+  if (lower.includes('credentials_pattern') || lower.includes('credential_exposure'))
+    return 'the question or context appears to expose credentials, which the policy prohibits';
+  if (lower.includes('prohibited_action'))
+    return 'the request matches a prohibited-action pattern under the active policy';
+  if (lower.includes('context_expansion'))
+    return 'new context arrived after the answer was evaluated, invalidating the original decision';
+  // Generic cleanup as a last resort.
+  return null;
 }
 
-// Format a single failed gate phrase, with or without threshold context.
-function failedGatePhrase({ dim, score, threshold }) {
-  const name = DIMENSION_NAME[dim] || dim;
-  if (score != null && threshold != null) {
-    return `the ${name} (${dim}) gate failed — score ${fmtScore(score)}, required ≥ ${fmtThreshold(threshold)}`;
+// Look for a rule-supplied human explanation. Typed-context and
+// term-group rules carry an ``effect.explanation`` string that is
+// already plain language ("lithium is contraindicated in pregnancy…");
+// use it verbatim when present.
+function ruleExplanation(tc) {
+  const matches = Array.isArray(tc.governance_rule_matches)
+    ? tc.governance_rule_matches
+    : Array.isArray(tc.rule_matches) ? tc.rule_matches : [];
+  for (const m of matches) {
+    const explanation = m?.effect?.explanation;
+    if (typeof explanation === 'string' && explanation.trim()) {
+      return explanation.trim();
+    }
   }
-  if (score != null) {
-    return `the ${name} (${dim}) gate failed — score ${fmtScore(score)}`;
-  }
-  return `the ${name} (${dim}) gate failed`;
+  return null;
 }
 
-// Format an override event timestamp for display. Same compact form used
-// elsewhere in the UI ("MM/DD HH:MM").
-function shortOverrideTime(iso) {
-  if (!iso) return '';
-  const datePart = iso.slice(5, 10).replace('-', '/');
-  const timePart = iso.slice(11, 16);
-  return `${datePart} ${timePart}`;
-}
+// =============================================================================
+// The renderer
+// =============================================================================
 
-// Top-level renderer. Returns a self-contained block that the caller
-// drops into its layout.
-//
-// Props:
-//   tc         — the TC or evaluation-like record to summarize.
-//   overrides  — optional array of override events from
-//                /v2/govern/decisions/{tc_id}/override-history. Each
-//                entry: { override_decision, override_actor,
-//                override_at, override_reason_text }. When present and
-//                non-empty, a "Human override" block is appended to the
-//                summary listing every event newest-first.
-//   compact    — when true, render in a smaller footprint suitable for
-//                inline use under a row (Replay view). Default false.
-export default function PlainLanguageExplanation({ tc, overrides, compact = false }) {
+export default function PlainLanguageExplanation({
+  tc,
+  prompt,           // optional — the original prompt/question. When
+                    // present, the summary's lead sentence references
+                    // it ("To answer 'lithium dosing…', the system…").
+  overrides,        // optional — events from
+                    // /v2/govern/decisions/{tc_id}/override-history.
+  compact = false,  // smaller footprint for inline use under a row.
+}) {
   if (!tc) return null;
 
   const decision = tc.decision || 'Unknown';
-  const verb = DECISION_VERB[decision] || decision;
   const tone = DECISION_TONE[decision] || 'text-gray-200';
+  const domain = tc.domain || tc.policy_profile_snapshot?.domain || 'unknown';
+  const profile = profileFor(domain);
+  const promptRef = shortPromptRef(prompt);
 
   const failed = failedGateDetails(tc);
-  const cause = primaryCause(tc);
+  const ruleSays = ruleExplanation(tc);
   const sBase = typeof tc.s_base === 'number' ? tc.s_base : null;
-  const tisCurrent = typeof tc.tis_current === 'number' ? tc.tis_current : null;
-  // soft-hold ceiling (κ) is only present on full evaluations with policy
-  // snapshots, not on slim summaries.
   const kappa = tc.policy_profile_snapshot?.soft_hold_ceiling;
 
-  // ---- Sentence 1: the verdict ------------------------------------------ //
-  const sentenceVerdict = (
-    <>
-      This response was{' '}
-      <span className={`font-semibold ${tone}`}>{verb}</span>.
-    </>
-  );
+  // ---- Lead sentence: "what happened" + reference to the prompt --------- //
+  // For Allow/Observe we frame positively ("This {topic} was delivered.").
+  // For Hold/Escalate/Stop we frame as "What's needed" ("To deliver this
+  // {topic}, the system needs …").
 
-  // ---- Sentence 2: gate-level detail ------------------------------------ //
-  let sentenceDetail = null;
-  if (failed.length > 0) {
-    const joined = failed.map(failedGatePhrase).join('; ');
-    // capitalize first character only
-    const cap = joined.charAt(0).toUpperCase() + joined.slice(1);
-    sentenceDetail = <>{cap}.</>;
-  } else if (decision === 'Allow' || decision === 'Observe' || decision.startsWith('Allow_with_')) {
-    sentenceDetail = (
+  let leadJsx = null;
+  const verbSpan = (txt) => <span className={`font-semibold ${tone}`}>{txt}</span>;
+
+  if (decision === 'Allow') {
+    leadJsx = (
       <>
-        All governance gates passed
-        {tisCurrent != null
-          ? <> (TIS_current = <span className="font-mono">{fmtScore(tisCurrent)}</span>)</>
-          : null}
-        .
+        This {profile.topic} was {verbSpan('answered and delivered')}.
+        {promptRef ? <> The original question — “<span className="italic">{promptRef}</span>” — passed every automated governance check.</> : <> Every automated governance check passed.</>}
       </>
     );
-  } else if (decision === 'Escalate') {
-    sentenceDetail = (
-      <>
-        Gates passed but the overall trust score fell into the escalation band
-        {tisCurrent != null
-          ? <> (TIS_current = <span className="font-mono">{fmtScore(tisCurrent)}</span>)</>
-          : null}
-        .
-      </>
-    );
-  }
-
-  // ---- Sentence 3: primary cause ---------------------------------------- //
-  let sentenceCause = null;
-  if (cause) {
-    sentenceCause = <>Primary reason: {cause}.</>;
-  }
-
-  // ---- Sentence 4: remediability-floor framing -------------------------- //
-  let sentenceFloor = null;
-  if (sBase != null && typeof kappa === 'number') {
-    if (decision === 'Hold') {
-      sentenceFloor = (
-        <>
-          Overall trust score{' '}
-          (S_base = <span className="font-mono">{fmtScore(sBase)}</span>){' '}
-          is above the remediability floor{' '}
-          (κ = <span className="font-mono">{fmtThreshold(kappa)}</span>),{' '}
-          so the response is paused rather than blocked.
-        </>
-      );
-    } else if (decision === 'Stop' && failed.length > 0) {
-      sentenceFloor = (
-        <>
-          Overall trust score{' '}
-          (S_base = <span className="font-mono">{fmtScore(sBase)}</span>){' '}
-          is below the remediability floor{' '}
-          (κ = <span className="font-mono">{fmtThreshold(kappa)}</span>),{' '}
-          so the system blocked delivery rather than escalating.
-        </>
-      );
-    }
-  }
-
-  // ---- Sentence 5: next step -------------------------------------------- //
-  let sentenceNext = null;
-  if (decision === 'Hold') {
-    sentenceNext = <>Next step: a reviewer can release or escalate this response via the Hold Queue.</>;
-  } else if (decision === 'Escalate') {
-    const roles = Array.isArray(tc.escalation_routed_to)
-      ? tc.escalation_routed_to.filter(Boolean)
-      : [];
-    if (roles.length > 0) {
-      sentenceNext = (
-        <>
-          Routed to: <span className="font-mono">{roles.join(', ')}</span>.
-          A senior reviewer can approve, hold, or stop via the Escalation Queue.
-        </>
-      );
-    } else {
-      sentenceNext = <>A senior reviewer can approve, hold, or stop via the Escalation Queue.</>;
-    }
-  } else if (decision === 'Stop') {
-    sentenceNext = <>The response will not be delivered.</>;
-  } else if (decision === 'Allow') {
-    sentenceNext = <>No human action required.</>;
   } else if (decision === 'Observe') {
-    sentenceNext = <>Delivered as-is; decision recorded as evidence, no intervention applied.</>;
+    leadJsx = (
+      <>
+        This {profile.topic} was {verbSpan('delivered with monitoring')}. The decision was recorded as evidence; no human intervention applied.
+      </>
+    );
+  } else if (decision === 'Hold') {
+    leadJsx = promptRef ? (
+      <>
+        Before the answer to{' '}
+        “<span className="italic">{promptRef}</span>”{' '}
+        can be delivered, the system needs a {profile.reviewer} to verify it ({verbSpan('held for review')}).
+      </>
+    ) : (
+      <>
+        Before this {profile.topic} can be delivered, the system needs a {profile.reviewer} to verify the answer ({verbSpan('held for review')}).
+      </>
+    );
+  } else if (decision === 'Escalate') {
+    const roles = Array.isArray(tc.escalation_routed_to) ? tc.escalation_routed_to.filter(Boolean) : [];
+    const routed = roles.length ? <> Routed to: <span className="font-mono">{roles.join(', ')}</span>.</> : null;
+    leadJsx = promptRef ? (
+      <>
+        The answer to{' '}
+        “<span className="italic">{promptRef}</span>”{' '}
+        needs senior review before it can be released ({verbSpan('escalated')}).{routed}
+      </>
+    ) : (
+      <>
+        This {profile.topic} needs senior review before it can be released ({verbSpan('escalated')}).{routed}
+      </>
+    );
+  } else if (decision === 'Stop') {
+    leadJsx = promptRef ? (
+      <>
+        The request{' '}
+        “<span className="italic">{promptRef}</span>”{' '}
+        was {verbSpan('blocked')}. The response will not be delivered.
+      </>
+    ) : (
+      <>
+        This request was {verbSpan('blocked')}. The response will not be delivered.
+      </>
+    );
+  } else {
+    // Phase 3 refinements (Allow_with_*, Rollback, etc.).
+    leadJsx = (
+      <>
+        This {profile.topic} resulted in <span className={`font-semibold ${tone}`}>{decision}</span>.
+      </>
+    );
   }
+
+  // ---- Why sentence: plain prose, never raw machine strings ------------ //
+  // Priority order:
+  //   1) Rule-supplied explanation (already human prose)
+  //   2) Paraphrased blocking_reason (for Stop with C3 patterns)
+  //   3) Generated from failing gate + domain context
+  //   4) Generic fallback
+
+  let whyJsx = null;
+  let supplementJsx = null;
+
+  if (ruleSays && (decision === 'Stop' || decision === 'Hold' || decision === 'Escalate')) {
+    whyJsx = <>The reason: {ruleSays}</>;
+  } else if (decision === 'Stop') {
+    const paraphrased = paraphraseBlockingReason(tc.blocking_reason);
+    if (paraphrased) {
+      whyJsx = <>The reason: {paraphrased}.</>;
+    } else if (failed.length > 0) {
+      const dim = failed[0].dim;
+      const plain = DIMENSION_PLAIN[dim];
+      whyJsx = plain ? (
+        <>The reason: the automated check on {plain.long} did not pass for this {profile.topic}, and the overall trust score sits below the threshold where the system is willing to escalate rather than block.</>
+      ) : <>The reason: the {DIMENSION_NAME[dim] || dim} check did not pass and the overall trust score fell below the remediability floor.</>;
+    } else {
+      whyJsx = <>The reason: the request did not pass automated governance.</>;
+    }
+  } else if ((decision === 'Hold' || decision === 'Escalate') && failed.length > 0) {
+    // Build a domain-flavored explanation per failed dimension.
+    const phrases = failed.map(({ dim }) => {
+      const plain = DIMENSION_PLAIN[dim];
+      if (!plain) return `the ${DIMENSION_NAME[dim] || dim} check did not pass`;
+      if (dim === 'K') {
+        return `the system's confidence in the answer didn't reach the bar required for ${profile.topic}s of this risk level — the information may be correct, the system simply isn't sure enough on its own`;
+      }
+      if (dim === 'A') {
+        return 'the answer was not sufficiently backed by attributable sources';
+      }
+      if (dim === 'B') {
+        return `the system could not confirm that the requester has the authorization required for this kind of ${profile.topic}`;
+      }
+      if (dim === 'C') {
+        return 'the question or answer is bumping against a policy-compliance boundary that requires human judgment';
+      }
+      return `the automated check on ${plain.long} did not pass`;
+    });
+    whyJsx = <>The reason: {phrases.join('; ')}.</>;
+
+    // Optional small parenthetical with the raw numbers — kept short and
+    // visually demoted so it doesn't compete with the prose.
+    const numbered = failed.filter(f => f.score != null && f.threshold != null);
+    if (numbered.length > 0) {
+      supplementJsx = (
+        <span className="text-gray-500">
+          {' '}({numbered.map(f =>
+            `${f.dim} = ${fmtScore(f.score)}, required ≥ ${fmtThreshold(f.threshold)}`
+          ).join('; ')}
+          {decision === 'Hold' && sBase != null && typeof kappa === 'number'
+            ? `; overall S_base = ${fmtScore(sBase)}, above floor κ = ${fmtThreshold(kappa)}`
+            : ''}
+          )
+        </span>
+      );
+    }
+  } else if (decision === 'Escalate') {
+    whyJsx = <>The reason: every gate passed, but the combined trust score fell into the band where a more senior reviewer should sign off before delivery.</>;
+  }
+
+  // ---- Next-step sentence: domain-friendly action --------------------- //
+  let nextJsx = null;
+  if (decision === 'Hold') {
+    nextJsx = <>Next step: a {profile.reviewer} can release the response if it looks accurate, or escalate it if it needs revision. The action lives in the Hold Queue on the Live page.</>;
+  } else if (decision === 'Escalate') {
+    nextJsx = <>Next step: a senior {profile.reviewer} can approve, hold, or stop the response from the Escalation Queue on the Live page.</>;
+  } else if (decision === 'Stop') {
+    nextJsx = <>Next step: nothing automatic. If the block looks like a mistake, a {profile.reviewer} can review the certificate and (where the rule allows it) record a documented override.</>;
+  } else if (decision === 'Allow') {
+    nextJsx = <>Next step: none. The response is being delivered as part of normal operation.</>;
+  } else if (decision === 'Observe') {
+    nextJsx = <>Next step: none. The decision is logged as evidence for monitoring without changing delivery.</>;
+  }
+
+  // ---- Override block (unchanged from prior pass) ---------------------- //
+  const overrideList = Array.isArray(overrides) ? overrides.filter(Boolean) : [];
 
   const textSize = compact ? 'text-xs' : 'text-sm';
   const containerPad = compact ? 'p-2' : 'p-3';
@@ -346,27 +345,23 @@ export default function PlainLanguageExplanation({ tc, overrides, compact = fals
     ? 'bg-gray-900/60 border border-gray-800 rounded'
     : 'bg-gray-900 border border-gray-700 rounded-lg';
 
-  // ---- Override section (if any) --------------------------------------- //
-  // Listed newest-first so the most recent decision-effecting event sits
-  // at the top. Each line: actor + when + decision + reason. The block
-  // is rendered as its own outlined sub-card so it visually separates
-  // from the original decision narrative.
-  const overrideList = Array.isArray(overrides) ? overrides.filter(Boolean) : [];
-
   return (
     <div className={`${blockClass} ${containerPad}`}>
       <div className={`${headerSize} uppercase tracking-wide text-gray-500 mb-1.5`}>
         Plain-language summary
       </div>
       <p className={`${textSize} text-gray-200 leading-relaxed`}>
-        {sentenceVerdict}{' '}
-        {sentenceDetail && <>{sentenceDetail}{' '}</>}
-        {sentenceCause && <>{sentenceCause}{' '}</>}
-        {sentenceFloor && <>{sentenceFloor}{' '}</>}
+        {leadJsx}
       </p>
-      {sentenceNext && (
-        <p className={`${textSize} text-gray-400 leading-relaxed mt-1.5 italic`}>
-          {sentenceNext}
+      {whyJsx && (
+        <p className={`${textSize} text-gray-200 leading-relaxed mt-2`}>
+          {whyJsx}
+          {supplementJsx}
+        </p>
+      )}
+      {nextJsx && (
+        <p className={`${textSize} text-gray-400 leading-relaxed mt-2 italic`}>
+          {nextJsx}
         </p>
       )}
 

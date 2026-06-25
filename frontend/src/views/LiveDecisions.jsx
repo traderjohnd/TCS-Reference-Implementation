@@ -105,7 +105,11 @@ function TCDetailPanel({ certificateId, onClose }) {
         </div>
 
         {/* ── ② Plain-language summary (with override block if any) ── */}
-        <PlainLanguageExplanation tc={tcData} overrides={overrides} />
+        <PlainLanguageExplanation
+          tc={tcData}
+          prompt={artifact?.prompt || (artifact?.generation_mode === 'human_composed' ? artifact?.raw_output : null)}
+          overrides={overrides}
+        />
 
         {/* ── ③ Collapsible technical sections ─────────────────────── */}
         <div className="border border-gray-800 rounded-lg">

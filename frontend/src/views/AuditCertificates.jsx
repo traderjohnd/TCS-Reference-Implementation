@@ -583,7 +583,11 @@ export default function AuditCertificates() {
                 </div>
 
                 {/* ── ② Plain-language summary ─────────────────────────── */}
-                <PlainLanguageExplanation tc={tcDetail} overrides={tcOverrides} />
+                <PlainLanguageExplanation
+                  tc={tcDetail}
+                  prompt={tcArtifact?.prompt || (tcArtifact?.generation_mode === 'human_composed' ? tcArtifact?.raw_output : null)}
+                  overrides={tcOverrides}
+                />
 
                 {/* ── ③ Collapsible technical detail ───────────────────── */}
                 <div className="border border-gray-800 rounded">
