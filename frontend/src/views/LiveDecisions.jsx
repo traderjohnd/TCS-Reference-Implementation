@@ -3,6 +3,22 @@ import { usePolling, apiFetch, apiPost } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
 import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
 
+// Canonical BACK dimension order — used to reorder dim-keyed dicts
+// (component_scores, component_weights, gate_results, thresholds) so
+// they render in BACK sequence regardless of backend JSON serialization.
+const BACK_ORDER = ['B', 'A', 'C', 'K'];
+function reorderBack(dict) {
+  if (!dict || typeof dict !== 'object') return dict;
+  const out = {};
+  for (const k of BACK_ORDER) {
+    if (k in dict) out[k] = dict[k];
+  }
+  for (const k of Object.keys(dict)) {
+    if (!BACK_ORDER.includes(k)) out[k] = dict[k];
+  }
+  return out;
+}
+
 function TCDetailPanel({ certificateId, onClose }) {
   const [tcData, setTcData] = useState(null);
   const [loadingTc, setLoadingTc] = useState(true);
@@ -58,8 +74,8 @@ function TCDetailPanel({ certificateId, onClose }) {
   const sections = [
     { title: 'Identity', fields: ['certificate_id', 'subject_id', 'subject_type', 'domain', 'risk_tier', 'action_class', 'policy_set_id'] },
     { title: 'Score', fields: ['s_base', 's_adjusted', 'tis_raw', 'tis_adjusted', 'tis_current', 'penalty_aggregate'] },
-    { title: 'Components', data: tcData.component_scores },
-    { title: 'Gate Results', data: tcData.gate_results },
+    { title: 'Components', data: reorderBack(tcData.component_scores) },
+    { title: 'Gate Results', data: reorderBack(tcData.gate_results) },
     { title: 'Decision', fields: ['decision', 'requires_human_review', 'blocking_reason'] },
     { title: 'Provenance', fields: ['source_references', 'integration_boundary_gaps'] },
     { title: 'Temporal', fields: ['evaluation_timestamp', 'valid_until', 'decay_rate', 'invalidation_status'] },

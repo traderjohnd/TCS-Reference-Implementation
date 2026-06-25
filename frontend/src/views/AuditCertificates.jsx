@@ -3,6 +3,34 @@ import { useApi, apiFetch, usePolling } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
 import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
 
+// Canonical BACK dimension order. Any dimension-keyed dict surfaced in
+// the Decision Summary technical sections is reordered to this sequence
+// so the display matches the spec (Boundedness, Attribution, Compliance,
+// Known) regardless of the backend's JSON serialization order.
+const BACK_ORDER = ['B', 'A', 'C', 'K'];
+function reorderBack(dict) {
+  if (!dict || typeof dict !== 'object') return dict;
+  const out = {};
+  for (const k of BACK_ORDER) {
+    if (k in dict) out[k] = dict[k];
+  }
+  // Preserve any non-BACK keys at the end (defensive — current TCs
+  // don't include extra keys but the dataclass schema doesn't forbid
+  // them).
+  for (const k of Object.keys(dict)) {
+    if (!BACK_ORDER.includes(k)) out[k] = dict[k];
+  }
+  return out;
+}
+// Keys in the TC dict whose values are BACK-dimension dicts and should
+// render in canonical BACK order.
+const BACK_KEYED_TC_FIELDS = new Set([
+  'component_scores',
+  'component_weights',
+  'gate_results',
+  'thresholds',
+]);
+
 // ─── GovernanceRuleMatches panel ────────────────────────────────────────────
 //
 // Surfaces the governance_rule_matches block from the Trust Certificate so
@@ -628,7 +656,13 @@ export default function AuditCertificates() {
                             </dl>
                           ) : key && tcDetail[key] ? (
                             <pre className="text-xs text-gray-400 font-mono overflow-x-auto">
-                              {JSON.stringify(tcDetail[key], null, 2)}
+                              {JSON.stringify(
+                                BACK_KEYED_TC_FIELDS.has(key)
+                                  ? reorderBack(tcDetail[key])
+                                  : tcDetail[key],
+                                null,
+                                2,
+                              )}
                             </pre>
                           ) : (
                             <span className="text-xs text-gray-600">N/A</span>
