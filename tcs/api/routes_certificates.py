@@ -116,6 +116,130 @@ def chain_summary(
 
 
 # --------------------------------------------------------------------------- #
+# Chain walk — full audit walk-through                                         #
+# --------------------------------------------------------------------------- #
+
+@router.get("/certificates/chain/{chain_id}/walk")
+def chain_walk(
+    chain_id: str,
+    request: Request,
+) -> Dict[str, Any]:
+    """
+    Return the ordered list of TCs in a chain with per-row integrity
+    checks, suitable for an examiner-grade hash-chain walk-through.
+
+    For each TC (ordered by chain_sequence ASC) the response includes:
+
+      certificate_id       — UUID of this TC
+      decision             — Allow / Hold / Stop / etc.
+      evaluation_timestamp — ISO-8601 UTC
+      lifecycle_state      — admissible / computed / blocked / observed / ...
+      chain_sequence       — 1, 2, 3, ...
+      tc_hash              — stored SHA-256 hash of the TC content
+      previous_tc_hash     — stored hash of the prior TC in the chain
+                              (null for chain_sequence==1)
+      content_hash_ok      — True iff recompute(tc_dict) == stored tc_hash
+                              (proves the TC content hasn't been altered)
+      linkage_ok           — True iff previous_tc_hash matches the prior
+                              TC's tc_hash (proves no row was inserted,
+                              removed, or reordered)
+      sequence_ok          — True iff chain_sequence == expected (proves
+                              no row was dropped)
+
+    Top-level fields:
+
+      chain_id             — echoed for convenience
+      count                — number of TCs in the chain
+      chain_intact         — True iff every per-row check passes; equivalent
+                              to ``CertificateStore.verify_chain(chain_id)``
+                              but with the per-row evidence exposed so the
+                              UI can show WHICH row failed.
+
+    Returns 200 with ``count = 0`` and an empty list for an unknown
+    chain (matches the idiom used elsewhere — we don't 404 on absence
+    of evidence because that conflates "chain is empty" with "chain
+    doesn't exist", and the existing chain_id selector only offers
+    chains that do exist).
+    """
+    from tcs.trust_certificate import compute_tc_hash
+
+    store = request.app.state.store
+    tcs = store.list_chain(chain_id)
+    if not tcs:
+        return {
+            "chain_id": chain_id,
+            "count": 0,
+            "chain_intact": True,   # vacuously true; matches verify_chain
+            "rows": [],
+        }
+
+    rows = []
+    prev_hash: Optional[str] = None
+    expected_seq = 1
+    chain_intact = True
+    for tc in tcs:
+        ai = tc.audit_integrity
+        if ai is None:
+            # No audit layer at all — every check fails for this row.
+            rows.append({
+                "certificate_id":       tc.certificate_id,
+                "decision":             tc.decision,
+                "evaluation_timestamp": tc.evaluation_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "lifecycle_state":      tc.lifecycle_state,
+                "chain_sequence":       None,
+                "tc_hash":              None,
+                "previous_tc_hash":     None,
+                "content_hash_ok":      False,
+                "linkage_ok":           False,
+                "sequence_ok":          False,
+            })
+            chain_intact = False
+            continue
+
+        # (a) content hash stable under recompute
+        recomputed = compute_tc_hash(tc.to_dict())
+        content_hash_ok = (recomputed == ai.tc_hash)
+
+        # (b) previous_tc_hash linkage
+        if expected_seq == 1:
+            linkage_ok = (ai.previous_tc_hash is None)
+        else:
+            linkage_ok = (ai.previous_tc_hash == prev_hash)
+
+        # (c) monotonic sequence
+        sequence_ok = (ai.chain_sequence == expected_seq)
+
+        rows.append({
+            "certificate_id":       tc.certificate_id,
+            "decision":             tc.decision,
+            "evaluation_timestamp": tc.evaluation_timestamp.strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "lifecycle_state":      tc.lifecycle_state,
+            "chain_sequence":       ai.chain_sequence,
+            "tc_hash":              ai.tc_hash,
+            "previous_tc_hash":     ai.previous_tc_hash,
+            "content_hash_ok":      content_hash_ok,
+            "linkage_ok":           linkage_ok,
+            "sequence_ok":          sequence_ok,
+        })
+        if not (content_hash_ok and linkage_ok and sequence_ok):
+            chain_intact = False
+
+        prev_hash = ai.tc_hash
+        expected_seq += 1
+
+    return {
+        "chain_id":     chain_id,
+        "count":        len(rows),
+        "chain_intact": chain_intact,
+        "rows":         rows,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Single TC by id                                                              #
 # --------------------------------------------------------------------------- #
 

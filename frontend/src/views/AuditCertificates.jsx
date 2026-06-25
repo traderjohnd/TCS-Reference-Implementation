@@ -31,6 +31,22 @@ const BACK_KEYED_TC_FIELDS = new Set([
   'thresholds',
 ]);
 
+// Tiny pill used by the Hash Chain Walk to show per-row integrity
+// outcomes (content hash, linkage, sequence). Green check for true,
+// red cross for false. Pure presentation.
+function Check({ label, ok }) {
+  return (
+    <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 border ${
+      ok
+        ? 'border-green-800 bg-green-900/30 text-green-300'
+        : 'border-red-800 bg-red-900/30 text-red-300'
+    }`}>
+      <span className="font-mono">{ok ? '✓' : '✗'}</span>
+      <span>{label}</span>
+    </span>
+  );
+}
+
 // ─── GovernanceRuleMatches panel ────────────────────────────────────────────
 //
 // Surfaces the governance_rule_matches block from the Trust Certificate so
@@ -317,6 +333,10 @@ export default function AuditCertificates() {
   const [chainSummary, setChainSummary] = useState(null);
   const [chainVerifyResult, setChainVerifyResult] = useState(null);
   const [loadingChain, setLoadingChain] = useState(false);
+  // Chain walk-through (examiner-grade hash-chain audit view). Loaded
+  // when a chain is selected in the Chain Explorer.
+  const [chainWalk, setChainWalk] = useState(null);
+  const [loadingChainWalk, setLoadingChainWalk] = useState(false);
   const { data: liveMetrics } = useApi('/metrics/live');
 
   const certs = data?.certificates || [];
@@ -381,7 +401,7 @@ export default function AuditCertificates() {
   const chainIds = liveMetrics?.chain_ids || [];
 
   const loadChainSummary = async (chainId) => {
-    if (!chainId) { setChainSummary(null); return; }
+    if (!chainId) { setChainSummary(null); setChainWalk(null); return; }
     setLoadingChain(true);
     setChainVerifyResult(null);
     try {
@@ -391,6 +411,59 @@ export default function AuditCertificates() {
       setChainSummary(null);
     }
     setLoadingChain(false);
+    // Also fetch the full walk so the examiner-grade hash-chain
+    // panel populates without an extra user click.
+    setLoadingChainWalk(true);
+    try {
+      const walk = await apiFetch(`/certificates/chain/${chainId}/walk`);
+      setChainWalk(walk);
+    } catch {
+      setChainWalk(null);
+    }
+    setLoadingChainWalk(false);
+  };
+
+  const copyWalkJson = async () => {
+    if (!chainWalk) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(chainWalk, null, 2));
+    } catch {
+      // Clipboard API may be unavailable in some browser contexts;
+      // silent failure is fine — the JSON is also visible inline.
+    }
+  };
+
+  const downloadWalkCsv = () => {
+    if (!chainWalk?.rows?.length) return;
+    const header = [
+      'chain_sequence', 'certificate_id', 'decision',
+      'evaluation_timestamp', 'lifecycle_state',
+      'tc_hash', 'previous_tc_hash',
+      'content_hash_ok', 'linkage_ok', 'sequence_ok',
+    ];
+    const lines = [header.join(',')];
+    for (const r of chainWalk.rows) {
+      const cells = header.map((k) => {
+        const v = r[k];
+        if (v === null || v === undefined) return '';
+        const s = String(v);
+        // Escape commas and quotes for CSV safety.
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+          return `"${s.replace(/"/g, '""')}"`;
+        }
+        return s;
+      });
+      lines.push(cells.join(','));
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `chain-${chainWalk.chain_id}-walk.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   const verifySelectedChain = async () => {
@@ -537,6 +610,141 @@ export default function AuditCertificates() {
           </div>
         )}
       </div>
+
+      {/* ── Examiner-grade Hash Chain Walk ─────────────────────────────── */}
+      {selectedChain && (
+        <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
+          <div className="flex items-baseline justify-between mb-3 gap-3 flex-wrap">
+            <div>
+              <h3 className="text-sm font-medium text-gray-300">
+                Hash Chain Walk —{' '}
+                <span className="font-mono text-xs text-gray-500">{selectedChain}</span>
+              </h3>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                Examiner-grade walk-through. Every TC in the chain in
+                sequence, with content-hash, linkage, and sequence
+                integrity checks per row. Read-only.
+              </p>
+            </div>
+            {chainWalk?.rows?.length > 0 && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={copyWalkJson}
+                  className="text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 px-3 py-1.5 rounded"
+                  title="Copy the full walk payload as JSON"
+                >
+                  Copy JSON
+                </button>
+                <button
+                  onClick={downloadWalkCsv}
+                  className="text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 px-3 py-1.5 rounded"
+                  title="Download the walk as CSV for offline audit"
+                >
+                  Download CSV
+                </button>
+              </div>
+            )}
+          </div>
+
+          {loadingChainWalk && (
+            <p className="text-xs text-gray-500 italic">Loading chain walk…</p>
+          )}
+
+          {!loadingChainWalk && chainWalk && chainWalk.count === 0 && (
+            <p className="text-xs text-gray-500 italic">
+              No TCs in this chain.
+            </p>
+          )}
+
+          {!loadingChainWalk && chainWalk && chainWalk.count > 0 && (
+            <>
+              {/* Top-level chain status banner */}
+              <div className={`mb-3 rounded border px-3 py-2 text-sm flex items-center justify-between ${
+                chainWalk.chain_intact
+                  ? 'bg-green-900/20 border-green-800 text-green-300'
+                  : 'bg-red-900/20 border-red-800 text-red-300'
+              }`}>
+                <span>
+                  Chain integrity:{' '}
+                  <span className="font-semibold">
+                    {chainWalk.chain_intact ? 'VERIFIED ✓' : 'BROKEN ✗'}
+                  </span>
+                </span>
+                <span className="text-xs text-gray-400 font-mono">
+                  {chainWalk.count} TC{chainWalk.count === 1 ? '' : 's'}
+                </span>
+              </div>
+
+              {/* Per-TC walk */}
+              <div className="space-y-3">
+                {chainWalk.rows.map((row, idx) => {
+                  const rowOk = row.content_hash_ok && row.linkage_ok && row.sequence_ok;
+                  const isFirst = idx === 0;
+                  return (
+                    <div key={row.certificate_id || idx}>
+                      <div className={`border rounded p-3 ${
+                        rowOk
+                          ? 'bg-gray-800/40 border-gray-700'
+                          : 'bg-red-900/15 border-red-800'
+                      }`}>
+                        <div className="flex items-baseline justify-between gap-3 flex-wrap mb-2">
+                          <div className="flex items-baseline gap-2">
+                            <span className="text-[11px] uppercase tracking-wide text-gray-500 font-mono">
+                              # {row.chain_sequence ?? '?'}
+                            </span>
+                            <button
+                              onClick={() => viewDetail(row.certificate_id)}
+                              className="text-sm font-mono text-blue-300 hover:text-blue-200 underline-offset-2 hover:underline"
+                              title="Open TC Detail"
+                            >
+                              {(row.certificate_id || '').slice(0, 14)}…
+                            </button>
+                            <StatusBadge decision={row.decision} />
+                          </div>
+                          <div className="text-[11px] text-gray-500 font-mono">
+                            {row.evaluation_timestamp}
+                            {row.lifecycle_state ? <> · {row.lifecycle_state}</> : null}
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
+                          <div>
+                            <div className="text-gray-500">tc_hash</div>
+                            <div className="font-mono text-gray-300 break-all">
+                              {row.tc_hash || '(missing)'}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-gray-500">previous_tc_hash</div>
+                            <div className="font-mono text-gray-300 break-all">
+                              {isFirst
+                                ? <span className="italic text-gray-500">(none — chain start)</span>
+                                : row.previous_tc_hash || '(missing)'}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+                          <Check label="content hash"      ok={row.content_hash_ok} />
+                          <Check label="linkage"           ok={row.linkage_ok} />
+                          <Check label="sequence"          ok={row.sequence_ok} />
+                        </div>
+                      </div>
+
+                      {/* Arrow between rows visualizing the linkage */}
+                      {idx < chainWalk.rows.length - 1 && (
+                        <div className="flex items-center justify-center my-1 text-gray-600 text-xs font-mono">
+                          │ previous_tc_hash ▼
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="flex gap-6">
         <div className={`${selectedTc ? 'w-1/2' : 'w-full'} transition-all`}>
