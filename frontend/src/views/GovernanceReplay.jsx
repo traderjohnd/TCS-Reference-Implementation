@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useApi, apiFetch, apiPost } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
+import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
 
 // =============================================================================
 // Phase 5 Slice 5.6 — Governance Replay + Role-Based Views
@@ -385,7 +386,6 @@ function ArtifactPanel({ artifact, role }) {
 function EvaluationRow({ ev, role }) {
   const ruleMatches = ev.rule_matches || [];
   const tone = DECISION_TONE[ev.decision] || 'text-gray-300';
-  const reason = plainEnglishReason(ev.decision, /* blocking_reason */ null, ruleMatches);
 
   return (
     <div className="border border-gray-800 rounded p-2 bg-gray-800/20">
@@ -420,8 +420,11 @@ function EvaluationRow({ ev, role }) {
         </div>
       </div>
 
-      <div className="text-xs text-gray-300 mt-1.5 leading-snug">
-        {reason}
+      {/* Plain-language summary, inline under the row so a reviewer can
+          read across policies in one scan. compact=true keeps the
+          footprint small inside the comparison list. */}
+      <div className="mt-2">
+        <PlainLanguageExplanation tc={ev} compact />
       </div>
 
       {role !== 'general' && (

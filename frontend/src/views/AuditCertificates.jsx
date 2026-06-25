@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useApi, apiFetch, usePolling } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
+import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
 
 // ─── GovernanceRuleMatches panel ────────────────────────────────────────────
 //
@@ -269,6 +270,14 @@ export default function AuditCertificates() {
   const { data, refetch } = useApi(`/certificates?limit=${limit}`);
   const [selectedTc, setSelectedTc] = useState(null);
   const [tcDetail, setTcDetail] = useState(null);
+  // The TC's linked ResponseArtifact (Phase 5 path). May be null for
+  // TCs issued through the legacy /v2/govern path or for Phase 4 demo
+  // TCs that pre-date the artifact tier. Used to surface the original
+  // prompt above the plain-language summary.
+  const [tcArtifact, setTcArtifact] = useState(null);
+  // Collapsible technical 11-layer dump. Default closed so casual readers
+  // see only the prompt + plain-language summary; auditors expand.
+  const [technicalOpen, setTechnicalOpen] = useState(false);
   const [verifyResult, setVerifyResult] = useState(null);
   const [verifying, setVerifying] = useState(false);
   const [searchId, setSearchId] = useState('');
@@ -285,8 +294,23 @@ export default function AuditCertificates() {
       const tc = await apiFetch(`/certificates/${id}`);
       setTcDetail(tc);
       setSelectedTc(id);
+      setTechnicalOpen(false);
+      // Try to fetch the linked artifact. For Phase 5 TCs issued via
+      // /v2/query, tc.subject_id == artifact.artifact_id. For older
+      // TCs the artifact endpoint will 404 and we leave the prompt
+      // panel showing a "not available" message.
+      setTcArtifact(null);
+      if (tc?.subject_id) {
+        try {
+          const art = await apiFetch(`/artifacts/${tc.subject_id}`);
+          setTcArtifact(art);
+        } catch {
+          setTcArtifact(null);
+        }
+      }
     } catch {
       setTcDetail(null);
+      setTcArtifact(null);
     }
   };
 
@@ -512,40 +536,96 @@ export default function AuditCertificates() {
           <div className="w-1/2">
             <div className="bg-gray-900 rounded-lg border border-gray-800 p-4 sticky top-4">
               <div className="flex justify-between items-center mb-3">
-                <h3 className="text-sm font-medium text-white">TC Detail — All 11 Layers</h3>
-                <button onClick={() => { setSelectedTc(null); setTcDetail(null); }}
+                <div className="flex items-center gap-2">
+                  <StatusBadge decision={tcDetail.decision} />
+                  <h3 className="text-sm font-medium text-white">Decision Summary</h3>
+                </div>
+                <button onClick={() => { setSelectedTc(null); setTcDetail(null); setTcArtifact(null); }}
                   className="text-gray-400 hover:text-white">&times;</button>
               </div>
               <div className="space-y-3 max-h-[75vh] overflow-y-auto">
-                {TC_LAYERS.map(({ title, fields, key }) => (
-                  <div key={title} className="border border-gray-800 rounded p-2">
-                    <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider mb-1">{title}</h4>
-                    {fields ? (
-                      <dl className="space-y-0.5">
-                        {fields.map((f) => (
-                          <div key={f} className="flex justify-between text-xs">
-                            <dt className="text-gray-500">{f}</dt>
-                            <dd className="text-gray-300 font-mono max-w-[55%] text-right truncate">
-                              {typeof tcDetail[f] === 'object' ? JSON.stringify(tcDetail[f]) : String(tcDetail[f] ?? '')}
-                            </dd>
-                          </div>
-                        ))}
-                      </dl>
-                    ) : key && tcDetail[key] ? (
-                      <pre className="text-xs text-gray-400 font-mono overflow-x-auto">
-                        {JSON.stringify(tcDetail[key], null, 2)}
-                      </pre>
-                    ) : (
-                      <span className="text-xs text-gray-600">N/A</span>
-                    )}
+                {/* ── ① What was asked ─────────────────────────────────── */}
+                <div className="bg-gray-900 border border-gray-700 rounded-lg p-3">
+                  <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1.5">
+                    What was asked
                   </div>
-                ))}
-                {/* Governance rule evidence — surfaces the rule layer that
-                    influenced this decision, alongside the standards
-                    composer audit and the rest of the TC layers. */}
-                <GovernanceRuleMatches
-                  matches={tcDetail.governance_rule_matches}
-                />
+                  {tcArtifact?.prompt ? (
+                    <blockquote className="text-sm text-gray-200 italic border-l-2 border-gray-700 pl-3 whitespace-pre-wrap leading-relaxed">
+                      “{tcArtifact.prompt}”
+                    </blockquote>
+                  ) : tcArtifact?.raw_output && tcArtifact?.generation_mode === 'human_composed' ? (
+                    <div>
+                      <div className="text-[10px] text-gray-500 mb-1">Human-composed draft (no prompt)</div>
+                      <blockquote className="text-sm text-gray-200 italic border-l-2 border-gray-700 pl-3 whitespace-pre-wrap leading-relaxed">
+                        “{tcArtifact.raw_output}”
+                      </blockquote>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-gray-500 italic">
+                      Prompt not available — this certificate predates the
+                      artifact tier or was issued through a non-artifact path.
+                    </p>
+                  )}
+                </div>
+
+                {/* ── ② Plain-language summary ─────────────────────────── */}
+                <PlainLanguageExplanation tc={tcDetail} />
+
+                {/* ── ③ Collapsible technical detail ───────────────────── */}
+                <div className="border border-gray-800 rounded">
+                  <button
+                    onClick={() => setTechnicalOpen((v) => !v)}
+                    className="w-full flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-blue-400 hover:bg-gray-800/60 transition-colors"
+                    aria-expanded={technicalOpen}
+                  >
+                    <span>Technical Detail (all 11 layers)</span>
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      className={`w-3 h-3 transition-transform ${technicalOpen ? '' : '-rotate-90'}`}
+                    >
+                      <path
+                        fillRule="evenodd"
+                        d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"
+                        clipRule="evenodd"
+                      />
+                    </svg>
+                  </button>
+                  {technicalOpen && (
+                    <div className="space-y-3 p-2 border-t border-gray-800">
+                      {TC_LAYERS.map(({ title, fields, key }) => (
+                        <div key={title} className="border border-gray-800 rounded p-2">
+                          <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider mb-1">{title}</h4>
+                          {fields ? (
+                            <dl className="space-y-0.5">
+                              {fields.map((f) => (
+                                <div key={f} className="flex justify-between text-xs">
+                                  <dt className="text-gray-500">{f}</dt>
+                                  <dd className="text-gray-300 font-mono max-w-[55%] text-right truncate">
+                                    {typeof tcDetail[f] === 'object' ? JSON.stringify(tcDetail[f]) : String(tcDetail[f] ?? '')}
+                                  </dd>
+                                </div>
+                              ))}
+                            </dl>
+                          ) : key && tcDetail[key] ? (
+                            <pre className="text-xs text-gray-400 font-mono overflow-x-auto">
+                              {JSON.stringify(tcDetail[key], null, 2)}
+                            </pre>
+                          ) : (
+                            <span className="text-xs text-gray-600">N/A</span>
+                          )}
+                        </div>
+                      ))}
+                      {/* Governance rule evidence — surfaces the rule layer that
+                          influenced this decision, alongside the standards
+                          composer audit and the rest of the TC layers. */}
+                      <GovernanceRuleMatches
+                        matches={tcDetail.governance_rule_matches}
+                      />
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           </div>
