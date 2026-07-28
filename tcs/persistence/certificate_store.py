@@ -45,7 +45,12 @@ from typing import Any, Dict, Iterator, List, Optional, Union
 from tcs.trust_certificate import (
     AuditIntegrity,
     TrustCertificate,
+    compute_legacy_raw_tc_hash,
     compute_tc_hash,
+)
+from tcs.canonical import (
+    CertificateInvariantError,
+    UnsupportedCertificateSchemaVersion,
 )
 from tcs.persistence.db import (
     AppendOnlyViolation,
@@ -587,44 +592,74 @@ class CertificateStore:
         """
         Walk the chain and verify:
 
-            a. each stored tc_hash equals compute_tc_hash(stored content)
+            a. each stored tc_hash equals the hash of the RAW persisted
+               content (verified from the original stored dictionary,
+               BEFORE rehydration — a field injected into stored
+               content_json changes the payload and fails here, where
+               rehydrate-then-recompute would silently drop it)
             b. each previous_tc_hash equals the prior row's tc_hash
             c. chain_sequence is 1, 2, 3, ... with no gaps
 
         Returns True only if all three conditions hold for every TC in
         the chain. Returns True on an empty chain (nothing to verify).
+
+        Stored content carrying ``certificate_schema_version`` does not
+        match the historical v1 wire shape and fails verification (v2
+        raw verification lands with the v2 wire format in Commit 4+).
         """
-        tcs = self.list_chain(chain_id)
-        if not tcs:
+        raws = self._list_chain_raw(chain_id)
+        if not raws:
             return True
 
         prev_hash: Optional[str] = None
         expected_seq = 1
-        for tc in tcs:
-            ai = tc.audit_integrity
-            if ai is None:
+        for raw in raws:
+            ai = raw.get("audit_integrity")
+            if not ai:
                 return False
 
-            # (a) content hash stable under recompute
-            if compute_tc_hash(tc.to_dict()) != ai.tc_hash:
+            # (a) content hash verified from the raw persisted dict
+            try:
+                recomputed = compute_legacy_raw_tc_hash(raw)
+            except (CertificateInvariantError,
+                    UnsupportedCertificateSchemaVersion):
+                return False
+            if recomputed != ai.get("tc_hash"):
                 return False
 
             # (b) previous_tc_hash linkage
             if expected_seq == 1:
-                if ai.previous_tc_hash is not None:
+                if ai.get("previous_tc_hash") is not None:
                     return False
             else:
-                if ai.previous_tc_hash != prev_hash:
+                if ai.get("previous_tc_hash") != prev_hash:
                     return False
 
             # (c) monotonic sequence
-            if ai.chain_sequence != expected_seq:
+            if ai.get("chain_sequence") != expected_seq:
                 return False
 
-            prev_hash = ai.tc_hash
+            prev_hash = ai.get("tc_hash")
             expected_seq += 1
 
         return True
+
+    def _list_chain_raw(self, chain_id: str) -> List[Dict[str, Any]]:
+        """
+        Return every stored content dict in a chain, ordered by
+        chain_sequence, parsed from content_json WITHOUT rehydration.
+
+        Internal-only: exists to support integrity verification against
+        the original persisted representation. Raw certificate contents
+        must never be exposed through an API response.
+        """
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT content_json FROM trust_certificates "
+                "WHERE chain_id = ? ORDER BY chain_sequence ASC",
+                (chain_id,),
+            ).fetchall()
+        return [json.loads(r["content_json"]) for r in rows]
 
     # ---- Internal helpers ----------------------------------------------- #
 
@@ -840,8 +875,32 @@ def _tc_from_json(content_json: str) -> TrustCertificate:
     This round-trip fidelity is sufficient for:
         - verify_chain() (needs audit_integrity + content hash)
         - get() returning a TC that to_dict() reproduces identically
+
+    Schema-version dispatch (tis-v2 Commit 3): absence of
+    ``certificate_schema_version`` means v1 — never a model default.
+    Explicit integer 1 is accepted as internal dispatch metadata and
+    deliberately stripped before the legacy constructor (the current
+    dataclass carries no such field; Commit 4 adds it for v2). Version
+    2 fails closed until Commit 4 lands v2 deserialization. Anything
+    else is unsupported.
     """
     d = json.loads(content_json)
+
+    if "certificate_schema_version" in d:
+        version = d.pop("certificate_schema_version")
+        if isinstance(version, bool) or not isinstance(version, int) \
+                or version not in (1, 2):
+            raise UnsupportedCertificateSchemaVersion(
+                f"certificate_schema_version must be int 1 or 2, "
+                f"got {version!r}"
+            )
+        if version == 2:
+            raise UnsupportedCertificateSchemaVersion(
+                "certificate_schema_version=2: v2 certificate "
+                "deserialization lands in Commit 4; failing closed"
+            )
+        # version == 1: dispatch metadata only — continue on the
+        # legacy path with the key stripped.
 
     return TrustCertificate(
         # Identity

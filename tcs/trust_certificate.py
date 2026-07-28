@@ -46,6 +46,13 @@ from typing import Any, Dict, List, Optional
 from tcs.policy_profiles import PolicyProfile
 from tcs.tis_engine import TISInput, TISResult
 
+# tis-v2 Commit 3 — schema-version dispatch exceptions live in the
+# canonical numerical module (added in Commit 1).
+from tcs.canonical import (
+    CertificateInvariantError,
+    UnsupportedCertificateSchemaVersion,
+)
+
 
 # --------------------------------------------------------------------------- #
 # Constants and mappings                                                       #
@@ -233,30 +240,192 @@ class OverrideRecord:
 
 
 # --------------------------------------------------------------------------- #
-# Hash chain helper                                                            #
+# Hash chain helpers — frozen v1 contract + schema-version dispatch            #
+# (tis-v2 Commit 3)                                                            #
 # --------------------------------------------------------------------------- #
+#
+# Two DISTINCT version-1 behaviors, deliberately not conflated:
+#
+#   Raw stored-v1 verification
+#       A stored legacy record is hash-verified from its original
+#       persisted dictionary BEFORE rehydration or conversion, via
+#       ``build_legacy_raw_hash_payload``. Absence of
+#       ``certificate_schema_version`` IS the historical wire contract;
+#       a raw dictionary carrying the key is rejected as not matching
+#       the historical v1 wire shape, and any other injected field
+#       changes the payload and fails verification. Nothing is silently
+#       ignored, and no second accepted stored-v1 wire representation
+#       exists.
+#
+#   Post-rehydration v1 reconstruction
+#       A rehydrated / in-memory v1 certificate is serialized and hashed
+#       via ``build_v1_hash_payload``, which projects the dict onto the
+#       FROZEN historical field set below. Explicit integer
+#       ``certificate_schema_version = 1`` is permitted on internal
+#       representations as dispatch metadata and is excluded from the
+#       projection — it never becomes a newly hashed historical field.
+#       Commit 4 may add model and serialization fields; the projection
+#       guarantees they cannot leak into the historical v1 payload, so
+#       neither the allowlist nor its tests ever need amendment.
+
+#: The frozen historical v1 top-level field set. Captured from the
+#: 249 stored certificates across data/tcs.db and the 2026-06-25
+#: archive — every stored record carries EXACTLY these 75 keys plus
+#: ``audit_integrity`` (which the hash excludes). This is a permanent
+#: historical contract: it is written as a literal, never computed from
+#: the live dataclass, and MUST NOT change when Commit 4+ adds fields.
+V1_REQUIRED_HASH_FIELDS = frozenset({
+    "action_class", "archived", "audit_log_id", "blocking_reason",
+    "certificate_id", "chain_depth", "chain_of_custody_id",
+    "chain_u_scores", "checkpoint_id", "compensation_scope",
+    "component_scores", "component_weights", "composer_metadata",
+    "connection_type", "connection_type_modifier_id", "decay_rate",
+    "decision", "domain", "enhanced_logging", "escalation_routed_to",
+    "evaluation_timestamp", "explanation_summary",
+    "failing_dimension_subfactors", "failure_mode", "gate_passed",
+    "gate_results", "gate_set", "gca_context_id",
+    "governance_rule_matches", "governance_status", "identity_binding",
+    "incident_id", "integration_boundary_gaps", "invalidation_status",
+    "invalidation_triggers", "key_concerns", "key_factors",
+    "last_invalidation_event", "lifecycle_state", "mcp_server_id",
+    "override_record", "penalty_aggregate", "penalty_breakdown",
+    "policy_set_id", "policy_severity", "proximity_to_threshold",
+    "qualified_decision", "reason_code", "recompute_required",
+    "recomputed_from_certificate_id", "recovery_mode_activated",
+    "redacted_fields", "redaction_applied", "redaction_scope",
+    "regulatory_explanation_level", "regulatory_mapping",
+    "requires_human_review", "resolved_policy_profile_id",
+    "retrieval_ids", "risk_tier", "s_adjusted", "s_base",
+    "scope_attestation", "source_references",
+    "state_transition_history", "step_up_completed",
+    "step_up_required", "subject_id", "subject_type",
+    "superseded_by_certificate_id", "thresholds", "tis_adjusted",
+    "tis_current", "tis_raw", "valid_until",
+})
+
+#: Historically, no stored v1 record omits any top-level key — the
+#: optional set is empty and stays empty permanently. It exists as a
+#: named contract slot so the required/optional split is explicit.
+V1_OPTIONAL_HASH_FIELDS = frozenset()
+
+V1_HASH_FIELD_SET = V1_REQUIRED_HASH_FIELDS | V1_OPTIONAL_HASH_FIELDS
+
+
+def _canonical_json_bytes(content: Dict[str, Any]) -> bytes:
+    """The historical canonical JSON encoding — frozen.
+
+    ``sort_keys=True`` so key order does not affect the hash;
+    ``separators=(",", ":")`` to eliminate whitespace variance;
+    UTF-8 encoding. Non-JSON-serializable values raise TypeError,
+    which is correct — such content would fail round-trip anyway.
+    """
+    return json.dumps(
+        content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def build_legacy_raw_hash_payload(raw_dict: Dict[str, Any]) -> bytes:
+    """Raw stored-v1 verification payload — FROZEN historical behavior.
+
+    Input is the dictionary parsed directly from persisted
+    ``content_json``, before any rehydration or conversion. Removes only
+    ``audit_integrity`` and hashes everything else exactly as stored —
+    original keys, values, representations, and omission state. A field
+    injected into raw persisted content changes the payload and fails
+    verification; it is never silently ignored.
+
+    A raw dictionary carrying ``certificate_schema_version`` does not
+    match the historical v1 wire shape (no stored legacy record has the
+    key) and is rejected. Explicit version 1 is an internal dispatch
+    classification only — see ``build_v1_hash_payload``.
+    """
+    if "certificate_schema_version" in raw_dict:
+        raise CertificateInvariantError(
+            "raw legacy v1 content must not carry "
+            "certificate_schema_version; absence is the historical "
+            "wire contract"
+        )
+    content = {k: v for k, v in raw_dict.items() if k != "audit_integrity"}
+    return _canonical_json_bytes(content)
+
+
+def compute_legacy_raw_tc_hash(raw_dict: Dict[str, Any]) -> str:
+    """SHA-256 hex digest of the raw stored-v1 payload."""
+    return hashlib.sha256(build_legacy_raw_hash_payload(raw_dict)).hexdigest()
+
+
+def build_v1_hash_payload(serialized: Dict[str, Any]) -> bytes:
+    """Post-rehydration v1 reconstruction payload — FROZEN projection.
+
+    Projects a serialized model dict onto ``V1_HASH_FIELD_SET``,
+    preserving presence/absence (a key absent from the input stays
+    absent — no defaults are injected). ``audit_integrity``,
+    ``certificate_schema_version``, and every v2-only field added by
+    Commit 4 and later are excluded by construction, without depending
+    on any ``to_dict()`` caller remembering to omit them.
+    """
+    content = {
+        k: v for k, v in serialized.items() if k in V1_HASH_FIELD_SET
+    }
+    return _canonical_json_bytes(content)
+
+
+def classify_certificate_schema_version(tc_dict: Dict[str, Any]) -> int:
+    """Classify a serialized certificate's schema version.
+
+    Absence of ``certificate_schema_version`` means v1 — NEVER a model
+    default. When present, the value must be exactly the integer 1 or 2:
+    bool is rejected (it is an int subclass), and no ``int(...)``
+    coercion is applied. Anything else fails closed.
+    """
+    version = tc_dict.get("certificate_schema_version", 1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise UnsupportedCertificateSchemaVersion(
+            f"certificate_schema_version must be int 1 or 2, "
+            f"got {version!r}"
+        )
+    if version not in (1, 2):
+        raise UnsupportedCertificateSchemaVersion(version)
+    return version
+
+
+def build_hash_payload(tc_dict: Dict[str, Any]) -> bytes:
+    """Version-dispatched hash payload for serialized model content.
+
+    v1 (absent key, or explicit internal 1) routes to the frozen v1
+    reconstruction projection. v2 fails closed here — the v2 payload
+    builder lands in Commit 4 atomically with the v2 certificate
+    fields, so a v2 hash request before then is unsupported by design.
+    """
+    version = classify_certificate_schema_version(tc_dict)
+    if version == 1:
+        return build_v1_hash_payload(tc_dict)
+    raise UnsupportedCertificateSchemaVersion(
+        "certificate_schema_version=2: v2 hash payload construction "
+        "lands in Commit 4; failing closed"
+    )
+
 
 def compute_tc_hash(tc_dict: Dict[str, Any]) -> str:
     """
-    Compute the SHA-256 hash of a TC's content, excluding the audit layer.
+    Compute the SHA-256 hash of a TC's serialized content.
 
-    The hash covers every serialized field *except* ``audit_integrity``
-    itself — that layer would otherwise have to reference its own hash,
-    which is a chicken-and-egg problem. Excluding it also lets the hash
-    carry forward unchanged when we later add chain bookkeeping.
+    The payload is version-dispatched via ``build_hash_payload``: for
+    every v1 certificate this is byte-identical to the historical
+    algorithm (drop ``audit_integrity``, canonical JSON, SHA-256) —
+    proven by the stored-legacy fixture tests — and a v2-marked dict
+    fails closed until Commit 4 lands the v2 payload builder.
 
-    Canonicalization rules (critical for reproducible hashing):
-        - ``sort_keys=True`` so key order does not affect the hash
-        - ``separators=(",", ":")`` to eliminate whitespace variance
-        - UTF-8 encoding before hashing
+    The hash excludes ``audit_integrity`` because that layer would
+    otherwise have to reference its own hash, and excluding it lets the
+    hash carry forward unchanged through chain bookkeeping.
 
-    Passing any non-JSON-serializable value in ``tc_dict`` will raise
-    TypeError here, which is the correct behavior — the TC would fail
-    JSON round-trip anyway.
+    NOTE: verification of RAW PERSISTED legacy content must use
+    ``compute_legacy_raw_tc_hash`` (before rehydration), not this
+    function — the reconstruction projection would silently drop a
+    field injected into stored content, whereas the raw path detects it.
     """
-    content = {k: v for k, v in tc_dict.items() if k != "audit_integrity"}
-    canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(build_hash_payload(tc_dict)).hexdigest()
 
 
 def verify_chain(tcs: List["TrustCertificate"]) -> bool:

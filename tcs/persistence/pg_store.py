@@ -40,12 +40,17 @@ from psycopg.rows import dict_row
 from tcs.trust_certificate import (
     AuditIntegrity,
     TrustCertificate,
+    compute_legacy_raw_tc_hash,
     compute_tc_hash,
 )
 from tcs.persistence.certificate_store import (
     ChainSequenceError,
     CertificateNotFoundError,
     _tc_from_json,
+)
+from tcs.canonical import (
+    CertificateInvariantError,
+    UnsupportedCertificateSchemaVersion,
 )
 
 
@@ -407,29 +412,49 @@ class PostgresCertificateStore:
     # ---- Verification ------------------------------------------------------ #
 
     def verify_chain(self, chain_id: str) -> bool:
-        tcs = self.list_chain(chain_id)
-        if not tcs:
+        # Content hashes are verified from the RAW persisted dictionary,
+        # before rehydration — same contract as the SQLite store (a field
+        # injected into stored content fails verification instead of
+        # being silently dropped by rehydration).
+        raws = self._list_chain_raw(chain_id)
+        if not raws:
             return True
 
         prev_hash: Optional[str] = None
         expected_seq = 1
-        for tc in tcs:
-            ai = tc.audit_integrity
-            if ai is None:
+        for raw in raws:
+            ai = raw.get("audit_integrity")
+            if not ai:
                 return False
-            if compute_tc_hash(tc.to_dict()) != ai.tc_hash:
+            try:
+                recomputed = compute_legacy_raw_tc_hash(raw)
+            except (CertificateInvariantError,
+                    UnsupportedCertificateSchemaVersion):
+                return False
+            if recomputed != ai.get("tc_hash"):
                 return False
             if expected_seq == 1:
-                if ai.previous_tc_hash is not None:
+                if ai.get("previous_tc_hash") is not None:
                     return False
             else:
-                if ai.previous_tc_hash != prev_hash:
+                if ai.get("previous_tc_hash") != prev_hash:
                     return False
-            if ai.chain_sequence != expected_seq:
+            if ai.get("chain_sequence") != expected_seq:
                 return False
-            prev_hash = ai.tc_hash
+            prev_hash = ai.get("tc_hash")
             expected_seq += 1
         return True
+
+    def _list_chain_raw(self, chain_id: str) -> List[Dict[str, Any]]:
+        """Internal-only raw content dicts for a chain, ordered by
+        chain_sequence — supports integrity verification before
+        rehydration. Never expose through an API response."""
+        rows = self._conn.execute(
+            "SELECT content_json FROM trust_certificates "
+            "WHERE chain_id = %s ORDER BY chain_sequence ASC",
+            (chain_id,),
+        ).fetchall()
+        return [json.loads(r["content_json"]) for r in rows]
 
     # ---- Internal helpers -------------------------------------------------- #
 

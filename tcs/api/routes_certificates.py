@@ -161,10 +161,22 @@ def chain_walk(
     doesn't exist", and the existing chain_id selector only offers
     chains that do exist).
     """
-    from tcs.trust_certificate import compute_tc_hash
+    from tcs.canonical import (
+        CertificateInvariantError,
+        UnsupportedCertificateSchemaVersion,
+    )
+    from tcs.trust_certificate import compute_legacy_raw_tc_hash
 
     store = request.app.state.store
     tcs = store.list_chain(chain_id)
+    # Content hashes are verified against the RAW persisted dictionaries
+    # (before rehydration), keyed by certificate_id. The raw contents are
+    # used ONLY for hash recomputation and are never exposed in the
+    # response — display fields come from the rehydrated TCs below.
+    raw_by_id = {
+        raw.get("certificate_id"): raw
+        for raw in store._list_chain_raw(chain_id)
+    }
     if not tcs:
         return {
             "chain_id": chain_id,
@@ -198,9 +210,18 @@ def chain_walk(
             chain_intact = False
             continue
 
-        # (a) content hash stable under recompute
-        recomputed = compute_tc_hash(tc.to_dict())
-        content_hash_ok = (recomputed == ai.tc_hash)
+        # (a) content hash verified from the raw persisted dict
+        raw = raw_by_id.get(tc.certificate_id)
+        if raw is None:
+            content_hash_ok = False
+        else:
+            try:
+                content_hash_ok = (
+                    compute_legacy_raw_tc_hash(raw) == ai.tc_hash
+                )
+            except (CertificateInvariantError,
+                    UnsupportedCertificateSchemaVersion):
+                content_hash_ok = False
 
         # (b) previous_tc_hash linkage
         if expected_seq == 1:
