@@ -52,7 +52,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, localcontext
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from tcs.canonical import TIS_DECIMAL_CONTEXT
 
 from tcs.adapters.rag_adapter import InterceptedRequest
 from tcs.decision_engine import map_decision
@@ -132,45 +135,78 @@ def default_scoring_policy(
     ``A_score``, ``C_score`` or ``K_score`` in context_metadata. The
     Phase 2 demo uses that to exercise specific outcomes.
     """
-    # Start with baselines
-    b = float(context.get("B_score", 0.94))
-    a = float(context.get("A_score", 0.94))
-    c = float(context.get("C_score", 0.92))
-    k = float(context.get("K_score", 0.88))
+    # Decimal-native derivation (tis-v2 Commit 5a): every governed value
+    # is Decimal from its source — override channels (governed_metadata)
+    # must supply Decimal or decimal strings; binary floats are rejected
+    # so the raw-evidence tier cannot inherit a float ancestor.
+    def _dec(value: Any, name: str) -> Decimal:
+        if isinstance(value, Decimal):
+            return value
+        if isinstance(value, bool) or isinstance(value, float):
+            raise ValueError(
+                f"{name}: governed score overrides must be Decimal or "
+                f"decimal strings, got {type(value).__name__}"
+            )
+        return Decimal(str(value))
 
-    # A: degrade per attribution gap
-    if "A_score" not in context:
-        n_gaps = int(context.get("n_gaps", 0))
-        a = max(0.0, a - 0.04 * n_gaps)
+    b = _dec(context.get("B_score", Decimal("0.94")), "B_score")
+    a = _dec(context.get("A_score", Decimal("0.94")), "A_score")
+    c = _dec(context.get("C_score", Decimal("0.92")), "C_score")
+    k = _dec(context.get("K_score", Decimal("0.88")), "K_score")
 
-    # C: injection / C3 hard zero
-    c3_signal = float(context.get("c3_score_computed", 1.0))
-    injection_detected = bool(context.get("injection_detected", False))
-    if "C_score" not in context:
-        if injection_detected or c3_signal == 0.0:
-            c = 0.31
+    with localcontext(TIS_DECIMAL_CONTEXT):
+        # A: degrade per attribution gap
+        if "A_score" not in context:
+            n_gaps = int(context.get("n_gaps", 0))
+            a = max(Decimal("0"), a - Decimal("0.04") * n_gaps)
 
-    # K: chain-aware or adapter-hint path
-    if "K_score" not in context:
-        chain_scores = list(context.get("chain_u_scores") or [])
-        if chain_scores:
-            k = round(compute_chain_uncertainty(chain_scores), 4)
-        else:
-            k_penalty = float(context.get("k_subfactor_penalty", 0.0))
-            k = max(0.0, k - k_penalty)
+        # C: injection / C3 hard zero
+        c3_signal = _dec(
+            context.get("c3_score_computed", Decimal("1")),
+            "c3_score_computed",
+        )
+        injection_detected = bool(context.get("injection_detected", False))
+        if "C_score" not in context:
+            if injection_detected or c3_signal == 0:
+                c = Decimal("0.31")
+
+        # K: chain-aware or adapter-hint path. NOTE: preserves the
+        # existing v1 semantics exactly (the chain branch assigns the
+        # derived chain uncertainty), only in Decimal arithmetic.
+        if "K_score" not in context:
+            chain_scores = [
+                _dec(v, "chain_u_scores")
+                for v in (context.get("chain_u_scores") or [])
+            ]
+            if chain_scores:
+                k_chain_product = Decimal("1")
+                for cs in chain_scores:
+                    k_chain_product *= cs
+                k = (Decimal("1") - k_chain_product).quantize(
+                    Decimal("0.0001"))
+            else:
+                k_penalty = _dec(
+                    context.get("k_subfactor_penalty", Decimal("0")),
+                    "k_subfactor_penalty",
+                )
+                k = max(Decimal("0"), k - k_penalty)
 
     scores = {"B": b, "A": a, "C": c, "K": k}
 
     # Clamp into [0,1] (belt and suspenders — bad inputs should not
     # raise from the TIS engine's input validator at runtime).
-    for k in scores:
-        if scores[k] < 0.0:
-            scores[k] = 0.0
-        elif scores[k] > 1.0:
-            scores[k] = 1.0
+    for dim in scores:
+        if scores[dim] < 0:
+            scores[dim] = Decimal("0")
+        elif scores[dim] > 1:
+            scores[dim] = Decimal("1")
 
-    # C3 sub-factor: 0.0 on injection / explicit hard-zero, 1.0 otherwise
-    sub = {"C": {"C3": 0.0 if (injection_detected or c3_signal == 0.0) else 1.0}}
+    # C3 sub-factor: 0 on injection / explicit hard-zero, 1 otherwise
+    sub = {"C": {"C3": (
+        Decimal("0.0000")
+        if (injection_detected or c3_signal == 0)
+        else Decimal("1.0000")
+    )}}
 
     return scores, sub
 
@@ -259,12 +295,24 @@ class RequestInterceptor:
 
         # Step 3: TIS computation + decision + TC generation
         try:
+            # The scoring policy is Decimal-native (5a). Until Commit 5b
+            # switches this site to compute_tis_v2 / generate_
+            # certificate_v2, the LEGACY engine and v1 wire cannot carry
+            # Decimals, so a float shadow feeds the v1 pipeline. The
+            # shadow (and the float() on elapsed_hours) is REMOVED by
+            # the 5b activation diff; the Decimal originals then flow
+            # through unconverted and become component_scores_raw.
             tis_input = TISInput(
                 subject_id=request.subject_id,
                 subject_type=request.subject_type,
                 policy_profile=resolved,
-                dimension_scores=dim_scores,
-                sub_factor_scores=sub_scores,
+                dimension_scores={
+                    d: float(v) for d, v in dim_scores.items()
+                },
+                sub_factor_scores={
+                    dim: {sf: float(v) for sf, v in subs.items()}
+                    for dim, subs in sub_scores.items()
+                },
                 context_metadata=context,
                 elapsed_hours=float(context.get("elapsed_hours", 0.0)),
                 is_valid=int(context.get("is_valid", 1)),
@@ -377,7 +425,10 @@ class RequestInterceptor:
             "is_policy_sensitive": False,
             "blocking_context": "credential_detected",
             "credential_detected": True,
-            "credential_reason": repr(exc),
+            "credential_reason": repr(exc),   # explanatory only, never parsed
+            # Structured provenance (5a): the exception carries the
+            # typed signal; no reason-string parsing anywhere.
+            "c3_signals": [exc.c3_signal()],
         }
         # Carry chain linkage + identity metadata from the original
         # request if present. None values are skipped so the TC

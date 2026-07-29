@@ -76,7 +76,7 @@ def _base_rag_adapter() -> RAGAdapter:
 def _good_chunk(chunk_id: str, sim: float = 0.93) -> RAGChunk:
     return RAGChunk(
         chunk_id=chunk_id,
-        similarity_score=sim,
+        similarity_score=(sim if isinstance(sim, str) else f"{sim:.6f}"),
         source_doc="policy.pdf",
         version="2026-01",
         content="Diversified portfolios match conservative profiles.",
@@ -104,17 +104,17 @@ class TestScenario09AttributionGate:
         out = RAGOutput(
             query="Give a suitability recommendation",
             retrieved_chunks=[
-                RAGChunk(chunk_id="c1", similarity_score=0.89,
+                RAGChunk(chunk_id="c1", similarity_score="0.89",
                          source_doc=None, version=None, content="ok"),
-                RAGChunk(chunk_id="c2", similarity_score=0.87,
+                RAGChunk(chunk_id="c2", similarity_score="0.87",
                          source_doc=None, version=None, content="ok"),
-                RAGChunk(chunk_id="c3", similarity_score=0.91,
+                RAGChunk(chunk_id="c3", similarity_score="0.91",
                          source_doc="policy.pdf", version="2026-01",
                          content="ok"),
             ],
             candidate_answer="Recommend X.",
             subject_id="s9-attribution-gate",
-            extra_metadata={"B_score": 1.00, "C_score": 1.00},
+            governed_metadata={"B_score": "1.00", "C_score": "1.00"},
         )
         req = _ct4_adapter().adapt(out)
         # n_gaps = 2 flows through from the adapter
@@ -157,16 +157,16 @@ class TestScenario10LowSimilarity:
         out = RAGOutput(
             query="Recommend something",
             retrieved_chunks=[
-                RAGChunk(chunk_id="c1", similarity_score=0.55,
+                RAGChunk(chunk_id="c1", similarity_score="0.55",
                          source_doc="policy.pdf", version="2026-01",
                          content="weak match"),
-                RAGChunk(chunk_id="c2", similarity_score=0.52,
+                RAGChunk(chunk_id="c2", similarity_score="0.52",
                          source_doc="policy.pdf", version="2026-01",
                          content="also weak"),
             ],
             candidate_answer="Recommend Y.",
             subject_id="s10-low-sim",
-            extra_metadata={"B_score": 1.00, "C_score": 1.00},
+            governed_metadata={"B_score": "1.00", "C_score": "1.00"},
         )
         req = _ct4_adapter().adapt(out)
         # Adapter surfaces the k penalty signal
@@ -203,7 +203,7 @@ class TestScenario11ResponseInjection:
             retrieved_chunks=[
                 RAGChunk(
                     chunk_id="c-injection",
-                    similarity_score=0.91,
+                    similarity_score="0.91",
                     source_doc="policy.pdf",
                     version="2026-01",
                     content=(
@@ -252,7 +252,7 @@ class TestScenario12CredentialDetected:
             retrieved_chunks=[
                 RAGChunk(
                     chunk_id="c-cred",
-                    similarity_score=0.92,
+                    similarity_score="0.92",
                     source_doc="internal_notes.md",
                     version="2026-02",
                     content="API_KEY=sk-proj-abc123def456ghi789jkl",
@@ -396,7 +396,7 @@ class TestScenario15HashChain:
                 ],
                 candidate_answer=f"Recommend a 60/40 portfolio for client #{i}.",
                 subject_id=f"s15-tc-{i}",
-                extra_metadata={"chain_id": chain_id},
+                governed_metadata={"chain_id": chain_id},
             )
 
         adapter = _ct4_adapter()
@@ -447,17 +447,17 @@ class TestScenario16EnforcementHold:
         out = RAGOutput(
             query="Give a recommendation",
             retrieved_chunks=[
-                RAGChunk(chunk_id="c1", similarity_score=0.89,
+                RAGChunk(chunk_id="c1", similarity_score="0.89",
                          source_doc=None, version=None, content="ok"),
-                RAGChunk(chunk_id="c2", similarity_score=0.87,
+                RAGChunk(chunk_id="c2", similarity_score="0.87",
                          source_doc=None, version=None, content="ok"),
-                RAGChunk(chunk_id="c3", similarity_score=0.91,
+                RAGChunk(chunk_id="c3", similarity_score="0.91",
                          source_doc="policy.pdf", version="2026-01",
                          content="ok"),
             ],
             candidate_answer="Recommend X.",
             subject_id="s16-enforcement-hold",
-            extra_metadata={"B_score": 1.00, "C_score": 1.00},
+            governed_metadata={"B_score": "1.00", "C_score": "1.00"},
         )
         req = _ct4_adapter().adapt(out)
         resp = interceptor.govern(req)
@@ -502,14 +502,14 @@ class TestScenario17ChainUncertainty:
             retrieved_chunks=[_good_chunk("c1", 0.95)],
             candidate_answer="Combined recommendation.",
             subject_id="s17-ct8-chain",
-            extra_metadata={
+            governed_metadata={
                 # Explicit CT-8 override — the evaluation comes from an
                 # agent chain, not a RAG retrieval, even though the
                 # request also carries retrieved_chunks for the scorer.
                 # Explicit connection_type wins over retrieved_chunks
                 # in detect_connection_type's priority ladder.
                 "connection_type": "CT-8",
-                "chain_u_scores": [0.88, 0.88, 0.88],
+                "chain_u_scores": ["0.88", "0.88", "0.88"],
             },
         )
         # Use the base r3/a4 profile so CT-8 modifiers apply cleanly

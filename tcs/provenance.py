@@ -114,6 +114,21 @@ INJECTION_PATTERN_IDS_BY_VERSION: Dict[str, Dict[str, str]] = {
     },
 }
 
+#: LLM response-injection substring table (tcs.workflow.connectors.llm
+#: ``_INJECTION_RESPONSE_PATTERNS``) — a third pattern table discovered
+#: during Commit 5a. Same append-only contract as the other two.
+ACTIVE_LLM_RESPONSE_PATTERN_SET_VERSION = "tcs-llm-response-patterns-v1"
+
+LLM_RESPONSE_PATTERN_IDS_BY_VERSION: Dict[str, Dict[str, str]] = {
+    "tcs-llm-response-patterns-v1": {
+        "ignore policy": "llmresp-001-ignore-policy",
+        "override compliance": "llmresp-002-override-compliance",
+        "bypass governance": "llmresp-003-bypass-governance",
+        "ignore the above": "llmresp-004-ignore-the-above",
+        "disregard the rules": "llmresp-005-disregard-the-rules",
+    },
+}
+
 CREDENTIAL_PATTERN_IDS_BY_VERSION: Dict[str, Dict[str, str]] = {
     "tcs-credential-patterns-v1": {
         r"(?i)\b(api[_-]?key|secret|password|token|bearer)\s*[:=]":
@@ -388,18 +403,23 @@ def validate_c3_provenance_record(r: C3ProvenanceRecord) -> None:
             )
 
     if r.source_type == "credential_detection":
-        if not r.pattern_id:
+        # A pattern-matched detection carries the versioned pattern id.
+        # A DECLARED credential context (connection_type=CT-12) has no
+        # matched pattern — it carries a detail code instead (amended
+        # in Commit 5a when the CT-12 declared case was wired).
+        if not (r.pattern_id or r.detail_code):
             raise CertificateInvariantError(
-                "credential_detection requires pattern_id"
+                "credential_detection requires pattern_id or detail_code"
             )
-        mapping = _pattern_ids_for(
-            "credential_detection", r.pattern_set_version
-        )
-        if r.pattern_id not in mapping.values():
-            raise CertificateInvariantError(
-                f"pattern_id {r.pattern_id!r} not in pattern set "
-                f"{r.pattern_set_version!r}"
+        if r.pattern_id:
+            mapping = _pattern_ids_for(
+                "credential_detection", r.pattern_set_version
             )
+            if r.pattern_id not in mapping.values():
+                raise CertificateInvariantError(
+                    f"pattern_id {r.pattern_id!r} not in pattern set "
+                    f"{r.pattern_set_version!r}"
+                )
 
     if r.source_type == "connector_event":
         if not r.connector_type:
@@ -639,8 +659,10 @@ __all__ = [
     "C3_PROVENANCE_SCHEMA_VERSION",
     "ACTIVE_INJECTION_PATTERN_SET_VERSION",
     "ACTIVE_CREDENTIAL_PATTERN_SET_VERSION",
+    "ACTIVE_LLM_RESPONSE_PATTERN_SET_VERSION",
     "INJECTION_PATTERN_IDS_BY_VERSION",
     "CREDENTIAL_PATTERN_IDS_BY_VERSION",
+    "LLM_RESPONSE_PATTERN_IDS_BY_VERSION",
     "C3_SOURCE_TYPES",
     "RULE_EVALUATORS",
     "MatchedTermGroup",

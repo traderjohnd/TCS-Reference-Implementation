@@ -626,6 +626,33 @@ _BACK_DIMENSIONS: FrozenSet[str] = frozenset({"B", "A", "C", "K"})
 
 
 # --------------------------------------------------------------------------- #
+# Legacy float view (tis-v2 Commit 5a — removed by the 5b activation)          #
+# --------------------------------------------------------------------------- #
+
+def legacy_float_input_view(inp: TISInput) -> TISInput:
+    """A float view of a Decimal-native TISInput for the LEGACY v1
+    pipeline (v1 engine + v1 wire cannot carry Decimals).
+
+    Producers became Decimal-native in Commit 5a while production
+    issuance remains on v1; each v1 issuance call site applies this
+    view. The Commit 5b activation diff removes these calls so the
+    Decimal originals flow through and become component_scores_raw.
+    """
+    from dataclasses import replace as _replace
+    return _replace(
+        inp,
+        dimension_scores={
+            k: float(v) for k, v in inp.dimension_scores.items()
+        },
+        sub_factor_scores={
+            dim: {sf: float(v) for sf, v in subs.items()}
+            for dim, subs in (inp.sub_factor_scores or {}).items()
+        },
+        elapsed_hours=float(inp.elapsed_hours),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # v2 identity adjustments                                                      #
 # --------------------------------------------------------------------------- #
 

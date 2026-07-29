@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request
+
+from tcs.trust_certificate import gate_result_of
 from pydantic import BaseModel
 
 
@@ -83,7 +85,7 @@ class QueryResponse(BaseModel):
     tis_current: Optional[float]
     tis_raw: Optional[float]
     s_base: Optional[float] = None
-    gate_passed: Optional[bool] = None
+    gate_result: Optional[int] = None   # 0|1 — single gate vocabulary (5a)
     blocking_reason: Optional[str] = None
     requires_human_review: bool = False
     retrieval_chunks: List[Dict[str, Any]] = []
@@ -655,6 +657,10 @@ def _route_off_topic_via_baseline(
     # composed pack. The active pack is recorded in
     # ``original_active_pack_profile_id`` for audit.
 
+    # Producers are Decimal-native (5a); the legacy float view feeds
+    # the v1 pipeline until the 5b activation removes this call.
+    from tcs.tis_engine import legacy_float_input_view
+    inp = legacy_float_input_view(inp)
     result = compute_tis(inp)
     decision, requires = map_decision(inp, result)
     tc = generate_certificate(inp, result, decision, requires)
@@ -759,7 +765,7 @@ def _route_off_topic_via_baseline(
         tis_current=issued_tc.tis_current,
         tis_raw=issued_tc.tis_raw,
         s_base=issued_tc.s_base,
-        gate_passed=issued_tc.gate_passed,
+        gate_result=gate_result_of(issued_tc),
         blocking_reason=tc.blocking_reason,
         requires_human_review=requires,
         retrieval_chunks=[],  # baseline routing: no chunks delivered to UI
@@ -904,7 +910,7 @@ def _run_query_via_trace(
             certificate_id=None,
             tis_current=None,
             tis_raw=None,
-            gate_passed=None,
+            gate_result=None,
             blocking_reason=f"LLM provider error: {llm_event.error}",
             requires_human_review=False,
             retrieval_chunks=[],
@@ -920,6 +926,10 @@ def _run_query_via_trace(
     # generate_certificate() carries it onto the issued TC.
     if composer_metadata:
         tis_input.context_metadata["composer_metadata"] = dict(composer_metadata)
+    # Producers are Decimal-native (5a); the legacy float view feeds
+    # the v1 pipeline until the 5b activation removes this call.
+    from tcs.tis_engine import legacy_float_input_view
+    tis_input = legacy_float_input_view(tis_input)
     tis_result = compute_tis(tis_input)
     decision, requires_review = map_decision(tis_input, tis_result)
     tc = generate_certificate(tis_input, tis_result, decision, requires_review)
@@ -993,7 +1003,7 @@ def _run_query_via_trace(
         tis_current=issued_tc.tis_current,
         tis_raw=issued_tc.tis_raw,
         s_base=issued_tc.s_base,
-        gate_passed=issued_tc.gate_passed,
+        gate_result=gate_result_of(issued_tc),
         blocking_reason=issued_tc.blocking_reason,
         requires_human_review=requires_review,
         retrieval_chunks=rag_chunks_payload,
@@ -1084,7 +1094,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
             certificate_id=None,
             tis_current=None,
             tis_raw=None,
-            gate_passed=None,
+            gate_result=None,
             blocking_reason=str(e),
             requires_human_review=False,
             retrieval_chunks=[],
@@ -1115,7 +1125,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
                 certificate_id=None,
                 tis_current=None,
                 tis_raw=None,
-                gate_passed=None,
+                gate_result=None,
                 blocking_reason=f"Workflow trace path error: {e}",
                 requires_human_review=False,
                 retrieval_chunks=[],
@@ -1159,7 +1169,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
             certificate_id=None,
             tis_current=None,
             tis_raw=None,
-            gate_passed=None,
+            gate_result=None,
             blocking_reason=f"LLM provider error: {error_msg}",
             requires_human_review=False,
             retrieval_chunks=[],
@@ -1176,7 +1186,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
         certificate_id=result.certificate_id,
         tis_current=result.tis_current,
         tis_raw=result.tis_raw,
-        gate_passed=result.gate_passed,
+        gate_result=result.gate_result,
         blocking_reason=result.blocking_reason,
         requires_human_review=result.requires_human_review,
         retrieval_chunks=result.retrieval_chunks[:5],

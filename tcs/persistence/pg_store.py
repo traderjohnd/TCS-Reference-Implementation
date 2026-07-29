@@ -49,6 +49,7 @@ from tcs.trust_certificate import (
 from tcs.persistence.certificate_store import (
     ChainSequenceError,
     CertificateNotFoundError,
+    IssuanceVersionRegressionError,
     _tc_from_json,
 )
 from tcs.canonical import (
@@ -199,10 +200,18 @@ class PostgresCertificateStore:
 
             issued_tc = dataclass_replace(tc, audit_integrity=new_audit)
             # Sealing boundary (tis-v2 Commit 4) — same explicit contract
-            # as the SQLite store.
+            # as the SQLite store, plus the monotonic issuance floor
+            # (Commit 5a, owner correction 6).
             serialized = issued_tc.to_dict()
-            if classify_certificate_schema_version(serialized) == 2:
+            schema_version = classify_certificate_schema_version(serialized)
+            if schema_version == 2:
                 validate_v2_certificate_for_sealing(serialized)
+            elif self._store_has_v2_certificate(conn):
+                raise IssuanceVersionRegressionError(
+                    "this store has issued schema-v2 certificates; new "
+                    "schema-v1 issuance is rejected (historical v1 "
+                    "records remain readable and verifiable)"
+                )
             final_hash = compute_tc_hash(serialized)
             issued_tc.audit_integrity = AuditIntegrity(
                 tc_hash=final_hash,
@@ -465,6 +474,22 @@ class PostgresCertificateStore:
         return [json.loads(r["content_json"]) for r in rows]
 
     # ---- Internal helpers -------------------------------------------------- #
+
+    def _store_has_v2_certificate(self, conn: psycopg.Connection) -> bool:
+        """Monotonic v2 issuance floor — same contract and rationale as
+        the SQLite store's probe (the version key cannot appear in any
+        v1 wire payload)."""
+        if getattr(self, "_v2_floor_reached", False):
+            return True
+        row = conn.execute(
+            "SELECT 1 FROM trust_certificates "
+            "WHERE content_json LIKE %s LIMIT 1",
+            ('%"certificate_schema_version"%',),
+        ).fetchone()
+        if row is not None:
+            self._v2_floor_reached = True
+            return True
+        return False
 
     def _last_in_chain(
         self, conn: psycopg.Connection, chain_id: str,

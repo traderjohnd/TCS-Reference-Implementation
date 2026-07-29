@@ -135,7 +135,7 @@ class TestCriterion4_WorkflowTraceFiveConnectors:
             def retrieve(self, q, k=5):
                 return [{
                     "chunk_id": "c1", "source_doc": "guideline.md", "version": "2026-01",
-                    "content": "Sample.", "similarity_score": 0.92, "tags": [],
+                    "content": "Sample.", "similarity_score": "0.92", "tags": [],
                 }]
 
         class _StubProvider:

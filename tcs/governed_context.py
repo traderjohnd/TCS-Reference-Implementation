@@ -34,8 +34,10 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, localcontext
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
+from tcs.canonical import TIS_DECIMAL_CONTEXT
 from tcs.policy_profiles import DIMENSIONS, PolicyProfile, load_profile
 
 
@@ -415,9 +417,40 @@ class CredentialDetectedError(RuntimeError):
     TIS engine — the caller catches this and emits a hard Stop TC with
     C3=0.00 via the decision-path sidecar.
 
+    tis-v2 Commit 5a: the exception carries STRUCTURED provenance
+    (pattern id + set version + location, or a detail code for declared
+    CT-12) so the credential-stop handler can build a typed
+    C3ProvenanceRecord without parsing the human-readable message.
+
     See TCS_SPEC.md §18: "CT-12 (credentials) must never reach policy
     resolution."
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        pattern_id: str = "",
+        pattern_set_version: str = "",
+        location_tag: str = "",
+        detail_code: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.pattern_id = pattern_id
+        self.pattern_set_version = pattern_set_version
+        self.location_tag = location_tag
+        self.detail_code = detail_code
+
+    def c3_signal(self) -> Dict[str, str]:
+        """Structured signal for the credential-stop handler's context."""
+        return {
+            "source_type": "credential_detection",
+            "pattern_id": self.pattern_id,
+            "pattern_set_version": self.pattern_set_version,
+            "location_tag": self.location_tag,
+            "connector_type": "",
+            "detail_code": self.detail_code,
+        }
 
 
 #: Regex patterns that trip credential detection. This is intentionally
@@ -600,9 +633,24 @@ def check_response_injection(metadata: Dict[str, Any]) -> Dict[str, Any]:
     Caller is responsible for raising CredentialDetectedError on a
     credential hit — this function is pure classification.
     """
+    from tcs.provenance import (
+        ACTIVE_CREDENTIAL_PATTERN_SET_VERSION,
+        ACTIVE_INJECTION_PATTERN_SET_VERSION,
+        CREDENTIAL_PATTERN_IDS_BY_VERSION,
+        INJECTION_PATTERN_IDS_BY_VERSION,
+    )
+    inj_ids = INJECTION_PATTERN_IDS_BY_VERSION[
+        ACTIVE_INJECTION_PATTERN_SET_VERSION]
+    cred_ids = CREDENTIAL_PATTERN_IDS_BY_VERSION[
+        ACTIVE_CREDENTIAL_PATTERN_SET_VERSION]
+
     chunks = metadata.get("retrieved_chunks") or []
     injection_reason: Optional[str] = None
     credential_reason: Optional[str] = None
+    injection_pattern_id: Optional[str] = None
+    injection_location: Optional[str] = None
+    credential_pattern_id: Optional[str] = None
+    credential_location: Optional[str] = None
 
     for c in chunks:
         text = str(c.get("content") or c.get("text") or "")
@@ -612,12 +660,16 @@ def check_response_injection(metadata: Dict[str, Any]) -> Dict[str, Any]:
                 injection_reason = (
                     f"chunk_id={c.get('chunk_id')}: injection pattern {hit!r}"
                 )
+                injection_pattern_id = inj_ids[hit]
+                injection_location = f"chunk_id={c.get('chunk_id')}"
         if credential_reason is None:
             hit = _scan_for_credentials(text)
             if hit:
                 credential_reason = (
                     f"chunk_id={c.get('chunk_id')}: credential pattern {hit!r}"
                 )
+                credential_pattern_id = cred_ids[hit]
+                credential_location = f"chunk_id={c.get('chunk_id')}"
 
     # Also scan top-level free text if present (e.g. a combined prompt).
     for key in ("prompt", "user_query", "free_text"):
@@ -626,18 +678,39 @@ def check_response_injection(metadata: Dict[str, Any]) -> Dict[str, Any]:
             hit = _scan_for_injection(text)
             if hit:
                 injection_reason = f"{key}: injection pattern {hit!r}"
+                injection_pattern_id = inj_ids[hit]
+                injection_location = key
         if credential_reason is None:
             hit = _scan_for_credentials(text)
             if hit:
                 credential_reason = f"{key}: credential pattern {hit!r}"
+                credential_pattern_id = cred_ids[hit]
+                credential_location = key
 
     any_hit = bool(injection_reason or credential_reason)
+    # tis-v2 Commit 5a: c3_score is canonical Decimal (v1 consumers
+    # coerce via float(); the v2 path stays Decimal-native end to end).
+    # The *_pattern_id / *_location fields are the STRUCTURED provenance
+    # — the human-readable reason strings above are explanatory
+    # metadata only and are never parsed for provenance.
     return {
-        "c3_score": 0.00 if any_hit else 1.00,
+        "c3_score": Decimal("0.0000") if any_hit else Decimal("1.0000"),
         "injection_detected": bool(injection_reason),
         "credential_detected": bool(credential_reason),
         "injection_reason": injection_reason,
         "credential_reason": credential_reason,
+        "injection_pattern_id": injection_pattern_id,
+        "injection_pattern_set_version": (
+            ACTIVE_INJECTION_PATTERN_SET_VERSION
+            if injection_pattern_id else None
+        ),
+        "injection_location": injection_location,
+        "credential_pattern_id": credential_pattern_id,
+        "credential_pattern_set_version": (
+            ACTIVE_CREDENTIAL_PATTERN_SET_VERSION
+            if credential_pattern_id else None
+        ),
+        "credential_location": credential_location,
     }
 
 
@@ -998,11 +1071,17 @@ def assemble_context_v2(
     if injection_report["credential_detected"]:
         raise CredentialDetectedError(
             f"Credential detected in context: "
-            f"{injection_report['credential_reason']}"
+            f"{injection_report['credential_reason']}",
+            pattern_id=injection_report.get("credential_pattern_id") or "",
+            pattern_set_version=(
+                injection_report.get("credential_pattern_set_version") or ""
+            ),
+            location_tag=injection_report.get("credential_location") or "",
         )
     if connection_type == "CT-12":
         raise CredentialDetectedError(
-            "connection_type=CT-12 (credentials) — hard Stop required"
+            "connection_type=CT-12 (credentials) — hard Stop required",
+            detail_code="connection_type_ct12_declared",
         )
 
     # --- Step 3: MCP server identity ------------------------------------ #
@@ -1047,6 +1126,24 @@ def assemble_context_v2(
     ctx["injection_detected"] = injection_report["injection_detected"]
     ctx["injection_reason"] = injection_report["injection_reason"]
     ctx["sensitivity_tier"] = sensitivity_tier
+
+    # Structured C3 signals (tis-v2 Commit 5a): the authoritative
+    # provenance channel — typed dicts, never parsed reason strings.
+    # Pre-existing signals (trusted internal producers, trace path)
+    # are preserved; the injection scan appends its own.
+    c3_signals: List[Dict[str, Any]] = list(meta_in.get("c3_signals") or [])
+    if injection_report["injection_detected"] and \
+            injection_report.get("injection_pattern_id"):
+        c3_signals.append({
+            "source_type": "injection_scan",
+            "pattern_id": injection_report["injection_pattern_id"],
+            "pattern_set_version": injection_report[
+                "injection_pattern_set_version"],
+            "location_tag": injection_report["injection_location"] or "",
+            "connector_type": "",
+            "detail_code": "",
+        })
+    ctx["c3_signals"] = c3_signals
 
     # Governance risk classifier — runs against the user prompt under
     # the active domain. Applies C3 / penalty effects to ctx so the
@@ -1181,7 +1278,8 @@ def _apply_query_risk_classification(
         # prompt_injection_pattern, credential_pattern,
         # unauthorized_scope, safety_envelope_violation).
         if agg.c3_violation:
-            ctx_meta["c3_score_computed"] = 0.0
+            # tis-v2 Commit 5a: canonical Decimal, Decimal-native path.
+            ctx_meta["c3_score_computed"] = Decimal("0.0000")
             ctx_meta["injection_detected"] = True
             cat = agg.primary_safety_category or "prohibited_action"
             reason_tail = agg.blocking_reason or "governance_rule_c3_violation"
@@ -1195,23 +1293,27 @@ def _apply_query_risk_classification(
             ctx_meta["governance_c3_categories"] = list(agg.c3_categories)
             ctx_meta["governance_c3_primary_category"] = agg.primary_c3_category
             if dimension_scores is not None:
-                dimension_scores["C"] = 0.0
+                dimension_scores["C"] = Decimal("0.0000")
         # Numeric penalties subtract from corresponding dim scores
-        # (only when dimension_scores were provided — legacy path
-        # doesn't have them at this stage).
+        # (only when dimension_scores were provided — the trace path,
+        # which is Decimal-native as of 5a). Rule-effect penalty
+        # constants are shipped rule-library literals; Decimal(str(..))
+        # reproduces them exactly.
         if dimension_scores is not None:
-            if agg.boundedness_penalty:
-                dimension_scores["B"] = round(
-                    max(0.0, dimension_scores.get("B", 1.0) - agg.boundedness_penalty), 4
-                )
-            if agg.attribution_penalty:
-                dimension_scores["A"] = round(
-                    max(0.0, dimension_scores.get("A", 1.0) - agg.attribution_penalty), 4
-                )
-            if agg.known_calibration_penalty:
-                dimension_scores["K"] = round(
-                    max(0.0, dimension_scores.get("K", 1.0) - agg.known_calibration_penalty), 4
-                )
+            with localcontext(TIS_DECIMAL_CONTEXT):
+                for dim, pen in (
+                    ("B", agg.boundedness_penalty),
+                    ("A", agg.attribution_penalty),
+                    ("K", agg.known_calibration_penalty),
+                ):
+                    if pen:
+                        current = dimension_scores.get(dim, Decimal("1"))
+                        if not isinstance(current, Decimal):
+                            current = Decimal(str(current))
+                        dimension_scores[dim] = max(
+                            Decimal("0"),
+                            current - Decimal(str(pen)),
+                        ).quantize(Decimal("0.0001"))
         # Novelty + audit fields always go on ctx_meta.
         if agg.novelty_lift:
             ctx_meta["novelty_score"] = round(
@@ -1339,26 +1441,41 @@ def _aggregate_back_scores(events: List[Any]) -> Dict[str, float]:
     signal — propagates the C3=0 hard stop through to the engine).
     """
     if not events:
-        return {"B": 1.0, "A": 1.0, "C": 1.0, "K": 1.0}
+        return {
+            "B": Decimal("1.0000"), "A": Decimal("1.0000"),
+            "C": Decimal("1.0000"), "K": Decimal("1.0000"),
+        }
 
-    b_scores: List[float] = []
-    a_scores: List[float] = []
-    c_scores: List[float] = []
-    k_scores: List[float] = []
+    # tis-v2 Commit 5a — Decimal-native aggregation. Each signal's
+    # DECLARED decimal measurement (score_contribution_decimal) is
+    # preferred; a legacy connector that only carries the float field
+    # has its measurement declared at this aggregation boundary.
+    def _sig_dec(sig: Any) -> Decimal:
+        declared = getattr(sig, "score_contribution_decimal", None)
+        if declared is not None:
+            return Decimal(declared)
+        return Decimal(str(sig.score_contribution))
+
+    b_scores: List[Decimal] = []
+    a_scores: List[Decimal] = []
+    c_scores: List[Decimal] = []
+    k_scores: List[Decimal] = []
     c3_violation = False
 
     for ev in events:
-        b_scores.append(float(ev.boundedness.score_contribution))
-        a_scores.append(float(ev.attribution.score_contribution))
-        c_scores.append(float(ev.compliance.score_contribution))
-        k_scores.append(float(ev.known.score_contribution))
+        b_scores.append(_sig_dec(ev.boundedness))
+        a_scores.append(_sig_dec(ev.attribution))
+        c_scores.append(_sig_dec(ev.compliance))
+        k_scores.append(_sig_dec(ev.known))
         if ev.compliance.c3_violation:
             c3_violation = True
 
-    b = round(min(b_scores), 4)
-    a = round(min(a_scores), 4)
-    c = 0.0 if c3_violation else round(min(c_scores), 4)
-    k = round(min(k_scores), 4)
+    with localcontext(TIS_DECIMAL_CONTEXT):
+        q = Decimal("0.0001")
+        b = min(b_scores).quantize(q)
+        a = min(a_scores).quantize(q)
+        c = Decimal("0.0000") if c3_violation else min(c_scores).quantize(q)
+        k = min(k_scores).quantize(q)
     return {"B": b, "A": a, "C": c, "K": k}
 
 
@@ -1379,12 +1496,31 @@ def _aggregate_context_metadata(events: List[Any]) -> Dict[str, Any]:
     novelty = 0.0
     injection_detected = False
     injection_reason: Optional[str] = None
+    c3_signals: List[Dict[str, Any]] = []
     for ev in events:
         n_gaps += int(getattr(ev.attribution, "integration_boundary_gaps", 0) or 0)
         novelty = max(novelty, float(getattr(ev.known, "novelty_score", 0.0) or 0.0))
         if ev.compliance.c3_violation:
             injection_detected = True
             injection_reason = injection_reason or ev.compliance.c3_pattern
+            # Structured connector-event C3 provenance (tis-v2 5a).
+            # Connectors that emit precise pattern ids populate them;
+            # any other c3-violating connector still yields a valid
+            # record via the generic detail code — no reason-string
+            # parsing anywhere.
+            c3_signals.append({
+                "source_type": "connector_event",
+                "pattern_id": getattr(
+                    ev.compliance, "c3_pattern_id", None) or "",
+                "pattern_set_version": getattr(
+                    ev.compliance, "c3_pattern_set_version", None) or "",
+                "location_tag": f"node={getattr(ev, 'node_id', '')}",
+                "connector_type": str(
+                    getattr(ev, "connector_type", "") or "connector"),
+                "detail_code": getattr(
+                    ev.compliance, "c3_detail_code", None
+                ) or "connector_c3_violation",
+            })
 
     return {
         "n_gaps": n_gaps,
@@ -1394,7 +1530,10 @@ def _aggregate_context_metadata(events: List[Any]) -> Dict[str, Any]:
         "is_policy_sensitive": False,
         "injection_detected": injection_detected,
         "injection_reason": injection_reason,
-        "c3_score_computed": 0.0 if injection_detected else 1.0,
+        "c3_score_computed": (
+            Decimal("0.0000") if injection_detected else Decimal("1.0000")
+        ),
+        "c3_signals": c3_signals,
     }
 
 
@@ -1505,13 +1644,19 @@ def assemble_context_from_trace(
     #    The derived U_chain = 1 - K_chain is not a primary dimension; it
     #    surfaces only as audit metadata.
     if connection_type == "CT-8" and chain_k_scores:
-        u_chain = compute_chain_uncertainty(chain_k_scores)
-        k_chain = round(1.0 - u_chain, 4)
-        dimension_scores["K"] = k_chain
+        # Decimal-native chain math (tis-v2 5a): per-hop K_i values are
+        # declared as decimals at this boundary; K_chain = prod(K_i).
+        with localcontext(TIS_DECIMAL_CONTEXT):
+            k_chain_dec = Decimal("1")
+            for k_i in chain_k_scores:
+                k_chain_dec *= Decimal(str(k_i))
+            k_chain_dec = k_chain_dec.quantize(Decimal("0.0001"))
+        dimension_scores["K"] = k_chain_dec
         ctx_meta["chain_depth"] = len(chain_k_scores)
         ctx_meta["chain_u_scores"] = chain_k_scores  # legacy field name; values are K_i
-        ctx_meta["k_chain"] = k_chain
-        ctx_meta["u_chain_derived"] = round(u_chain, 4)
+        ctx_meta["k_chain"] = float(k_chain_dec)          # audit display
+        ctx_meta["u_chain_derived"] = round(
+            float(Decimal("1") - k_chain_dec), 4)         # audit display
 
     # 7. CT audit trail in context_metadata.
     ctx_meta["connection_type"] = connection_type
@@ -1520,8 +1665,9 @@ def assemble_context_from_trace(
 
     # 8. Sub-factor scores: lift C3 into the canonical sub_factor shape so
     #    the engine's failing_dimension_subfactors extraction works.
-    sub_factor_scores: Dict[str, Dict[str, float]] = {
-        "C": {"C3": float(ctx_meta["c3_score_computed"])}
+    #    Decimal-native as of 5a (v1 consumers coerce via float()).
+    sub_factor_scores: Dict[str, Dict[str, Any]] = {
+        "C": {"C3": ctx_meta["c3_score_computed"]}
     }
 
     # 9. Freeze the context (C-R.14) and add GCA snapshot ID.

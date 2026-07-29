@@ -47,7 +47,11 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from decimal import Decimal, localcontext
+from typing import Any, Dict, List, Optional, Union
+
+from tcs.canonical import TIS_DECIMAL_CONTEXT
+from tcs.governed_metadata import find_protected_keys
 
 
 # --------------------------------------------------------------------------- #
@@ -62,6 +66,41 @@ SIMILARITY_FLOOR: float = 0.80
 #: Maximum K sub-factor penalty the adapter will recommend. Keeps the
 #: governance layer in control of the actual TIS effect.
 MAX_K_SUBFACTOR_PENALTY: float = 0.50
+
+# tis-v2 Commit 5a — the adapter computes similarity-derived signals in
+# Decimal. Similarity is DEFINED as a decimal measurement at the
+# retrieval/wire boundary; no binary float participates in the governed
+# arithmetic downstream of that boundary.
+SIMILARITY_FLOOR_DECIMAL = Decimal("0.80")
+MAX_K_SUBFACTOR_PENALTY_DECIMAL = Decimal("0.5000")
+_SIMILARITY_QUANTUM = Decimal("0.000001")
+_PENALTY_QUANTUM = Decimal("0.0001")
+
+
+def _as_governed_decimal(value: Any, field_name: str) -> Decimal:
+    """Coerce an internal similarity/confidence input to Decimal.
+
+    Accepts Decimal, int, or decimal string. Binary floats are REJECTED
+    — an internal producer that still holds a float must declare its
+    measurement as a decimal string at the point of measurement rather
+    than laundering the float here (owner correction 1).
+    """
+    if isinstance(value, bool) or isinstance(value, float):
+        raise ValueError(
+            f"{field_name}: governed decimal inputs must be Decimal or "
+            f"decimal strings, got {type(value).__name__} — declare the "
+            f"measurement as a decimal at its source"
+        )
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, str):
+        return Decimal(value)
+    raise ValueError(
+        f"{field_name}: cannot interpret {type(value).__name__} as a "
+        f"governed decimal"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -81,7 +120,7 @@ class RAGChunk:
     over it in :mod:`tcs.governed_context`; the adapter does not scan.
     """
     chunk_id: str
-    similarity_score: float
+    similarity_score: Union[Decimal, str, int]   # Decimal-native (5a); floats rejected in adapt()
     source_doc: Optional[str] = None
     version: Optional[str] = None
     content: str = ""
@@ -109,11 +148,23 @@ class RAGOutput:
     # Optional passthroughs into context_metadata
     requesting_identity: Optional[str] = None
     identity_verified: Optional[bool] = None
-    identity_confidence: Optional[float] = None
+    identity_confidence: Optional[Decimal] = None   # Decimal-native (5a)
     authorization_tier: Optional[str] = None
     sensitivity_tier: Optional[str] = None
     mcp_server_id: Optional[str] = None
+
+    #: Free-form DISPLAY metadata. The public /v2/govern route rejects
+    #: protected keys before this is populated, and adapt() enforces the
+    #: same contract for direct internal callers — governed keys here
+    #: raise rather than silently overriding adapter-computed signals.
     extra_metadata: Dict[str, Any] = field(default_factory=dict)
+
+    #: Governed metadata for TRUSTED INTERNAL producers only (tests,
+    #: demos, in-process pipelines). Never populated from the public
+    #: HTTP surface. Keys here may override adapter-computed signals —
+    #: that is the point: an internal, typed, deliberate channel,
+    #: instead of a public free-form one (owner decision 2).
+    governed_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -211,19 +262,26 @@ class RAGAdapter:
             if not c.get("source_doc") or not c.get("version")
         )
 
+        # Decimal-native similarity signals (tis-v2 Commit 5a): the wire
+        # boundary delivers decimal strings, the route converts them to
+        # Decimal, and every derived value below is Decimal arithmetic
+        # inside the pinned context. No binary float exists on this path.
         similarities = [
-            float(c["similarity_score"]) for c in chunks
+            c["similarity_score"] for c in chunks
             if c.get("similarity_score") is not None
         ]
-        if similarities:
-            chunk_min = min(similarities)
-            chunk_mean = sum(similarities) / len(similarities)
-        else:
-            chunk_min = 1.0
-            chunk_mean = 1.0
+        with localcontext(TIS_DECIMAL_CONTEXT):
+            if similarities:
+                chunk_min = min(similarities)
+                chunk_mean = (
+                    sum(similarities, Decimal("0")) / len(similarities)
+                ).quantize(_SIMILARITY_QUANTUM)
+            else:
+                chunk_min = Decimal("1")
+                chunk_mean = Decimal("1")
 
-        low_similarity_flag = chunk_min < self.similarity_floor
-        k_penalty = self._compute_k_penalty(chunk_min)
+        low_similarity_flag = chunk_min < SIMILARITY_FLOOR_DECIMAL
+        k_penalty = self._compute_k_penalty_decimal(chunk_min)
 
         context_bundle: Dict[str, Any] = {
             "retrieved_chunks": chunks,
@@ -252,10 +310,25 @@ class RAGAdapter:
             if value is not None:
                 context_bundle[field_name] = value
 
-        # Caller-supplied extras override anything the adapter computed.
-        # This lets demo scenarios inject policy_unavailable / simulated
-        # failures without subclassing the adapter.
+        # extra_metadata is DISPLAY metadata only (tis-v2 Commit 5a).
+        # Protected governed keys are rejected — the public route already
+        # blocked them with HTTP 422; enforcing again here means a direct
+        # internal caller cannot smuggle them through this channel either.
+        protected = find_protected_keys(rag_output.extra_metadata)
+        if protected:
+            raise ValueError(
+                "extra_metadata may not carry governed keys "
+                f"{sorted(protected)}; internal producers use "
+                "RAGOutput.governed_metadata"
+            )
         for k, v in rag_output.extra_metadata.items():
+            context_bundle[k] = v
+
+        # governed_metadata is the TYPED INTERNAL channel for trusted
+        # producers (tests, demos, in-process pipelines). It may override
+        # adapter-computed signals deliberately. The public HTTP surface
+        # never populates it.
+        for k, v in rag_output.governed_metadata.items():
             context_bundle[k] = v
 
         return InterceptedRequest(
@@ -287,10 +360,28 @@ class RAGAdapter:
             "chunk_id": c.chunk_id,
             "source_doc": c.source_doc,
             "version": c.version,
-            "similarity_score": float(c.similarity_score),
+            "similarity_score": _as_governed_decimal(
+                c.similarity_score, f"chunk {c.chunk_id} similarity_score"
+            ),
             "content": c.content or "",
             "tags": list(c.tags),
         }
+
+    def _compute_k_penalty_decimal(self, chunk_min: Decimal) -> Decimal:
+        """Decimal-native K sub-factor penalty (same contract as
+        :meth:`_compute_k_penalty`, which is retained for legacy
+        callers): 0 at/above the floor, MAX at similarity 0, linear
+        between, quantized to 4dp."""
+        if chunk_min >= SIMILARITY_FLOOR_DECIMAL:
+            return Decimal("0.0000")
+        with localcontext(TIS_DECIMAL_CONTEXT):
+            shortfall = SIMILARITY_FLOOR_DECIMAL - chunk_min
+            scaled = shortfall / SIMILARITY_FLOOR_DECIMAL
+            penalty = min(
+                MAX_K_SUBFACTOR_PENALTY_DECIMAL,
+                scaled * MAX_K_SUBFACTOR_PENALTY_DECIMAL,
+            )
+            return penalty.quantize(_PENALTY_QUANTUM)
 
     def _compute_k_penalty(self, chunk_min: float) -> float:
         """

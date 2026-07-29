@@ -70,7 +70,7 @@ class _OnTopicVectorStore:
                 "chunk_id": "ok-0",
                 "source_doc": "relevant_doc.md",
                 "version": "v1",
-                "similarity_score": 0.92,
+                "similarity_score": "0.92",
                 "content": "Relevant content.",
                 "tags": [],
             }

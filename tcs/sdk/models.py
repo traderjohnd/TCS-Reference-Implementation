@@ -95,7 +95,7 @@ class GovernResult:
     tis_current: Optional[float]
     tis_raw: Optional[float]
     s_base: Optional[float] = None
-    gate_passed: Optional[bool] = None
+    gate_result: Optional[int] = None   # 0|1 — single gate vocabulary (5a)
 
     # Internal: base URL for building certificate_url.
     _base_url: str = ""
@@ -139,7 +139,14 @@ class GovernResult:
             tis_current=data.get("tis_current"),
             tis_raw=data.get("tis_raw"),
             s_base=data.get("s_base"),
-            gate_passed=data.get("gate_passed"),
+            gate_result=(
+                data.get("gate_result")
+                if data.get("gate_result") is not None
+                else (
+                    (1 if data.get("gate_passed") else 0)
+                    if "gate_passed" in data else None
+                )
+            ),
             _base_url=base_url,
             _raw=data,
         )

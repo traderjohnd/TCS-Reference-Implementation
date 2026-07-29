@@ -234,10 +234,21 @@ class TCSClient:
         if result.certificate_id:
             try:
                 tc = self.get_certificate(result.certificate_id)
-                result.tis_current = tc.get("tis_current")
-                result.tis_raw = tc.get("tis_raw")
-                result.s_base = tc.get("s_base")
-                result.gate_passed = tc.get("gate_passed")
+                # Version-tolerant reads: v1 wire numbers are floats,
+                # v2 wire numbers are canonical decimal strings; the
+                # gate aggregate derives once at this read boundary.
+                def _num(v):
+                    try:
+                        return float(v) if v is not None else None
+                    except (TypeError, ValueError):
+                        return None
+                result.tis_current = _num(tc.get("tis_current"))
+                result.tis_raw = _num(tc.get("tis_raw"))
+                result.s_base = _num(tc.get("s_base"))
+                if tc.get("gate_result") is not None:
+                    result.gate_result = int(tc["gate_result"])
+                elif "gate_passed" in tc:
+                    result.gate_result = 1 if tc.get("gate_passed") else 0
             except TCSClientError:
                 pass  # Scores stay None if the fetch fails.
 

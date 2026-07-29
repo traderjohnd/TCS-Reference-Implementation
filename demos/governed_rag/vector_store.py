@@ -143,7 +143,11 @@ class SimpleVectorStore:
                 "source_doc": chunk.source_doc,
                 "version": chunk.version,
                 "content": chunk.content,
-                "similarity_score": round(scaled, 4),
+                # Declared decimal measurement at the instrument boundary
+                # (tis-v2 5a): the similarity function is float-internal;
+                # the governed value it EMITS is this fixed-precision
+                # decimal string.
+                "similarity_score": f"{scaled:.4f}",
                 "tags": chunk.tags,
             })
         return results

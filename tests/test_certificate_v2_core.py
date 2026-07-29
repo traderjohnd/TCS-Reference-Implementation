@@ -447,11 +447,19 @@ class TestC3ProvenanceSources:
         assert "should i take" not in blob  # ditto
 
     def test_injection_scan_source_seals_without_rule_match(self):
+        # Structured signal, as the production scanner emits it (5a) —
+        # reason strings are explanatory only and never parsed.
         inp = c3_zero_input(meta_extra={
             "injection_detected": True,
-            "injection_reason": (
-                f"chunk_id=c1: injection pattern {_injection_pattern_repr()}"
-            ),
+            "injection_reason": "chunk_id=c1: injection pattern (explanatory)",
+            "c3_signals": [{
+                "source_type": "injection_scan",
+                "pattern_id": "inj-001-ignore-instructions",
+                "pattern_set_version": ACTIVE_INJECTION_PATTERN_SET_VERSION,
+                "location_tag": "chunk_id=c1",
+                "connector_type": "",
+                "detail_code": "",
+            }],
         })
         tc, _, _ = build_v2_certificate(inp=inp)
         d = tc.to_dict()
@@ -469,10 +477,15 @@ class TestC3ProvenanceSources:
     def test_credential_detection_source_seals_without_rule_match(self):
         inp = c3_zero_input(meta_extra={
             "credential_detected": True,
-            "credential_reason": (
-                f"chunk_id=c9: credential pattern "
-                f"{_credential_pattern_repr()}"
-            ),
+            "credential_reason": "chunk_id=c9: credential pattern (explanatory)",
+            "c3_signals": [{
+                "source_type": "credential_detection",
+                "pattern_id": "cred-002-openai-style-key",
+                "pattern_set_version": ACTIVE_CREDENTIAL_PATTERN_SET_VERSION,
+                "location_tag": "chunk_id=c9",
+                "connector_type": "",
+                "detail_code": "",
+            }],
         })
         tc, _, _ = build_v2_certificate(inp=inp)
         d = tc.to_dict()

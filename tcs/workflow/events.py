@@ -91,6 +91,11 @@ class BoundednessSignal:
     scope_violations: Tuple[str, ...] = ()
     external_references: Tuple[str, ...] = ()
     score_contribution: float = 1.0
+    #: tis-v2 Commit 5a — the connector's DECLARED decimal measurement
+    #: (a decimal string). When set, the GCA aggregates from this value
+    #: with no binary-float ancestor; the float field remains for
+    #: legacy display/serialization.
+    score_contribution_decimal: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,7 @@ class AttributionSignal:
     timestamp_present: bool = True
     chain_of_custody_complete: bool = True
     score_contribution: float = 1.0
+    score_contribution_decimal: Optional[str] = None   # see BoundednessSignal
 
 
 @dataclass(frozen=True)
@@ -126,6 +132,13 @@ class ComplianceSignal:
     policy_violations: Tuple[str, ...] = ()
     documentation_complete: bool = True
     score_contribution: float = 1.0
+    score_contribution_decimal: Optional[str] = None   # see BoundednessSignal
+    #: tis-v2 Commit 5a — STRUCTURED C3 provenance emitted at the
+    #: connector. These feed typed C3ProvenanceRecords; the
+    #: human-readable c3_pattern string above is explanatory only.
+    c3_pattern_id: Optional[str] = None
+    c3_pattern_set_version: Optional[str] = None
+    c3_detail_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +168,7 @@ class KnownStateSignal:
     dependency_acknowledged: bool = True
     confidence_interval_valid: bool = True
     score_contribution: float = 1.0
+    score_contribution_decimal: Optional[str] = None   # see BoundednessSignal
     # CT-8 only — left as None for non-chain connectors
     chain_k_scores: Optional[Tuple[float, ...]] = None
 

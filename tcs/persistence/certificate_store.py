@@ -49,6 +49,8 @@ from tcs.trust_certificate import (
     compute_legacy_raw_tc_hash,
     compute_raw_stored_tc_hash,
     compute_tc_hash,
+    gate_result_from_serialized,
+    wire_number,
     tc_from_dict_v2,
     validate_v2_certificate_for_sealing,
 )
@@ -74,6 +76,18 @@ class ChainSequenceError(RuntimeError):
 
 class CertificateNotFoundError(LookupError):
     """Raised when ``get()`` cannot find a certificate_id in the store."""
+
+
+class IssuanceVersionRegressionError(RuntimeError):
+    """The store-wide monotonic issuance floor (tis-v2 Commit 5a,
+    owner correction 6).
+
+    Once ANY schema-v2 certificate has been issued into a store, new
+    schema-v1 issuance is rejected — reverting the activation call
+    sites must fail closed rather than silently resume legacy
+    calculation semantics. Reading, replaying, and verifying historical
+    v1 certificates remains permitted; only NEW v1 issuance is barred.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -245,8 +259,18 @@ class CertificateStore:
             # it at the persistence boundary rather than relying on the
             # hash path alone.
             serialized = issued_tc.to_dict()
-            if classify_certificate_schema_version(serialized) == 2:
+            schema_version = classify_certificate_schema_version(serialized)
+            if schema_version == 2:
                 validate_v2_certificate_for_sealing(serialized)
+            elif self._store_has_v2_certificate(conn):
+                # Monotonic issuance floor (owner correction 6): once a
+                # v2 certificate exists here, new v1 issuance fails
+                # closed. Historical v1 reads/replay are unaffected.
+                raise IssuanceVersionRegressionError(
+                    "this store has issued schema-v2 certificates; new "
+                    "schema-v1 issuance is rejected (historical v1 "
+                    "records remain readable and verifiable)"
+                )
             final_hash = compute_tc_hash(serialized)
             issued_tc.audit_integrity = AuditIntegrity(
                 tc_hash=final_hash,
@@ -683,6 +707,27 @@ class CertificateStore:
         return [json.loads(r["content_json"]) for r in rows]
 
     # ---- Internal helpers ----------------------------------------------- #
+
+    def _store_has_v2_certificate(self, conn: sqlite3.Connection) -> bool:
+        """True once any schema-v2 certificate is persisted here.
+
+        The substring probe is sound because the key
+        ``certificate_schema_version`` can never appear in a v1 wire
+        payload (absence IS the v1 wire contract — proven by the frozen
+        fixtures) and no serializer emits it inside string content.
+        The flag is cached once True: the floor is monotonic.
+        """
+        if getattr(self, "_v2_floor_reached", False):
+            return True
+        row = conn.execute(
+            "SELECT 1 FROM trust_certificates "
+            "WHERE content_json LIKE ? LIMIT 1",
+            ('%"certificate_schema_version"%',),
+        ).fetchone()
+        if row is not None:
+            self._v2_floor_reached = True
+            return True
+        return False
 
     def _last_in_chain_locked(
         self,
@@ -1335,7 +1380,7 @@ def _gate_failure_details(
 
     for r in rows:
         d = json.loads(r["content_json"])
-        if d.get("gate_passed", True):
+        if gate_result_from_serialized(d) == 1:
             continue
         total += 1
 
@@ -1464,19 +1509,22 @@ def _telemetry_stream(
             "tis_raw": round(float(d.get("tis_raw", 0.0)), 4),
             "tis_adjusted": round(float(d.get("tis_adjusted", 0.0)), 4),
             "tis_current": float(r["tis_current"]),
-            "B": round(cs.get("B", 0.0), 4),
-            "A": round(cs.get("A", 0.0), 4),
-            "C": round(cs.get("C", 0.0), 4),
+            "B": round(wire_number(cs.get("B")), 4),
+            "A": round(wire_number(cs.get("A")), 4),
+            "C": round(wire_number(cs.get("C")), 4),
             # Read-side legacy fallback: archived TCs written before the
             # BACU -> BACK migration may have "U" instead of "K". This is
             # NOT a translation layer — new writes always use K end-to-end.
-            "K": round(cs.get("K", cs.get("U", 0.0)), 4),
-            "gate_passed": d.get("gate_passed", True),
-            "P_cb": round(pb.get("P_cb", 0.0), 4),
-            "P_d": round(pb.get("P_d", 0.0), 4),
-            "P_n": round(pb.get("P_n", 0.0), 4),
-            "P_h": round(pb.get("P_h", 0.0), 4),
-            "P_ps": round(pb.get("P_ps", 0.0), 4),
+            "K": round(wire_number(cs.get("K", cs.get("U"))), 4),
+            # Single gate vocabulary at the read boundary (5a): v1 rows
+            # derive once from gate_passed; v2 rows carry gate_result.
+            "gate_result": gate_result_from_serialized(d),
+            # v2 wire uses canonical lowercase penalty keys.
+            "P_cb": round(wire_number(pb.get("P_cb", pb.get("cb"))), 4),
+            "P_d": round(wire_number(pb.get("P_d", pb.get("d"))), 4),
+            "P_n": round(wire_number(pb.get("P_n", pb.get("n"))), 4),
+            "P_h": round(wire_number(pb.get("P_h", pb.get("h"))), 4),
+            "P_ps": round(wire_number(pb.get("P_ps", pb.get("ps"))), 4),
             "penalty_aggregate": round(float(d.get("penalty_aggregate", 0.0)), 4),
             "governance_ms": d.get("governance_ms"),
             "profile_id": d.get("policy_set_id", ""),

@@ -456,6 +456,38 @@ def build_hash_payload(tc_dict: Dict[str, Any]) -> bytes:
     return build_v2_hash_payload(tc_dict)
 
 
+def gate_result_from_serialized(d: Dict[str, Any]) -> int:
+    """One authoritative gate aggregate from either wire version.
+
+    v2 payloads carry ``gate_result`` (0|1) directly; v1 payloads carry
+    only ``gate_passed`` and are derived ONCE here at the read boundary.
+    v2 values are never reconstructed from the legacy alias.
+    """
+    if d.get("gate_result") is not None:
+        return int(d["gate_result"])
+    return 1 if d.get("gate_passed") else 0
+
+
+def gate_result_of(tc: "TrustCertificate") -> int:
+    """Model-instance counterpart of gate_result_from_serialized."""
+    if tc.gate_result is not None:
+        return int(tc.gate_result)
+    return 1 if tc.gate_passed else 0
+
+
+def wire_number(value: Any, default: float = 0.0) -> float:
+    """Version-tolerant DISPLAY conversion for analytics readers:
+    v1 wire numbers are floats, v2 wire numbers are canonical decimal
+    strings. Authoritative values live in the certificate itself; this
+    is for dashboard aggregation only."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def compute_raw_stored_tc_hash(raw_dict: Dict[str, Any]) -> str:
     """Version-dispatched hash of RAW persisted content (pre-rehydration).
 
@@ -1468,6 +1500,164 @@ def _stub_id(prefix: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Version-neutral construction helpers (tis-v2 Commit 5a)                      #
+# --------------------------------------------------------------------------- #
+#
+# Extracted verbatim from generate_certificate() so BOTH builders share
+# them — generate_certificate_v2() must not call the legacy builder
+# (owner correction 4), and duplicating these blocks would let the two
+# drift. The v1 builder's output is byte-identical after extraction
+# (pinned by the stored-legacy fixtures and the fresh-v1 wire test).
+
+def _initial_transition(
+    lifecycle_state: str, decision: str, evaluation_time: datetime,
+) -> Dict[str, Any]:
+    return {
+        "from": "computed",
+        "to": lifecycle_state,
+        "timestamp": evaluation_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reason": f"Initial evaluation -- decision: {decision}",
+    }
+
+
+def _derive_provenance_refs(meta: Dict[str, Any]):
+    source_references = list(meta.get("source_references", []))
+    retrieval_ids = list(meta.get("retrieval_ids", []))
+    checkpoint_id = str(meta.get("checkpoint_id") or _stub_id("ckpt"))
+    gca_context_id = str(meta.get("gca_context_id") or _stub_id("gca"))
+    chain_of_custody_id = str(
+        meta.get("chain_of_custody_id") or _stub_id("coc")
+    )
+    audit_log_id = str(meta.get("audit_log_id") or _stub_id("audit"))
+    return (source_references, retrieval_ids, checkpoint_id,
+            gca_context_id, chain_of_custody_id, audit_log_id)
+
+
+def _build_scope_attestation(
+    meta: Dict[str, Any],
+    tis_result: TISResult,
+    evaluation_time: datetime,
+):
+    mcp_server_id = str(meta.get("mcp_server_id") or _stub_id("mcp"))
+    context_expanded = bool(
+        meta.get("context_expanded_after_evaluation")
+        or tis_result.invalidation_event == "context_expansion"
+    )
+    scope_attestation: Dict[str, Any] = {
+        "mcp_servers_in_scope": list(meta.get("mcp_servers_in_scope", [mcp_server_id])),
+        "mcp_servers_out_of_scope": list(meta.get("mcp_servers_out_of_scope", [])),
+        "downstream_agents_in_scope": list(meta.get("downstream_agents_in_scope", [])),
+        "downstream_agents_out_of_scope": list(meta.get("downstream_agents_out_of_scope", [])),
+        "context_frozen_at": evaluation_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "context_expanded_after_evaluation": context_expanded,
+        "context_expansion_events": list(meta.get("context_expansion_events", [])),
+        "enforcement_perimeter_complete": bool(
+            meta.get("enforcement_perimeter_complete", True)
+        ),
+        "attestation_basis": str(
+            meta.get("attestation_basis", "deployment-manifest-stub-v1")
+        ),
+        "upstream_tc_references": list(meta.get("upstream_tc_references", [])),
+    }
+    return mcp_server_id, scope_attestation
+
+
+def _derive_ct_audit(meta: Dict[str, Any], profile: PolicyProfile):
+    connection_type = str(meta.get("connection_type") or "CT-0")
+    connection_type_modifier_id = str(
+        meta.get("connection_type_modifier_id") or "ct-modifier-stub-v0"
+    )
+    resolved_policy_profile_id = str(
+        meta.get("resolved_policy_profile_id")
+        or f"{profile.profile_id}::{connection_type}::stub"
+    )
+    chain_depth = int(meta.get("chain_depth", 0))
+    chain_u_scores = [float(v) for v in meta.get("chain_u_scores", [])]
+    return (connection_type, connection_type_modifier_id,
+            resolved_policy_profile_id, chain_depth, chain_u_scores)
+
+
+def _derive_composer_metadata(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    cm_raw = meta.get("composer_metadata")
+    return dict(cm_raw) if isinstance(cm_raw, dict) else None
+
+
+def _build_identity_binding(meta: Dict[str, Any]) -> IdentityBinding:
+    return IdentityBinding(
+        requesting_identity=str(
+            meta.get("requesting_identity") or _stub_id("id")
+        ),
+        identity_type=str(meta.get("identity_type") or "human"),
+        role=str(meta.get("role") or "evaluation_requester"),
+        authorization_tier=str(meta.get("authorization_tier") or "T3"),
+        identity_confidence=float(meta.get("identity_confidence", 1.0)),
+        identity_verified=bool(meta.get("identity_verified", True)),
+        authentication_method=str(
+            meta.get("authentication_method") or "oauth2_mfa"
+        ),
+        requesting_session_id=str(
+            meta.get("requesting_session_id") or _stub_id("sess")
+        ),
+    )
+
+
+def _build_governance_status_layer(meta: Dict[str, Any]) -> GovernanceStatus:
+    return GovernanceStatus(
+        governance_status=str(meta.get("governance_status") or "complete"),
+        evaluation_completeness_score=float(
+            meta.get("evaluation_completeness_score", 1.0)
+        ),
+        components_evaluated=list(
+            meta.get(
+                "components_evaluated",
+                [
+                    "context_assembly",
+                    "dimension_scoring",
+                    "penalty_computation",
+                    "gate_evaluation",
+                    "decay_application",
+                    "invalidation_check",
+                    "decision_mapping",
+                    "certificate_generation",
+                ],
+            )
+        ),
+        components_skipped=list(meta.get("components_skipped", [])),
+        skip_reasons=dict(meta.get("skip_reasons", {})),
+        fail_safe_applied=bool(meta.get("fail_safe_applied", False)),
+        fail_safe_type=meta.get("fail_safe_type"),  # None by default
+        governance_integrity_score=float(
+            meta.get("governance_integrity_score", 1.0)
+        ),
+    )
+
+
+def _build_override_record_layer(meta: Dict[str, Any]) -> OverrideRecord:
+    return OverrideRecord(
+        override_invoked=bool(meta.get("override_invoked", False)),
+        original_decision=meta.get("original_decision"),
+        override_decision=meta.get("override_decision"),
+        override_actor=meta.get("override_actor"),
+        override_actor_role=meta.get("override_actor_role"),
+        override_reason=meta.get("override_reason"),
+        override_type=meta.get("override_type"),
+        policy_exception_id=meta.get("policy_exception_id"),
+        regulatory_basis=meta.get("regulatory_basis"),
+        co_authorizer=meta.get("co_authorizer"),
+        post_override_review_required=bool(
+            meta.get("post_override_review_required", False)
+        ),
+        post_override_review_deadline=meta.get("post_override_review_deadline"),
+        post_override_review_completed=bool(
+            meta.get("post_override_review_completed", False)
+        ),
+        override_creates_tc_amendment=bool(
+            meta.get("override_creates_tc_amendment", False)
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Public entry point                                                           #
 # --------------------------------------------------------------------------- #
 
@@ -1508,24 +1698,16 @@ def generate_certificate(
 
     # Initial state transition: every TC begins life in "computed" and then
     # settles into its assigned initial state (per TC_SCHEMA.md Layer L).
-    initial_transition = {
-        "from": "computed",
-        "to": lifecycle_state,
-        "timestamp": tis_input.evaluation_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "reason": f"Initial evaluation -- decision: {decision}",
-    }
+    initial_transition = _initial_transition(
+        lifecycle_state, decision, tis_input.evaluation_time
+    )
 
     # Provenance references. In Phase 1 these are generated stubs; context
     # metadata may override any of them if the scenario provides real IDs.
     meta = tis_input.context_metadata
-    source_references = list(meta.get("source_references", []))
-    retrieval_ids = list(meta.get("retrieval_ids", []))
-    checkpoint_id = str(meta.get("checkpoint_id") or _stub_id("ckpt"))
-    gca_context_id = str(meta.get("gca_context_id") or _stub_id("gca"))
-    chain_of_custody_id = str(
-        meta.get("chain_of_custody_id") or _stub_id("coc")
-    )
-    audit_log_id = str(meta.get("audit_log_id") or _stub_id("audit"))
+    (source_references, retrieval_ids, checkpoint_id,
+     gca_context_id, chain_of_custody_id, audit_log_id) = \
+        _derive_provenance_refs(meta)
 
     # recompute_required: True for r3 per TC_SCHEMA.md Layer T.
     recompute_required = (profile.risk_tier == "r3")
@@ -1541,30 +1723,9 @@ def generate_certificate(
     # Scenario metadata may override any of these by providing the same
     # keys in context_metadata — this lets Phase 2 scenarios (9/10/11)
     # exercise the bypass rules without touching generate_certificate().
-    mcp_server_id = str(meta.get("mcp_server_id") or _stub_id("mcp"))
-
-    # context_expanded flows from the invalidation_event if it's "context_expansion";
-    # everything else is a stub default.
-    context_expanded = bool(
-        meta.get("context_expanded_after_evaluation")
-        or tis_result.invalidation_event == "context_expansion"
+    mcp_server_id, scope_attestation = _build_scope_attestation(
+        meta, tis_result, tis_input.evaluation_time
     )
-    scope_attestation: Dict[str, Any] = {
-        "mcp_servers_in_scope": list(meta.get("mcp_servers_in_scope", [mcp_server_id])),
-        "mcp_servers_out_of_scope": list(meta.get("mcp_servers_out_of_scope", [])),
-        "downstream_agents_in_scope": list(meta.get("downstream_agents_in_scope", [])),
-        "downstream_agents_out_of_scope": list(meta.get("downstream_agents_out_of_scope", [])),
-        "context_frozen_at": tis_input.evaluation_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "context_expanded_after_evaluation": context_expanded,
-        "context_expansion_events": list(meta.get("context_expansion_events", [])),
-        "enforcement_perimeter_complete": bool(
-            meta.get("enforcement_perimeter_complete", True)
-        ),
-        "attestation_basis": str(
-            meta.get("attestation_basis", "deployment-manifest-stub-v1")
-        ),
-        "upstream_tc_references": list(meta.get("upstream_tc_references", [])),
-    }
 
     # ---- CT Audit Fields (TCS-CATC-001 §18) ---------------------------- #
     # Phase-1 stubs. In Phase 2 these will be populated from the
@@ -1574,26 +1735,16 @@ def generate_certificate(
     # has not yet run". Scenario metadata may override any of these keys,
     # which lets Phase 2 scenarios 12/13/14 exercise connection-aware
     # scoring without touching generate_certificate() further.
-    connection_type = str(meta.get("connection_type") or "CT-0")
-    connection_type_modifier_id = str(
-        meta.get("connection_type_modifier_id") or "ct-modifier-stub-v0"
-    )
-    resolved_policy_profile_id = str(
-        meta.get("resolved_policy_profile_id")
-        or f"{profile.profile_id}::{connection_type}::stub"
-    )
-    chain_depth = int(meta.get("chain_depth", 0))
-    chain_u_scores = [float(v) for v in meta.get("chain_u_scores", [])]
+    (connection_type, connection_type_modifier_id,
+     resolved_policy_profile_id, chain_depth, chain_u_scores) = \
+        _derive_ct_audit(meta, profile)
 
     # ---- Standards Composer audit (Slice 4) ---------------------------- #
     # If the active policy profile was produced by the Standards
     # Composer, the route/GCA will have stashed its composer_metadata
     # in context_metadata. Pass it through to the TC verbatim so the
     # audit trail is self-contained.
-    cm_raw = meta.get("composer_metadata")
-    composer_metadata: Optional[Dict[str, Any]] = (
-        dict(cm_raw) if isinstance(cm_raw, dict) else None
-    )
+    composer_metadata = _derive_composer_metadata(meta)
 
     # ---- Governance Risk Rule audit (Slice 4.5) ------------------------ #
     # The GCA stashes one audit dict per triggered rule in
@@ -1622,78 +1773,15 @@ def generate_certificate(
     # context_metadata to exercise degraded and override workflows.
     #
     # Layer Id — IdentityBinding
-    identity_binding = IdentityBinding(
-        requesting_identity=str(
-            meta.get("requesting_identity") or _stub_id("id")
-        ),
-        identity_type=str(meta.get("identity_type") or "human"),
-        role=str(meta.get("role") or "evaluation_requester"),
-        authorization_tier=str(meta.get("authorization_tier") or "T3"),
-        identity_confidence=float(meta.get("identity_confidence", 1.0)),
-        identity_verified=bool(meta.get("identity_verified", True)),
-        authentication_method=str(
-            meta.get("authentication_method") or "oauth2_mfa"
-        ),
-        requesting_session_id=str(
-            meta.get("requesting_session_id") or _stub_id("sess")
-        ),
-    )
+    identity_binding = _build_identity_binding(meta)
 
     # Layer GS — GovernanceStatus
-    governance_status_obj = GovernanceStatus(
-        governance_status=str(meta.get("governance_status") or "complete"),
-        evaluation_completeness_score=float(
-            meta.get("evaluation_completeness_score", 1.0)
-        ),
-        components_evaluated=list(
-            meta.get(
-                "components_evaluated",
-                [
-                    "context_assembly",
-                    "dimension_scoring",
-                    "penalty_computation",
-                    "gate_evaluation",
-                    "decay_application",
-                    "invalidation_check",
-                    "decision_mapping",
-                    "certificate_generation",
-                ],
-            )
-        ),
-        components_skipped=list(meta.get("components_skipped", [])),
-        skip_reasons=dict(meta.get("skip_reasons", {})),
-        fail_safe_applied=bool(meta.get("fail_safe_applied", False)),
-        fail_safe_type=meta.get("fail_safe_type"),  # None by default
-        governance_integrity_score=float(
-            meta.get("governance_integrity_score", 1.0)
-        ),
-    )
+    governance_status_obj = _build_governance_status_layer(meta)
 
     # Layer Ov — OverrideRecord
     # Phase 1 scenarios do not invoke overrides — every field stays at
     # its null/False default. Phase 2 scenario 16 populates this block.
-    override_record = OverrideRecord(
-        override_invoked=bool(meta.get("override_invoked", False)),
-        original_decision=meta.get("original_decision"),
-        override_decision=meta.get("override_decision"),
-        override_actor=meta.get("override_actor"),
-        override_actor_role=meta.get("override_actor_role"),
-        override_reason=meta.get("override_reason"),
-        override_type=meta.get("override_type"),
-        policy_exception_id=meta.get("policy_exception_id"),
-        regulatory_basis=meta.get("regulatory_basis"),
-        co_authorizer=meta.get("co_authorizer"),
-        post_override_review_required=bool(
-            meta.get("post_override_review_required", False)
-        ),
-        post_override_review_deadline=meta.get("post_override_review_deadline"),
-        post_override_review_completed=bool(
-            meta.get("post_override_review_completed", False)
-        ),
-        override_creates_tc_amendment=bool(
-            meta.get("override_creates_tc_amendment", False)
-        ),
-    )
+    override_record = _build_override_record_layer(meta)
 
     tc = TrustCertificate(
         # Identity
@@ -2543,14 +2631,6 @@ TrustCertificate.from_dict_v2 = staticmethod(tc_from_dict_v2)
 # the certificate stands alone; nothing in validation or replay above
 # consults a registry.
 
-_INJECTION_REASON_RE = _re.compile(
-    r"^(?P<loc>.+?): injection pattern (?P<pat>.+)$"
-)
-_CREDENTIAL_REASON_RE = _re.compile(
-    r"^(?P<loc>.+?): credential pattern (?P<pat>.+)$"
-)
-
-
 def _registered_rule_for(rule_id: str, rule_version: str, evaluator: str):
     """Look up the registered rule at ISSUANCE time (never at replay)."""
     from tcs.governance import SCENARIO_RULES, TYPED_CONTEXT_RULES
@@ -2675,30 +2755,24 @@ def lift_governance_rule_matches(
     return lifted
 
 
-def _parse_pattern_repr(pat_repr: str) -> str:
-    """Recover the regex source from its recorded repr() form."""
-    import ast as _ast
-    try:
-        value = _ast.literal_eval(pat_repr)
-    except Exception as exc:  # noqa: BLE001
-        raise CertificateInvariantError(
-            f"unparseable pattern repr in reason string: {pat_repr!r}"
-        ) from exc
-    if not isinstance(value, str):
-        raise CertificateInvariantError(
-            f"pattern repr did not decode to a string: {pat_repr!r}")
-    return value
-
-
 def derive_c3_provenance(
     meta: Dict[str, Any],
     typed_matches: List[GovernanceRuleMatch],
 ) -> List[C3ProvenanceRecord]:
-    """Derive C3 provenance from the discovered structured context
-    signals. Called only when C3 == 0.0000 and no explicit records were
-    supplied. Fails closed when nothing explains the zero — callers
-    with out-of-band producers must supply an explicit caller_supplied
-    record with a nonempty producer_id.
+    """Derive C3 provenance from STRUCTURED context signals only.
+
+    (tis-v2 Commit 5a, owner correction 3.) Two sources, both typed:
+
+        * governance rule matches with ``c3_violation`` → one ``rule``
+          record referencing the certificate's own typed matches;
+        * ``meta["c3_signals"]`` — structured dicts emitted at the
+          producers (injection scan, connectors, credential detection).
+
+    Human-readable strings (``injection_reason``, ``credential_reason``)
+    are explanatory metadata and are NEVER parsed. Structured signal
+    missing → fail closed before sealing; callers with out-of-band
+    producers supply an explicit caller_supplied record with a
+    nonempty producer_id.
     """
     records: List[C3ProvenanceRecord] = []
 
@@ -2719,59 +2793,235 @@ def derive_c3_provenance(
             rule_match_refs=refs,
         ))
 
-    reason = meta.get("injection_reason")
-    if isinstance(reason, str):
-        m = _INJECTION_REASON_RE.match(reason)
-        if m:
-            pattern_source = _parse_pattern_repr(m.group("pat"))
-            mapping = INJECTION_PATTERN_IDS_BY_VERSION[
-                ACTIVE_INJECTION_PATTERN_SET_VERSION]
-            pattern_id = mapping.get(pattern_source)
-            if pattern_id is None:
-                raise CertificateInvariantError(
-                    "injection pattern is not in the active versioned "
-                    "mapping; update tcs/provenance.py deliberately")
-            records.append(C3ProvenanceRecord(
-                schema_version=C3_PROVENANCE_SCHEMA_VERSION,
-                source_type="injection_scan",
-                pattern_id=pattern_id,
-                pattern_set_version=ACTIVE_INJECTION_PATTERN_SET_VERSION,
-                location_tag=m.group("loc"),
-                connector_type="", detail_code="", producer_id="",
-            ))
-
-    cred_reason = meta.get("credential_reason")
-    if meta.get("credential_detected") and isinstance(cred_reason, str):
-        m = _CREDENTIAL_REASON_RE.match(cred_reason)
-        if m:
-            pattern_source = _parse_pattern_repr(m.group("pat"))
-            mapping = CREDENTIAL_PATTERN_IDS_BY_VERSION[
-                ACTIVE_CREDENTIAL_PATTERN_SET_VERSION]
-            pattern_id = mapping.get(pattern_source)
-            if pattern_id is None:
-                raise CertificateInvariantError(
-                    "credential pattern is not in the active versioned "
-                    "mapping; update tcs/provenance.py deliberately")
-            records.append(C3ProvenanceRecord(
-                schema_version=C3_PROVENANCE_SCHEMA_VERSION,
-                source_type="credential_detection",
-                pattern_id=pattern_id,
-                pattern_set_version=ACTIVE_CREDENTIAL_PATTERN_SET_VERSION,
-                location_tag=m.group("loc"),
-                connector_type="", detail_code="", producer_id="",
-            ))
+    for signal in meta.get("c3_signals") or []:
+        if not isinstance(signal, dict):
+            raise CertificateInvariantError(
+                "c3_signals entries must be structured dicts"
+            )
+        record = C3ProvenanceRecord(
+            schema_version=C3_PROVENANCE_SCHEMA_VERSION,
+            source_type=str(signal.get("source_type") or ""),
+            pattern_id=str(signal.get("pattern_id") or ""),
+            pattern_set_version=str(
+                signal.get("pattern_set_version") or ""),
+            location_tag=str(signal.get("location_tag") or ""),
+            connector_type=str(signal.get("connector_type") or ""),
+            detail_code=str(signal.get("detail_code") or ""),
+            producer_id=str(signal.get("producer_id") or ""),
+        )
+        validate_c3_provenance_record(record)
+        records.append(record)
 
     if not records:
         raise CertificateInvariantError(
             "c3_score == 0.0000 but no structured signal explains it; "
-            "supply explicit c3_provenance (e.g. a caller_supplied "
-            "record with a nonempty producer_id)")
+            "producers must emit c3_signals, or the caller must supply "
+            "an explicit caller_supplied record with a nonempty "
+            "producer_id")
+    # Deduplicate identical signals (e.g. the same detection surfaced
+    # by two aggregation layers), then canonical order.
+    records = list({c3_record_sort_key(r): r for r in records}.values())
     records.sort(key=c3_record_sort_key)
     return records
 
 
 # --------------------------------------------------------------------------- #
-# v2 certificate construction — DORMANT until Commit 5                         #
+# v2 explanation — rendered from the recorded effective scores and             #
+# adjustments_applied (tis-v2 Commit 5a)                                       #
+# --------------------------------------------------------------------------- #
+#
+# The original brief's display defect: an explanation showing a
+# pre-adjustment score beside a post-adjustment verdict. The invariant
+# here: EVERY numerical score displayed beside a gate verdict is the
+# score that produced that verdict.
+
+_ADJUSTMENT_VERBS = {
+    "TCS_SPEC_19_1": ("clamped to", "§19.1"),
+    "TCS_SPEC_19_2": ("set to", "§19.2"),
+}
+
+
+def _fmt_dec(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return format(value, ".4f")
+    return f"{_r(float(value)):.4f}"
+
+
+def _generate_explanation_v2(
+    inp: TISInput,
+    tis_result: TISResult,
+    decision: str,
+    profile: PolicyProfile,
+) -> tuple:
+    effective = tis_result.effective_dimension_scores
+    observed = tis_result.observed_dimension_scores
+    thresholds = {
+        d: canonical_score(v) for d, v in profile.thresholds.items()
+    }
+
+    adj_by_dim: Dict[str, List[AdjustmentApplied]] = {}
+    for a in tis_result.adjustments_applied:
+        adj_by_dim.setdefault(a.dimension, []).append(a)
+
+    gate_lines: List[str] = []
+    for dim in ("B", "A", "C", "K"):
+        eff = effective[dim]
+        status = tis_result.gate_results_by_dim[dim]
+        clause = ""
+        if adj_by_dim.get(dim):
+            steps = []
+            for a in adj_by_dim[dim]:
+                verb, ref = _ADJUSTMENT_VERBS.get(
+                    a.rule_id, ("adjusted to", a.rule_id))
+                steps.append(f"{verb} {_fmt_dec(a.value_after)} by {ref}")
+            clause = (
+                f"{dim} observed {_fmt_dec(observed[dim])}; "
+                + "; ".join(steps) + "; "
+            )
+        else:
+            clause = f"{dim}={_fmt_dec(eff)} "
+        if status == "pass":
+            gate_lines.append(
+                clause + f"PASS — required {dim} >= "
+                f"{_fmt_dec(thresholds[dim])}"
+            )
+        elif status == "fail":
+            gate_lines.append(
+                clause + f"FAIL — required {dim} >= "
+                f"{_fmt_dec(thresholds[dim])}"
+            )
+        else:
+            gate_lines.append(clause + "not_gated")
+
+    gates_str = ", ".join(gate_lines)
+    gate_set_str = "{" + ",".join(sorted(profile.gate_set)) + "}"
+
+    if decision == "Stop" and tis_result.is_valid == 0:
+        decision_fragment = (
+            f"Invalidation event '{tis_result.invalidation_event}' fired "
+            f"at Priority 1. TIS_current forced to 0.0000 and decision set "
+            f"to Stop regardless of dimensional scores."
+        )
+    elif decision == "Stop" and tis_result.C3_score == Decimal("0.0000"):
+        decision_fragment = (
+            "C3 prohibited-pattern sub-factor = 0.0000 -> unconditional "
+            "tis-v2 Stop (fires independently of gate state; kappa does "
+            "not apply)."
+        )
+    elif decision == "Stop":
+        decision_fragment = (
+            f"Gate collapsed (G=0) and S_base={_fmt_dec(tis_result.s_base)} "
+            f"is below remediability floor kappa="
+            f"{_fmt_dec(canonical_score(profile.soft_hold_ceiling))} "
+            f"-> Stop (too degraded to remediate)."
+        )
+    elif decision == "Hold" and tis_result.gate_result == 0:
+        decision_fragment = (
+            f"Gate collapsed (G=0) but S_base={_fmt_dec(tis_result.s_base)} "
+            f"remains at or above remediability floor kappa="
+            f"{_fmt_dec(canonical_score(profile.soft_hold_ceiling))} "
+            f"-> Hold (remediable through review)."
+        )
+    elif decision == "Hold":
+        decision_fragment = (
+            f"TIS_current={_fmt_dec(tis_result.tis_current)} is below "
+            f"theta_hold={_fmt_dec(canonical_score(profile.theta_hold))} "
+            f"-> Hold (standard review queue)."
+        )
+    elif decision == "Escalate":
+        decision_fragment = (
+            f"TIS_current={_fmt_dec(tis_result.tis_current)} is below the "
+            f"escalate threshold theta_escalate="
+            f"{_fmt_dec(canonical_score(profile.theta_escalate))} -> "
+            f"Escalate."
+        )
+    elif decision == "Observe":
+        decision_fragment = (
+            f"TIS_current={_fmt_dec(tis_result.tis_current)} is below "
+            f"theta_allow={_fmt_dec(canonical_score(profile.theta_allow))} "
+            f"but above theta_hold="
+            f"{_fmt_dec(canonical_score(profile.theta_hold))} at r1 -> "
+            f"Observe."
+        )
+    else:  # Allow
+        decision_fragment = (
+            f"All gates in {gate_set_str} passed. "
+            f"TIS_current={_fmt_dec(tis_result.tis_current)} >= theta_allow="
+            f"{_fmt_dec(canonical_score(profile.theta_allow))} -> Allow."
+        )
+
+    reg_fragment = ""
+    if profile.regulatory_mapping:
+        reg_fragment = (
+            " Regulatory scope: "
+            + "; ".join(profile.regulatory_mapping[:3])
+            + ("; ..." if len(profile.regulatory_mapping) > 3 else "")
+            + "."
+        )
+
+    if inp.subject_type == "human_composed":
+        subject_clause = (
+            f"Human-composed draft message '{inp.subject_id}' (no LLM "
+            f"in the loop) evaluated against"
+        )
+    else:
+        subject_clause = (
+            f"Subject '{inp.subject_id}' ({inp.subject_type}) evaluated against"
+        )
+
+    summary = (
+        f"{subject_clause} "
+        f"policy '{profile.profile_id}' at {profile.risk_tier}/{profile.action_class} "
+        f"in domain '{profile.domain}'. "
+        f"Gate set {gate_set_str} evaluated: {gates_str}. "
+        f"{decision_fragment}"
+        f"{reg_fragment}"
+    )
+
+    key_factors: List[str] = []
+    key_concerns: List[str] = []
+    for dim in ("B", "A", "C", "K"):
+        status = tis_result.gate_results_by_dim[dim]
+        eff = effective[dim]
+        label = _DIM_LABELS[dim]
+        if status == "pass":
+            key_factors.append(
+                f"{label} ({dim}) passed at {_fmt_dec(eff)}")
+        elif status == "fail":
+            key_concerns.append(
+                f"{label} ({dim}) failed at {_fmt_dec(eff)} "
+                f"(required >= {_fmt_dec(thresholds[dim])})"
+            )
+    for a in tis_result.adjustments_applied:
+        verb, ref = _ADJUSTMENT_VERBS.get(
+            a.rule_id, ("adjusted to", a.rule_id))
+        key_concerns.append(
+            f"{a.dimension} observed {_fmt_dec(a.value_before)} "
+            f"{verb} {_fmt_dec(a.value_after)} by {ref} ({a.reason})"
+        )
+    if tis_result.C3_score == Decimal("0.0000"):
+        key_concerns.append(
+            "C3 prohibited-pattern sub-factor = 0.0000 "
+            "(unconditional tis-v2 stop condition)"
+        )
+    if tis_result.penalty_aggregate > 0:
+        key_concerns.append(
+            f"Aggregate penalty P = {_fmt_dec(tis_result.penalty_aggregate)}"
+        )
+    if tis_result.is_valid == 0:
+        key_concerns.append(
+            f"Invalidation event: {tis_result.invalidation_event}"
+        )
+    if not key_factors:
+        key_factors.append("No dimension passed its gate")
+    if not key_concerns:
+        key_concerns.append("No blocking concerns")
+
+    return summary, key_factors, key_concerns
+
+
+# --------------------------------------------------------------------------- #
+# v2 certificate construction — DORMANT until Commit 5b                        #
 # --------------------------------------------------------------------------- #
 
 def generate_certificate_v2(
@@ -2836,35 +3086,6 @@ def generate_certificate_v2(
     profile = tis_input.policy_profile
     meta = tis_input.context_metadata
 
-    # ---- Base construction via the frozen v1 builder (float shadows) ---- #
-    shadow_input = _dataclass_replace(
-        tis_input,
-        dimension_scores={
-            k: float(v) for k, v in tis_input.dimension_scores.items()
-        },
-    )
-    shadow_result = _dataclass_replace(
-        tis_result,
-        s_base=float(tis_result.s_base),
-        tis_raw=float(tis_result.tis_raw),
-        penalty_breakdown={
-            k: float(v) for k, v in tis_result.penalty_breakdown.items()
-        },
-        penalty_aggregate=float(tis_result.penalty_aggregate),
-        s_adj=float(tis_result.s_adj),
-        tis_adj=float(tis_result.tis_adj),
-        C3_score=float(tis_result.C3_score),
-        decay_factor=float(tis_result.decay_factor),
-        tis_current=float(tis_result.tis_current),
-        effective_dimension_scores={},
-        observed_dimension_scores={},
-        adjustments_applied=[],
-        calculation_version="tis-v1",
-    )
-    tc = generate_certificate(
-        shadow_input, shadow_result, decision, requires_human_review,
-    )
-
     # ---- Typed provenance (issuance-time registry consultation) --------- #
     typed_matches = lift_governance_rule_matches(
         list(meta.get("governance_rule_matches") or [])
@@ -2888,61 +3109,146 @@ def generate_certificate_v2(
         records = []
     records.sort(key=c3_record_sort_key)
 
-    # ---- Explicit v2 construction mapping ------------------------------- #
-    tc.component_scores_raw = dict(tis_input.dimension_scores)
-    tc.component_scores_observed = dict(observed)
-    tc.component_scores = dict(effective)
-    tc.component_weights = {
-        dim: canonical_score(profile.weights[dim]) for dim in _BACK_DIMS
-    }
-    tc.thresholds = {
-        dim: canonical_score(v) for dim, v in profile.thresholds.items()
-    }
-    tc.s_base = tis_result.s_base
-    tc.s_adjusted = tis_result.s_adj          # name maps across the boundary
-    tc.tis_raw = tis_result.tis_raw
-    tc.tis_adjusted = tis_result.tis_adj      # name maps across the boundary
-    tc.tis_current = tis_result.tis_current
-    tc.penalty_aggregate = tis_result.penalty_aggregate
-    tc.penalty_breakdown = dict(tis_result.penalty_breakdown)
-    tc.resolved_penalty_weights = {
-        k: canonical_score(v) for k, v in profile.penalty_weights.items()
-    }
-    tc.adjustments_applied = list(tis_result.adjustments_applied)
-    tc.gate_result = int(tis_result.gate_result)
-    tc.resolved_decay_rate = canonical_nonnegative_parameter(
-        profile.decay_rate, field_name="resolved_decay_rate")
-    tc.elapsed_hours = canonical_nonnegative_parameter(
-        tis_input.elapsed_hours, field_name="elapsed_hours")
-    tc.decay_factor = tis_result.decay_factor
-    tc.resolved_theta_allow = canonical_score(profile.theta_allow)
-    tc.resolved_theta_hold = canonical_score(profile.theta_hold)
-    tc.resolved_theta_escalate = canonical_score(profile.theta_escalate)
-    tc.resolved_kappa = canonical_score(profile.soft_hold_ceiling)
-    tc.c3_score = c3
-    tc.is_valid = int(tis_result.is_valid)
-    tc.governance_rule_matches = typed_matches
-    tc.c3_provenance = records
+    # ---- Version-neutral derived blocks (shared with the v1 builder;
+    #      generate_certificate_v2 does NOT call generate_certificate) -- #
+    lifecycle_state = _derive_lifecycle_state(decision, tis_result.is_valid)
+    invalidation_status = _derive_invalidation_status(tis_result.is_valid)
+    blocking_reason = _derive_blocking_reason(tis_result, decision, tis_input)
+    failure_mode = _derive_failure_mode(tis_result, decision)
+    escalation_routed_to = _derive_escalation_routing(
+        decision, profile.domain)
+    last_invalidation_event = _derive_last_invalidation_event(
+        tis_result, tis_input.evaluation_time)
+    initial_transition = _initial_transition(
+        lifecycle_state, decision, tis_input.evaluation_time)
+    (source_references, retrieval_ids, checkpoint_id,
+     gca_context_id, chain_of_custody_id, audit_log_id) = \
+        _derive_provenance_refs(meta)
+    recompute_required = (profile.risk_tier == "r3")
+    mcp_server_id, scope_attestation = _build_scope_attestation(
+        meta, tis_result, tis_input.evaluation_time)
+    (connection_type, connection_type_modifier_id,
+     resolved_policy_profile_id, chain_depth, chain_u_scores) = \
+        _derive_ct_audit(meta, profile)
+    composer_metadata = _derive_composer_metadata(meta)
+    identity_binding = _build_identity_binding(meta)
+    governance_status_obj = _build_governance_status_layer(meta)
+    override_record = _build_override_record_layer(meta)
 
-    # Version identifiers — explicit, from named constants; never
-    # dataclass defaults.
-    tc.certificate_schema_version = 2
-    tc.calculation_version = tis_result.calculation_version
-    tc.score_precision_policy = SCORE_PRECISION_POLICY
-    tc.decay_algorithm_version = DECAY_ALGORITHM_VERSION
-    tc.provenance_schema_version = C3_PROVENANCE_SCHEMA_VERSION
+    # v2 explanation — rendered from the recorded EFFECTIVE scores and
+    # adjustments_applied, so no score appears beside a verdict it did
+    # not produce.
+    explanation_summary, key_factors, key_concerns = \
+        _generate_explanation_v2(tis_input, tis_result, decision, profile)
 
-    # ---- Recompute the hash through the VALIDATING v2 path -------------- #
-    prev_ai = tc.audit_integrity
-    tc.audit_integrity = None
+    # ---- Explicit, exhaustive v2 construction mapping ------------------- #
+    tc = TrustCertificate(
+        certificate_id=str(uuid.uuid4()),
+        subject_id=tis_input.subject_id,
+        subject_type=tis_input.subject_type,
+        domain=profile.domain,
+        risk_tier=profile.risk_tier,
+        action_class=profile.action_class,
+        policy_severity="standard",
+        checkpoint_id=checkpoint_id,
+        gca_context_id=gca_context_id,
+        policy_set_id=profile.profile_id,
+        s_base=tis_result.s_base,
+        s_adjusted=tis_result.s_adj,          # name maps across the boundary
+        tis_raw=tis_result.tis_raw,
+        tis_adjusted=tis_result.tis_adj,      # name maps across the boundary
+        tis_current=tis_result.tis_current,
+        component_scores=dict(tis_result.effective_dimension_scores),
+        component_weights={
+            dim: canonical_score(profile.weights[dim]) for dim in _BACK_DIMS
+        },
+        penalty_aggregate=tis_result.penalty_aggregate,
+        penalty_breakdown=dict(tis_result.penalty_breakdown),
+        failing_dimension_subfactors={},      # v1-only alias; not on v2 wire
+        gate_set=sorted(profile.gate_set),
+        thresholds={
+            dim: canonical_score(v) for dim, v in profile.thresholds.items()
+        },
+        gate_results=dict(tis_result.gate_results_by_dim),
+        gate_passed=(tis_result.gate_result == 1),  # derived; not on v2 wire
+        blocking_reason=blocking_reason,
+        failure_mode=failure_mode,
+        decision=decision,
+        requires_human_review=requires_human_review,
+        escalation_routed_to=escalation_routed_to,
+        source_references=source_references,
+        retrieval_ids=retrieval_ids,
+        chain_of_custody_id=chain_of_custody_id,
+        audit_log_id=audit_log_id,
+        integration_boundary_gaps=int(meta.get("n_gaps", 0)),
+        evaluation_timestamp=tis_input.evaluation_time,
+        valid_until=tis_result.valid_until,
+        decay_rate=float(profile.decay_rate),   # derived; not on v2 wire
+        recompute_required=recompute_required,
+        invalidation_triggers=list(profile.invalidation_triggers),
+        last_invalidation_event=last_invalidation_event,
+        invalidation_status=invalidation_status,
+        explanation_summary=explanation_summary,
+        key_factors=key_factors,
+        key_concerns=key_concerns,
+        regulatory_explanation_level="regulatory",
+        regulatory_mapping=list(profile.regulatory_mapping),
+        lifecycle_state=lifecycle_state,
+        state_transition_history=[initial_transition],
+        recomputed_from_certificate_id=None,
+        superseded_by_certificate_id=None,
+        archived=False,
+        mcp_server_id=mcp_server_id,
+        scope_attestation=scope_attestation,
+        connection_type=connection_type,
+        connection_type_modifier_id=connection_type_modifier_id,
+        resolved_policy_profile_id=resolved_policy_profile_id,
+        chain_depth=chain_depth,
+        chain_u_scores=chain_u_scores,
+        composer_metadata=composer_metadata,
+        governance_rule_matches=typed_matches,
+        identity_binding=identity_binding,
+        governance_status=governance_status_obj,
+        audit_integrity=None,                 # attached after hashing below
+        override_record=override_record,
+        component_scores_raw=dict(tis_input.dimension_scores),
+        component_scores_observed=dict(
+            tis_result.observed_dimension_scores),
+        adjustments_applied=list(tis_result.adjustments_applied),
+        c3_provenance=records,
+        gate_result=int(tis_result.gate_result),
+        resolved_penalty_weights={
+            k: canonical_score(v) for k, v in profile.penalty_weights.items()
+        },
+        resolved_decay_rate=canonical_nonnegative_parameter(
+            profile.decay_rate, field_name="resolved_decay_rate"),
+        elapsed_hours=canonical_nonnegative_parameter(
+            tis_input.elapsed_hours, field_name="elapsed_hours"),
+        decay_factor=tis_result.decay_factor,
+        resolved_theta_allow=canonical_score(profile.theta_allow),
+        resolved_theta_hold=canonical_score(profile.theta_hold),
+        resolved_theta_escalate=canonical_score(profile.theta_escalate),
+        resolved_kappa=canonical_score(profile.soft_hold_ceiling),
+        c3_score=c3,
+        is_valid=int(tis_result.is_valid),
+        # Version identifiers — explicit, from named constants; never
+        # dataclass defaults.
+        certificate_schema_version=2,
+        calculation_version=tis_result.calculation_version,
+        score_precision_policy=SCORE_PRECISION_POLICY,
+        decay_algorithm_version=DECAY_ALGORITHM_VERSION,
+        provenance_schema_version=C3_PROVENANCE_SCHEMA_VERSION,
+    )
+
+    # ---- Hash through the VALIDATING v2 payload path -------------------- #
     tc_hash = compute_tc_hash(tc.to_dict())   # validates + replays first
     tc.audit_integrity = AuditIntegrity(
         tc_hash=tc_hash,
-        previous_tc_hash=prev_ai.previous_tc_hash,
-        chain_sequence=prev_ai.chain_sequence,
-        chain_id=prev_ai.chain_id,
+        previous_tc_hash=meta.get("previous_tc_hash"),
+        chain_sequence=int(meta.get("chain_sequence", 1)),
+        chain_id=str(meta.get("chain_id") or _stub_id("chain")),
         hash_algorithm="sha256",
         integrity_verified=True,
-        issued_by=prev_ai.issued_by,
+        issued_by=str(meta.get("issued_by") or "tcs-reference-impl-v0.1"),
     )
     return tc
