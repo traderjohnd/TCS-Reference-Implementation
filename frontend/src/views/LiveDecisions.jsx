@@ -2,6 +2,20 @@ import { useState, useEffect } from 'react';
 import { usePolling, apiFetch, apiPost } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
 import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
+import {
+  AdjustmentsPanel,
+  C3ProvenancePanel,
+  GateSummary,
+  IntegrityWarning,
+  ScoreTiersPanel,
+  UnsupportedCertificate,
+  VersionsPanel,
+} from '../components/CertificateV2Sections';
+import {
+  displayGoverned,
+  normalizeCertificate,
+  validateStreamRow,
+} from '../lib/governedDecimal';
 
 // Canonical BACK dimension order — used to reorder dim-keyed dicts
 // (component_scores, component_weights, gate_results, thresholds) so
@@ -71,6 +85,19 @@ function TCDetailPanel({ certificateId, onClose }) {
 
   if (loadingTc || !tcData) return <div className="text-gray-500 p-4">Loading TC...</div>;
 
+  // Record-boundary normalization: strict v1/v2/unsupported dispatch.
+  // Normalization failures produce the integrity state — never a crash.
+  let norm;
+  try {
+    norm = normalizeCertificate(tcData);
+  } catch {
+    norm = {
+      version: 'unsupported',
+      gateResult: null,
+      integrity: { ok: false, problems: ['normalization_failed'] },
+    };
+  }
+
   const sections = [
     { title: 'Identity', fields: ['certificate_id', 'subject_id', 'subject_type', 'domain', 'risk_tier', 'action_class', 'policy_set_id'] },
     { title: 'Score', fields: ['s_base', 's_adjusted', 'tis_raw', 'tis_adjusted', 'tis_current', 'penalty_aggregate'] },
@@ -95,6 +122,27 @@ function TCDetailPanel({ certificateId, onClose }) {
         <button onClick={onClose} className="text-gray-400 hover:text-white text-xl">&times;</button>
       </div>
       <div className="p-4 space-y-4">
+
+        {/* ── ⓪ Strict version dispatch / integrity state ──────────── */}
+        {norm.version === 'unsupported' && (
+          <UnsupportedCertificate
+            version={tcData.certificate_schema_version}
+          />
+        )}
+        {norm.version !== 'unsupported' && !norm.integrity.ok && (
+          <IntegrityWarning problems={norm.integrity.problems} />
+        )}
+        {norm.version !== 'unsupported' && (
+          <div className="flex items-center justify-between text-xs px-1">
+            <GateSummary gateResult={norm.gateResult} />
+            <span className="text-gray-500 font-mono">
+              schema v{norm.version}
+              {norm.version === 2
+                ? ` · ${tcData.calculation_version || '—'}`
+                : ' · legacy'}
+            </span>
+          </div>
+        )}
 
         {/* ── ① What was asked ─────────────────────────────────────── */}
         <div className="bg-gray-900 border border-gray-700 rounded-lg p-3">
@@ -150,6 +198,16 @@ function TCDetailPanel({ certificateId, onClose }) {
           </button>
           {technicalOpen && (
             <div className="space-y-3 p-3 border-t border-gray-800">
+              {norm.version !== 'unsupported' && (
+                <VersionsPanel tc={tcData} version={norm.version} />
+              )}
+              {norm.version === 2 && (
+                <>
+                  <ScoreTiersPanel tc={tcData} />
+                  <AdjustmentsPanel adjustments={tcData.adjustments_applied} />
+                  <C3ProvenancePanel tc={tcData} />
+                </>
+              )}
               {sections.map(({ title, fields, data }) => (
                 <div key={title} className="border border-gray-800 rounded p-2">
                   <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider mb-2">{title}</h4>
@@ -363,7 +421,12 @@ export default function LiveDecisions() {
           </div>
         ) : (
           <div className="space-y-2">
-            {holds.map((h) => (
+            {holds.map((h) => {
+              // One malformed record must never blank the queue: it
+              // renders with an integrity warning and loses its
+              // consequential (Override) action; neighbors render.
+              const rowCheck = validateStreamRow(h);
+              return (
               <div key={h.certificate_id} className="bg-gray-800/50 rounded p-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
@@ -373,12 +436,19 @@ export default function LiveDecisions() {
                   <div className="flex items-center gap-2">
                     <button onClick={() => setSelectedTc(h.certificate_id)}
                       className="text-xs text-blue-400 hover:text-blue-300">View TC</button>
-                    <button onClick={() => setOverrideId(overrideId === h.certificate_id ? null : h.certificate_id)}
-                      className="text-xs text-yellow-400 hover:text-yellow-300">Override</button>
+                    {rowCheck.ok ? (
+                      <button onClick={() => setOverrideId(overrideId === h.certificate_id ? null : h.certificate_id)}
+                        className="text-xs text-yellow-400 hover:text-yellow-300">Override</button>
+                    ) : (
+                      <span className="text-[10px] text-red-400 border border-red-800 rounded px-1.5 py-0.5"
+                        title={`Invalid fields: ${rowCheck.problems.join(', ')}`}>
+                        data integrity — override disabled
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div className="text-xs text-gray-500 mt-1">{h.blocking_reason}</div>
-                {overrideId === h.certificate_id && (
+                {rowCheck.ok && overrideId === h.certificate_id && (
                   <OverrideForm
                     tcId={h.certificate_id}
                     endpoint="/govern/hold-queue"
@@ -388,7 +458,8 @@ export default function LiveDecisions() {
                   />
                 )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -409,7 +480,9 @@ export default function LiveDecisions() {
           </div>
         ) : (
           <div className="space-y-2">
-            {escalations.map((e) => (
+            {escalations.map((e) => {
+              const rowCheck = validateStreamRow(e);
+              return (
               <div key={e.certificate_id} className="bg-gray-800/50 rounded p-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
@@ -419,19 +492,26 @@ export default function LiveDecisions() {
                   <div className="flex items-center gap-2">
                     <button onClick={() => setSelectedTc(e.certificate_id)}
                       className="text-xs text-blue-400 hover:text-blue-300">View TC</button>
-                    <button onClick={() => setOverrideId(overrideId === e.certificate_id ? null : e.certificate_id)}
-                      className="text-xs text-orange-400 hover:text-orange-300">Review</button>
+                    {rowCheck.ok ? (
+                      <button onClick={() => setOverrideId(overrideId === e.certificate_id ? null : e.certificate_id)}
+                        className="text-xs text-orange-400 hover:text-orange-300">Review</button>
+                    ) : (
+                      <span className="text-[10px] text-red-400 border border-red-800 rounded px-1.5 py-0.5"
+                        title={`Invalid fields: ${rowCheck.problems.join(', ')}`}>
+                        data integrity — review disabled
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div className="text-xs text-gray-500 mt-1">{e.blocking_reason}</div>
                 <div className="text-[10px] text-gray-400 mt-2 grid grid-cols-2 md:grid-cols-4 gap-2">
                   {e.s_base != null && (
                     <div><span className="text-gray-500">s_base:</span>{' '}
-                      <span className="font-mono">{Number(e.s_base).toFixed(4)}</span></div>
+                      <span className="font-mono">{displayGoverned(e.s_base)}</span></div>
                   )}
                   {e.tis_current != null && (
                     <div><span className="text-gray-500">TIS_current:</span>{' '}
-                      <span className="font-mono">{Number(e.tis_current).toFixed(4)}</span></div>
+                      <span className="font-mono">{displayGoverned(e.tis_current)}</span></div>
                   )}
                   {e.policy_set_id && (
                     <div className="col-span-2"><span className="text-gray-500">profile:</span>{' '}
@@ -459,7 +539,7 @@ export default function LiveDecisions() {
                     )}
                   </div>
                 )}
-                {overrideId === e.certificate_id && (
+                {rowCheck.ok && overrideId === e.certificate_id && (
                   <OverrideForm
                     tcId={e.certificate_id}
                     endpoint="/govern/escalation-queue"
@@ -469,7 +549,8 @@ export default function LiveDecisions() {
                   />
                 )}
               </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -511,11 +592,11 @@ export default function LiveDecisions() {
                     </div>
                   </td>
                   <td className="py-2 pr-3 font-mono text-xs text-gray-400">{d.subject_id}</td>
-                  <td className="py-2 pr-3 font-mono text-xs">{d.tis_current?.toFixed(4)}</td>
-                  <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.B?.toFixed(2)}</td>
-                  <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.A?.toFixed(2)}</td>
-                  <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.C?.toFixed(2)}</td>
-                  <td className="py-2 pr-3 font-mono text-xs">{d.component_scores?.K?.toFixed(2)}</td>
+                  <td className="py-2 pr-3 font-mono text-xs">{displayGoverned(d.tis_current)}</td>
+                  <td className="py-2 pr-3 font-mono text-xs">{displayGoverned(d.component_scores?.B, 2)}</td>
+                  <td className="py-2 pr-3 font-mono text-xs">{displayGoverned(d.component_scores?.A, 2)}</td>
+                  <td className="py-2 pr-3 font-mono text-xs">{displayGoverned(d.component_scores?.C, 2)}</td>
+                  <td className="py-2 pr-3 font-mono text-xs">{displayGoverned(d.component_scores?.K, 2)}</td>
                   <td className="py-2 pr-3 text-xs text-gray-500">{d.domain}</td>
                   <td className="py-2 pr-3 font-mono text-xs text-gray-500">{d.governance_ms != null ? `${d.governance_ms}ms` : '--'}</td>
                   <td className="py-2">

@@ -9,6 +9,35 @@ function getHeaders() {
   return headers;
 }
 
+// Structured API error. `detail` carries the backend's error payload
+// verbatim (object for structured errors like protected_metadata_keys,
+// array for ordinary FastAPI validation 422s) so callers can
+// discriminate instead of string-matching a flattened message.
+export class ApiError extends Error {
+  constructor(message, status, detail) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+function summarizeDetail(detail, fallback) {
+  if (typeof detail === 'string' && detail) return detail;
+  if (detail && !Array.isArray(detail) && typeof detail === 'object') {
+    if (typeof detail.message === 'string' && detail.message) {
+      return detail.message;
+    }
+    if (typeof detail.error === 'string' && detail.error) return detail.error;
+  }
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0];
+    const loc = Array.isArray(first?.loc) ? first.loc.join('.') : '';
+    if (first?.msg) return loc ? `${loc}: ${first.msg}` : String(first.msg);
+  }
+  return fallback;
+}
+
 export async function apiFetch(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: getHeaders(),
@@ -16,7 +45,11 @@ export async function apiFetch(path, options = {}) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
+    throw new ApiError(
+      summarizeDetail(err?.detail, res.statusText),
+      res.status,
+      err?.detail,
+    );
   }
   return res.json();
 }

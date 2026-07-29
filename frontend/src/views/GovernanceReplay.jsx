@@ -68,13 +68,54 @@ const STRATEGY_LABEL = {
   what_if_policy_replay: 'What-if (snapshot evidence, new policy)',
 };
 
+// Semantics-aware strategy labeling (owner ruling, Commit 6).
+//
+//   Historical verification — only the frozen v1 certificate-replay
+//   path (chain verification) may claim to REPRODUCE an original v1
+//   decision. It is not this pipeline.
+//
+//   A snapshot-based evaluation here is labeled by the SOURCE
+//   snapshot's recorded calculation semantics:
+//     source tis-v2       → replay under identical tis-v2 semantics
+//     source tis-v1-legacy → "tis-v2 reevaluation (counterfactual)" —
+//        current v2 semantics applied to historical inputs. It must
+//        never be presented as reproducing the original decision; a
+//        changed outcome demonstrates a difference in calculation
+//        semantics, not that the original was erroneous.
+function strategySemantics(ev) {
+  const strategy = ev?.evaluation_strategy;
+  const source = ev?.governance_input_snapshot
+    ?.replayed_from_calculation_version;
+  if (
+    (strategy === 'runtime_snapshot'
+      || strategy === 'what_if_policy_replay')
+    && source && source !== 'tis-v2'
+  ) {
+    return {
+      label: 'tis-v2 reevaluation (counterfactual · legacy v1 source)',
+      crossVersion: true,
+    };
+  }
+  if (strategy === 'runtime_snapshot' && source === 'tis-v2') {
+    return { label: 'Replay (runtime snapshot · tis-v2)', crossVersion: false };
+  }
+  return {
+    label: STRATEGY_LABEL[strategy] || strategy || '',
+    crossVersion: false,
+  };
+}
+
 function plainEnglishReason(decision, blockingReason, ruleMatches) {
   // Prefer a rule's explanation if one fired; otherwise paraphrase the
   // blocking_reason; otherwise fall back to a decision-summary line.
+  // Rule records may be FLAT typed v2 (explanation at top level) or
+  // legacy nested (effect.explanation).
   if (Array.isArray(ruleMatches)) {
     for (const m of ruleMatches) {
-      const e = m?.effect || {};
-      if (e.explanation) return e.explanation;
+      const explanation = typeof m?.explanation === 'string'
+        ? m.explanation
+        : m?.effect?.explanation;
+      if (explanation) return explanation;
     }
   }
   if (blockingReason) {
@@ -386,6 +427,7 @@ function ArtifactPanel({ artifact, role }) {
 function EvaluationRow({ ev, role }) {
   const ruleMatches = ev.rule_matches || [];
   const tone = DECISION_TONE[ev.decision] || 'text-gray-300';
+  const semantics = strategySemantics(ev);
 
   return (
     <div className="border border-gray-800 rounded p-2 bg-gray-800/20">
@@ -398,9 +440,13 @@ function EvaluationRow({ ev, role }) {
           <span className="text-[10px] bg-gray-800 text-gray-400 border border-gray-700 rounded px-1.5 py-0.5">
             origin: {ev.evaluation_origin}
           </span>
-          {ev.evaluation_strategy && (
-            <span className="text-[10px] bg-gray-800 text-gray-400 border border-gray-700 rounded px-1.5 py-0.5">
-              {STRATEGY_LABEL[ev.evaluation_strategy] || ev.evaluation_strategy}
+          {semantics.label && (
+            <span className={`text-[10px] rounded px-1.5 py-0.5 border ${
+              semantics.crossVersion
+                ? 'bg-purple-900/30 text-purple-200 border-purple-800'
+                : 'bg-gray-800 text-gray-400 border-gray-700'
+            }`}>
+              {semantics.label}
             </span>
           )}
           <span className="text-[10px] text-gray-500 font-mono">
@@ -419,6 +465,22 @@ function EvaluationRow({ ev, role }) {
           )}
         </div>
       </div>
+
+      {/* Cross-version semantics disclosure (owner ruling): a legacy
+          v1 snapshot re-evaluated here runs under CURRENT tis-v2
+          semantics. It is a counterfactual reevaluation, never a
+          reproduction of the original decision. */}
+      {semantics.crossVersion && (
+        <div className="mt-1.5 text-[10px] text-purple-200/80 bg-purple-900/15 border border-purple-800/60 rounded px-2 py-1 leading-snug">
+          This evaluation applies current tis-v2 semantics to
+          historical inputs captured under the legacy v1 engine. It is
+          a reevaluation, not a reproduction of the original decision —
+          a different outcome demonstrates a difference in calculation
+          semantics, not an error in the original. Historical
+          verification of the original decision uses the frozen v1
+          certificate-replay path.
+        </div>
+      )}
 
       {/* Plain-language summary, inline under the row so a reviewer can
           read across policies in one scan. compact=true keeps the
@@ -447,22 +509,43 @@ function EvaluationRow({ ev, role }) {
             Rule matches ({ruleMatches.length})
           </div>
           <div className="space-y-1">
-            {ruleMatches.map((m, i) => (
+            {ruleMatches.map((m, i) => {
+              // Flat typed v2 record vs legacy nested `effect` shape.
+              const flat = !m?.effect
+                && ('schema_version' in (m || {})
+                    || 'matched_fact_keys' in (m || {}));
+              const controlClass = flat ? m.control_class : m.effect?.control_class;
+              const safety = flat ? m.safety_category : m.effect?.safety_category;
+              const third = flat
+                ? (m.decision_pressure || '—')
+                : (m.effect?.override_policy || '—');
+              return (
               <div key={i} className="bg-gray-900/60 border border-gray-800 rounded p-1.5 text-[10px]">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-amber-300 font-mono">{m.rule_id}</span>
                   <span className="text-gray-600">v{m.rule_version}</span>
                 </div>
                 <div className="text-gray-500 mt-0.5">
-                  {m.effect?.control_class} · {m.effect?.safety_category || '—'} · {m.effect?.override_policy || '—'}
+                  {controlClass} · {safety || '—'} · {third}
                 </div>
-                {m.matched_facts && Object.keys(m.matched_facts).length > 0 && (
+                {flat && Array.isArray(m.matched_fact_keys)
+                  && m.matched_fact_keys.length > 0 && (
+                  <div className="text-gray-400 mt-1 font-mono">
+                    matched_fact_keys: {m.matched_fact_keys.join(', ')}
+                    <span className="text-gray-600 font-sans italic ml-1">
+                      (keys only)
+                    </span>
+                  </div>
+                )}
+                {!flat && m.matched_facts
+                  && Object.keys(m.matched_facts).length > 0 && (
                   <div className="text-gray-400 mt-1 font-mono">
                     matched_facts: {JSON.stringify(m.matched_facts)}
                   </div>
                 )}
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -728,13 +811,23 @@ function ReplayPanel({ artifactId, onReplayComplete }) {
             configuration; runtime_snapshot strategy replays the
             captured TISInput verbatim, artifact_metadata re-scores
             from artifact provenance, and what_if_policy_replay
-            isolates policy impact by reusing prior evidence.
+            isolates policy impact by reusing prior evidence. Every
+            evaluation here runs under current tis-v2 calculation
+            semantics: a snapshot captured under the legacy v1 engine
+            is REEVALUATED, not reproduced — see the per-row semantics
+            note. Historical verification of original decisions is the
+            certificate chain-verification path, not this panel.
           </p>
         </div>
       )}
     </div>
   );
 }
+
+// Test-only surface: the component tests pin the calculation-semantics
+// terminology on the row component directly (the full view requires a
+// live artifact store). Not part of the app's public API.
+export const __testables = { EvaluationRow, strategySemantics };
 
 // ── Top-level view ───────────────────────────────────────────────────────────
 

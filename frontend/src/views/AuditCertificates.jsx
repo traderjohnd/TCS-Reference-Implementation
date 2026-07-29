@@ -2,6 +2,21 @@ import { useState } from 'react';
 import { useApi, apiFetch, usePolling } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
 import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
+import {
+  AdjustmentsPanel,
+  C3ProvenancePanel,
+  GateSummary,
+  IntegrityWarning,
+  RuleMatchesV2,
+  ScoreTiersPanel,
+  UnsupportedCertificate,
+  VersionsPanel,
+} from '../components/CertificateV2Sections';
+import {
+  displayGoverned,
+  isFlatRuleMatch,
+  normalizeCertificate,
+} from '../lib/governedDecimal';
 
 // Canonical BACK dimension order. Any dimension-keyed dict surfaced in
 // the Decision Summary technical sections is reordered to this sequence
@@ -167,6 +182,24 @@ function GovernanceRuleMatches({ matches }) {
   }
 
   // State 3 — one card per matched rule.
+  //
+  // tis-v2 certificates serialize the FLAT typed GovernanceRuleMatch
+  // record (control_class etc. at top level, fact KEYS only, term-group
+  // POSITIONS only). Legacy v1 certificates carry the nested `effect`
+  // shape. Never use one shape's aliases as fallbacks for the other.
+  if (matches.every(isFlatRuleMatch)) {
+    return (
+      <div className="border border-gray-800 rounded p-2">
+        <div className="flex items-baseline justify-between mb-2">
+          <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider">
+            Governance Rule Matches ({matches.length})
+          </h4>
+        </div>
+        <RuleMatchesV2 matches={matches} />
+      </div>
+    );
+  }
+
   return (
     <div className="border border-gray-800 rounded p-2">
       <div className="flex items-baseline justify-between mb-2">
@@ -314,6 +347,10 @@ export default function AuditCertificates() {
   const { data, refetch } = useApi(`/certificates?limit=${limit}`);
   const [selectedTc, setSelectedTc] = useState(null);
   const [tcDetail, setTcDetail] = useState(null);
+  // Record-boundary normalization result for the selected TC:
+  // { version, gateResult, integrity } — strict v1/v2/unsupported
+  // dispatch, field-name-only integrity problems.
+  const [tcNorm, setTcNorm] = useState(null);
   // The TC's linked ResponseArtifact (Phase 5 path). May be null for
   // TCs issued through the legacy /v2/govern path or for Phase 4 demo
   // TCs that pre-date the artifact tier. Used to surface the original
@@ -345,6 +382,17 @@ export default function AuditCertificates() {
     try {
       const tc = await apiFetch(`/certificates/${id}`);
       setTcDetail(tc);
+      // Normalization failures never crash the view — a malformed
+      // record renders an explicit integrity warning instead.
+      try {
+        setTcNorm(normalizeCertificate(tc));
+      } catch {
+        setTcNorm({
+          version: 'unsupported',
+          gateResult: null,
+          integrity: { ok: false, problems: ['normalization_failed'] },
+        });
+      }
       setSelectedTc(id);
       setTechnicalOpen(false);
       // Try to fetch the linked artifact. For Phase 5 TCs issued via
@@ -371,6 +419,7 @@ export default function AuditCertificates() {
       }
     } catch {
       setTcDetail(null);
+      setTcNorm(null);
       setTcArtifact(null);
       setTcOverrides([]);
     }
@@ -392,6 +441,15 @@ export default function AuditCertificates() {
     try {
       const tc = await apiFetch(`/certificates/${searchId.trim()}`);
       setTcDetail(tc);
+      try {
+        setTcNorm(normalizeCertificate(tc));
+      } catch {
+        setTcNorm({
+          version: 'unsupported',
+          gateResult: null,
+          integrity: { ok: false, problems: ['normalization_failed'] },
+        });
+      }
       setSelectedTc(searchId.trim());
     } catch {
       alert('Certificate not found');
@@ -482,7 +540,11 @@ export default function AuditCertificates() {
     { title: 'Component Scores', key: 'component_scores' },
     { title: 'Component Weights', key: 'component_weights' },
     { title: 'Penalty Breakdown', key: 'penalty_breakdown' },
-    { title: 'Layer G: Gate', fields: ['gate_passed', 'blocking_reason', 'failure_mode'] },
+    // Gate uses the single gate_result vocabulary on v2; the legacy
+    // gate_passed boolean appears only on v1 records (never as a
+    // fallback for v2). The normalized PASS/FAIL banner above the
+    // layers is derived once per record.
+    { title: 'Layer G: Gate', fields: ['gate_result', 'gate_passed', 'blocking_reason', 'failure_mode'] },
     { title: 'Gate Results', key: 'gate_results' },
     { title: 'Thresholds', key: 'thresholds' },
     { title: 'Decision', fields: ['decision', 'requires_human_review', 'escalation_routed_to'] },
@@ -534,6 +596,13 @@ export default function AuditCertificates() {
           {verifyResult.broken_chains?.length > 0 && (
             <span> | Broken: {verifyResult.broken_chains.join(', ')}</span>
           )}
+          <p className="text-[10px] text-gray-500 mt-1 font-normal">
+            Historical verification — each record is verified under its
+            own recorded calculation semantics (legacy certificates
+            through the frozen v1 path, tis-v2 certificates through the
+            v2 path). A pass here means the original decision record is
+            reproduced as issued.
+          </p>
         </div>
       )}
 
@@ -775,7 +844,7 @@ export default function AuditCertificates() {
                     <StatusBadge decision={tc.decision} />
                     <span className="text-gray-400 font-mono text-xs">{tc.subject_id}</span>
                   </div>
-                  <span className="text-gray-500 font-mono text-xs">{tc.tis_current?.toFixed(4)}</span>
+                  <span className="text-gray-500 font-mono text-xs">{displayGoverned(tc.tis_current)}</span>
                 </div>
               ))}
             </div>
@@ -790,10 +859,32 @@ export default function AuditCertificates() {
                   <StatusBadge decision={tcDetail.decision} />
                   <h3 className="text-sm font-medium text-white">Decision Summary</h3>
                 </div>
-                <button onClick={() => { setSelectedTc(null); setTcDetail(null); setTcArtifact(null); setTcOverrides([]); }}
+                <button onClick={() => { setSelectedTc(null); setTcDetail(null); setTcNorm(null); setTcArtifact(null); setTcOverrides([]); }}
                   className="text-gray-400 hover:text-white">&times;</button>
               </div>
               <div className="space-y-3 max-h-[75vh] overflow-y-auto">
+                {/* ── ⓪ Strict version dispatch / integrity state ──────── */}
+                {tcNorm?.version === 'unsupported' && (
+                  <UnsupportedCertificate
+                    version={tcDetail.certificate_schema_version}
+                  />
+                )}
+                {tcNorm && tcNorm.version !== 'unsupported'
+                  && !tcNorm.integrity.ok && (
+                  <IntegrityWarning problems={tcNorm.integrity.problems} />
+                )}
+                {tcNorm && tcNorm.version !== 'unsupported' && (
+                  <div className="flex items-center justify-between text-xs px-1">
+                    <GateSummary gateResult={tcNorm.gateResult} />
+                    <span className="text-gray-500 font-mono">
+                      schema v{tcNorm.version}
+                      {tcNorm.version === 2
+                        ? ` · ${tcDetail.calculation_version || '—'}`
+                        : ' · legacy'}
+                    </span>
+                  </div>
+                )}
+
                 {/* ── ① What was asked ─────────────────────────────────── */}
                 <div className="bg-gray-900 border border-gray-700 rounded-lg p-3">
                   <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1.5">
@@ -848,6 +939,18 @@ export default function AuditCertificates() {
                   </button>
                   {technicalOpen && (
                     <div className="space-y-3 p-2 border-t border-gray-800">
+                      {tcNorm && tcNorm.version !== 'unsupported' && (
+                        <VersionsPanel tc={tcDetail} version={tcNorm.version} />
+                      )}
+                      {tcNorm?.version === 2 && (
+                        <>
+                          <ScoreTiersPanel tc={tcDetail} />
+                          <AdjustmentsPanel
+                            adjustments={tcDetail.adjustments_applied}
+                          />
+                          <C3ProvenancePanel tc={tcDetail} />
+                        </>
+                      )}
                       {TC_LAYERS.map(({ title, fields, key }) => (
                         <div key={title} className="border border-gray-800 rounded p-2">
                           <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider mb-1">{title}</h4>
