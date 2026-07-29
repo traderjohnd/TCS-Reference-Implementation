@@ -30,6 +30,14 @@ class GovernRequest:
     request_id: Optional[str] = None
     base_profile_id: str = "fin-r3-a4-ct4"
 
+    # Evaluation typing (tis-v2 Commit 5a.1) — dedicated TOP-LEVEL
+    # request fields. These must never travel inside extra_metadata:
+    # the same names there are protected keys and the API rejects the
+    # request with 422.
+    risk_tier: Optional[str] = None
+    action_class: Optional[str] = None
+    connection_type: Optional[str] = None
+
     # Identity passthroughs
     requesting_identity: Optional[str] = None
     identity_verified: Optional[bool] = None
@@ -53,6 +61,12 @@ class GovernRequest:
             "extra_metadata": self.extra_metadata,
         }
         # Include optional fields only when set.
+        if self.risk_tier is not None:
+            d["risk_tier"] = self.risk_tier
+        if self.action_class is not None:
+            d["action_class"] = self.action_class
+        if self.connection_type is not None:
+            d["connection_type"] = self.connection_type
         if self.subject_id is not None:
             d["subject_id"] = self.subject_id
         if self.request_id is not None:

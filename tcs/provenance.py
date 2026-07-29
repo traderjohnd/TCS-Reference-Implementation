@@ -144,6 +144,28 @@ CREDENTIAL_PATTERN_IDS_BY_VERSION: Dict[str, Dict[str, str]] = {
     },
 }
 
+#: Enumerated stable detail codes for ``credential_detection`` records
+#: (owner correction, Commit 5a.1). ``detail_code`` is never arbitrary
+#: text — a free-form reason string is not authoritative provenance.
+#: APPEND-ONLY, same contract as the pattern-set mappings above: codes
+#: are added, never removed or repurposed, so historical records
+#: remain verifiable permanently.
+#:
+#: DECLARED codes identify a deterministic, pattern-free CT-12
+#: declaration (the caller or the GCA declared the context to BE
+#: credentials — nothing was matched). A declared-form record carries
+#: exactly one of these with EMPTY pattern_id / pattern_set_version.
+DECLARED_CREDENTIAL_DETAIL_CODES: FrozenSet[str] = frozenset({
+    "connection_type_ct12_declared",
+})
+
+#: Detail codes permitted ALONGSIDE a matched credential pattern
+#: (supplementary evidence on the pattern-detected form). None exist
+#: yet — the set is declared so a future code is an append, not a
+#: validator rewrite. A declared-form code on a pattern-detected
+#: record is contradictory and rejected.
+PATTERN_CREDENTIAL_DETAIL_CODES: FrozenSet[str] = frozenset()
+
 
 def _pattern_ids_for(source_type: str, pattern_set_version: str) -> Dict[str, str]:
     """Resolve the frozen ID mapping for a recorded pattern-set version.
@@ -348,7 +370,13 @@ def validate_c3_provenance_record(r: C3ProvenanceRecord) -> None:
         injection_scan       -> pattern_id + known pattern_set_version
                                 + location_tag
         connector_event      -> pattern_id or detail_code, + connector_type
-        credential_detection -> pattern_id + known pattern_set_version
+        credential_detection -> EITHER pattern-detected (pattern_id +
+                                nonempty supported pattern_set_version;
+                                detail_code optional from the PATTERN_*
+                                enumerated set) OR declared CT-12
+                                (detail_code from DECLARED_CREDENTIAL_
+                                DETAIL_CODES; pattern fields empty) —
+                                see the 5a.1 branch below
         caller_supplied      -> nonempty producer_id
     """
     if r.schema_version != C3_PROVENANCE_SCHEMA_VERSION:
@@ -403,15 +431,35 @@ def validate_c3_provenance_record(r: C3ProvenanceRecord) -> None:
             )
 
     if r.source_type == "credential_detection":
-        # A pattern-matched detection carries the versioned pattern id.
-        # A DECLARED credential context (connection_type=CT-12) has no
-        # matched pattern — it carries a detail code instead (amended
-        # in Commit 5a when the CT-12 declared case was wired).
+        # Source-specific forms (owner correction, Commit 5a.1). Exactly
+        # one of two valid evidence shapes; anything else fails closed:
+        #
+        #   PATTERN-DETECTED  pattern_id nonempty; pattern_set_version
+        #                     nonempty and supported; pattern_id must
+        #                     resolve under that frozen version;
+        #                     detail_code optional, but if present it
+        #                     must be an enumerated PATTERN_* code (a
+        #                     declared-form code here is contradictory).
+        #
+        #   DECLARED CT-12    detail_code from the enumerated DECLARED_*
+        #                     code set; pattern_id AND pattern_set_
+        #                     version must be empty (a version with no
+        #                     pattern is contradictory).
+        #
+        # Both evidence forms absent -> reject. Free-form reason
+        # strings are never authoritative provenance.
         if not (r.pattern_id or r.detail_code):
             raise CertificateInvariantError(
-                "credential_detection requires pattern_id or detail_code"
+                "credential_detection requires pattern evidence "
+                "(pattern_id + pattern_set_version) or a declared "
+                "detail_code — both are absent"
             )
         if r.pattern_id:
+            if not r.pattern_set_version:
+                raise CertificateInvariantError(
+                    "pattern-detected credential_detection requires a "
+                    "nonempty pattern_set_version"
+                )
             mapping = _pattern_ids_for(
                 "credential_detection", r.pattern_set_version
             )
@@ -419,6 +467,26 @@ def validate_c3_provenance_record(r: C3ProvenanceRecord) -> None:
                 raise CertificateInvariantError(
                     f"pattern_id {r.pattern_id!r} not in pattern set "
                     f"{r.pattern_set_version!r}"
+                )
+            if r.detail_code and \
+                    r.detail_code not in PATTERN_CREDENTIAL_DETAIL_CODES:
+                raise CertificateInvariantError(
+                    f"detail_code {r.detail_code!r} is not an enumerated "
+                    "pattern-form credential detail code (a declared-"
+                    "form code on a pattern-detected record is "
+                    "contradictory)"
+                )
+        else:
+            if r.detail_code not in DECLARED_CREDENTIAL_DETAIL_CODES:
+                raise CertificateInvariantError(
+                    f"detail_code {r.detail_code!r} is not an enumerated "
+                    "declared credential detail code"
+                )
+            if r.pattern_set_version:
+                raise CertificateInvariantError(
+                    "declared credential_detection must not carry "
+                    "pattern_set_version (contradictory with empty "
+                    "pattern_id)"
                 )
 
     if r.source_type == "connector_event":
@@ -662,6 +730,8 @@ __all__ = [
     "ACTIVE_LLM_RESPONSE_PATTERN_SET_VERSION",
     "INJECTION_PATTERN_IDS_BY_VERSION",
     "CREDENTIAL_PATTERN_IDS_BY_VERSION",
+    "DECLARED_CREDENTIAL_DETAIL_CODES",
+    "PATTERN_CREDENTIAL_DETAIL_CODES",
     "LLM_RESPONSE_PATTERN_IDS_BY_VERSION",
     "C3_SOURCE_TYPES",
     "RULE_EVALUATORS",

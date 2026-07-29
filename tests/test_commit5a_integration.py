@@ -217,7 +217,9 @@ class TestProtectedMetadata:
             "chunk_min_similarity", "chunk_mean_similarity",
             "low_similarity_flag", "pipeline_id", "model_id", "content",
             "text", "chunk_id", "tags", "industry", "sub_industry",
-            "use_case", "standards", "risk_tier", "action_class",
+            # risk_tier / action_class moved to PROTECTED (Commit 5a.1):
+            # the typed request fields are their only public channel.
+            "use_case", "standards",
             "composition_rules_version", "query", "url", "authorized",
             "status_code", "is_2xx", "is_5xx", "side_effect_class",
             "payload", "tool_name", "in_scope", "tc_reuse_attempted",

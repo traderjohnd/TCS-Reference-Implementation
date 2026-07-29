@@ -49,11 +49,26 @@ from tcs.api.models_numeric import (
     GovernedDecimalError,
     parse_unit_interval_decimal,
 )
+from tcs.governed_context import CT_WEIGHT_MODIFIERS
 from tcs.governed_metadata import find_protected_keys
 from tcs.trust_certificate import gate_result_from_serialized
 
 
 router = APIRouter()
+
+
+# Allowed values for the typed evaluation-typing fields (tis-v2 Commit
+# 5a.1). These are the SDK convenience parameters that historically
+# travelled inside extra_metadata; that channel is protected, so the
+# only public path is these validated typed fields. The route — never
+# the caller — places the validated values into the trusted governed
+# metadata channel.
+_VALID_RISK_TIERS = frozenset({"r1", "r2", "r3"})
+_VALID_ACTION_CLASSES = frozenset({"a1", "a2", "a3", "a4"})
+#: CT-1..CT-13 from the canonical modifier table. CT-12 is deliberately
+#: allowed: declaring credentials produces the deterministic CT-12
+#: credential Stop — a conservative outcome, never an override surface.
+_VALID_CONNECTION_TYPES = frozenset(CT_WEIGHT_MODIFIERS.keys())
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +135,16 @@ class GovernRequestBody(BaseModel):
 
     base_profile_id: str = "fin-r3-a4-ct4"
 
+    # Evaluation typing (tis-v2 Commit 5a.1) — the ONLY public channel
+    # for risk tier, action class, and connection type. The same names
+    # inside extra_metadata are protected and rejected with 422, so a
+    # conflicting duplicate submission fails rather than choosing one
+    # value. Omitted fields preserve the existing default behaviour
+    # (adapter/interceptor defaults and CT auto-detection).
+    risk_tier: Optional[str] = None
+    action_class: Optional[str] = None
+    connection_type: Optional[str] = None
+
     # Identity passthroughs — the ONLY public channel for identity
     # attestations. identity_confidence is a governed decimal string.
     requesting_identity: Optional[str] = None
@@ -150,6 +175,34 @@ class GovernRequestBody(BaseModel):
             parse_unit_interval_decimal(v, "identity_confidence")
         except GovernedDecimalError as exc:
             raise ValueError(str(exc)) from exc
+        return v
+
+    @field_validator("risk_tier")
+    @classmethod
+    def _validate_risk_tier(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_RISK_TIERS:
+            raise ValueError(
+                f"risk_tier must be one of {sorted(_VALID_RISK_TIERS)}"
+            )
+        return v
+
+    @field_validator("action_class")
+    @classmethod
+    def _validate_action_class(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_ACTION_CLASSES:
+            raise ValueError(
+                f"action_class must be one of {sorted(_VALID_ACTION_CLASSES)}"
+            )
+        return v
+
+    @field_validator("connection_type")
+    @classmethod
+    def _validate_connection_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_CONNECTION_TYPES:
+            raise ValueError(
+                "connection_type must be one of "
+                f"{sorted(_VALID_CONNECTION_TYPES)}"
+            )
         return v
 
 
@@ -191,11 +244,27 @@ def post_govern(body: GovernRequestBody, request: Request) -> Dict[str, Any]:
                     "extra_metadata may not supply governed scoring, "
                     "gating, C3, validity, decision, identity, "
                     "provenance, or enforcement keys. Identity "
-                    "attestations use the typed request fields."
+                    "attestations and evaluation typing (risk_tier, "
+                    "action_class, connection_type) use the typed "
+                    "request fields."
                 ),
                 "rejected_keys": sorted(rejected),
             },
         )
+
+    # Evaluation typing (tis-v2 Commit 5a.1): the ROUTE — never the
+    # public caller — constructs the trusted governed metadata, from
+    # the validated typed fields only. A duplicate of these names in
+    # extra_metadata was already rejected above (protected keys), so
+    # there is exactly one value in play. Omitted fields are simply
+    # absent, preserving default behaviour downstream.
+    governed_metadata: Dict[str, Any] = {}
+    if body.risk_tier is not None:
+        governed_metadata["risk_tier"] = body.risk_tier
+    if body.action_class is not None:
+        governed_metadata["action_class"] = body.action_class
+    if body.connection_type is not None:
+        governed_metadata["connection_type"] = body.connection_type
 
     # Translate wire chunks -> adapter chunks. Governed decimal strings
     # become Decimal HERE — no binary float ever exists on this path.
@@ -230,6 +299,7 @@ def post_govern(body: GovernRequestBody, request: Request) -> Dict[str, Any]:
         sensitivity_tier=body.sensitivity_tier,
         mcp_server_id=body.mcp_server_id,
         extra_metadata=dict(body.extra_metadata),
+        governed_metadata=governed_metadata,
     )
 
     adapter = RAGAdapter(base_profile_id=body.base_profile_id)

@@ -61,6 +61,10 @@ PROTECTED_METADATA_KEYS: FrozenSet[str] = frozenset({
     "requesting_identity", "identity_type", "identity_verified",
     "identity_confidence", "role", "authorization_tier",
     "sensitivity_tier", "authentication_method", "requesting_session_id",
+    # --- evaluation typing (tis-v2 Commit 5a.1: typed request fields on
+    #     /v2/govern are the only public channel; the route validates
+    #     them and constructs the trusted governed metadata itself) ----- #
+    "risk_tier", "action_class",
     # --- provenance / audit ----------------------------------------------- #
     "governance_rule_matches",
     "checkpoint_id", "gca_context_id", "chain_of_custody_id",

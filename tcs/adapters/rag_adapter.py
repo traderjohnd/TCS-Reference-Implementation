@@ -159,11 +159,13 @@ class RAGOutput:
     #: raise rather than silently overriding adapter-computed signals.
     extra_metadata: Dict[str, Any] = field(default_factory=dict)
 
-    #: Governed metadata for TRUSTED INTERNAL producers only (tests,
-    #: demos, in-process pipelines). Never populated from the public
-    #: HTTP surface. Keys here may override adapter-computed signals —
-    #: that is the point: an internal, typed, deliberate channel,
-    #: instead of a public free-form one (owner decision 2).
+    #: Governed metadata for TRUSTED producers only (tests, demos,
+    #: in-process pipelines — and, since Commit 5a.1, the /v2/govern
+    #: ROUTE itself, which places its VALIDATED typed evaluation-typing
+    #: fields here). Never populated from caller-controlled free-form
+    #: input. Keys here may override adapter-computed signals — that is
+    #: the point: an internal, typed, deliberate channel, instead of a
+    #: public free-form one (owner decision 2).
     governed_metadata: Dict[str, Any] = field(default_factory=dict)
 
 

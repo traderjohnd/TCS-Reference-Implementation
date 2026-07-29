@@ -204,6 +204,9 @@ class TCSClient:
         ID, and extracted scores. The ``allowed`` property tells you
         whether the output may be delivered to the user.
         """
+        # Evaluation typing travels as dedicated TOP-LEVEL request
+        # fields (tis-v2 Commit 5a.1). These names are protected inside
+        # extra_metadata — folding them there would 422.
         req = GovernRequest(
             query=query,
             retrieved_chunks=retrieved_chunks,
@@ -213,16 +216,11 @@ class TCSClient:
             subject_type=subject_type,
             subject_id=subject_id,
             base_profile_id=base_profile_id,
+            risk_tier=risk_tier,
+            action_class=action_class,
+            connection_type=connection_type,
             extra_metadata=extra_metadata or {},
         )
-
-        # Fold optional overrides into extra_metadata for the API.
-        if risk_tier is not None:
-            req.extra_metadata["risk_tier"] = risk_tier
-        if action_class is not None:
-            req.extra_metadata["action_class"] = action_class
-        if connection_type is not None:
-            req.extra_metadata["connection_type"] = connection_type
 
         data = self._post("/v2/govern", req.to_dict())
         result = GovernResult.from_api_response(data, base_url=self._base_url)
