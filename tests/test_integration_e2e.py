@@ -471,13 +471,17 @@ class TestSDKRoundTrip:
         )
         tc = client.get_certificate(result.certificate_id)
 
-        # TC fields should match the govern result
+        # TC fields should match the govern result. The v2 wire carries
+        # canonical decimal STRINGS; the SDK surfaces version-tolerant
+        # floats — compare numerically at the read boundary.
         assert tc["certificate_id"] == result.certificate_id
         assert tc["decision"] == result.decision
+        assert tc["certificate_schema_version"] == 2
+        assert tc["calculation_version"] == "tis-v2"
         if result.tis_current is not None:
-            assert tc["tis_current"] == result.tis_current
+            assert float(tc["tis_current"]) == result.tis_current
         if result.tis_raw is not None:
-            assert tc["tis_raw"] == result.tis_raw
+            assert float(tc["tis_raw"]) == result.tis_raw
 
     def test_metrics_has_decision_counts(self, client):
         client.govern(

@@ -824,40 +824,85 @@ class TestSerializedReplay10k:
 
 
 # =========================================================================== #
-# Production dormancy — full tcs/ tree, imports and aliases included           #
+# Production ACTIVATION — full tcs/ tree (replaces the Commit 4 dormancy      #
+# test; the 5b activation switched the five issuance sites to tis-v2)         #
 # =========================================================================== #
 
-_V2_ENTRY_POINTS = {"compute_tis_v2", "generate_certificate_v2",
-                    "map_decision_v2"}
+_V2_ISSUANCE_NAMES = {"compute_tis_v2", "generate_certificate_v2",
+                      "map_decision_versioned"}
+_LEGACY_ISSUANCE_TRIO = {"compute_tis", "generate_certificate",
+                         "map_decision"}
 _DEFINITION_MODULES = {"tis_engine.py", "trust_certificate.py",
                        "decision_engine.py"}
 
+#: Non-issuance modules explicitly permitted to keep the legacy trio
+#: (owner-approved 5b allowlist): historical replay re-runs STORED
+#: v1-era certificate data for what-if prediction and never issues a
+#: certificate.
+_LEGACY_TRIO_ALLOWED = {("simulation", "historical_replay.py")}
 
-class TestProductionDormancy:
-    def test_no_production_module_references_v2_entry_points(self):
+#: The five production issuance sites, as module -> minimum number of
+#: compute_tis_v2 call sites required in that module.
+_ACTIVATION_SITES = {
+    ("api", "routes_query.py"): 2,          # workflow + off-topic baseline
+    ("artifacts", "evaluation.py"): 1,      # evaluate/replay issuance
+    ("sidecar", "request_interceptor.py"): 2,  # govern + credential-stop
+}
+
+
+def _call_names(tree):
+    """Names invoked as calls: f(...) and obj.f(...)."""
+    called = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                called.append(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                called.append(node.func.attr)
+    return called
+
+
+class TestProductionActivation:
+    def test_five_issuance_sites_call_the_v2_pipeline(self):
+        tcs_root = Path(tcs.__file__).parent
+        for (pkg, name), min_calls in _ACTIVATION_SITES.items():
+            tree = ast.parse(
+                (tcs_root / pkg / name).read_text(encoding="utf-8"))
+            called = _call_names(tree)
+            assert called.count("compute_tis_v2") >= min_calls, (
+                f"{pkg}/{name}: expected >= {min_calls} compute_tis_v2 "
+                f"call sites, found {called.count('compute_tis_v2')}"
+            )
+            for required in ("map_decision_versioned",
+                             "generate_certificate_v2"):
+                assert required in called, (
+                    f"{pkg}/{name}: activation requires a {required} call"
+                )
+
+    def test_legacy_issuance_trio_confined_to_definition_modules(self):
+        """No production module outside the three definition modules may
+        CALL or IMPORT the legacy issuance trio. Historical replay and
+        v1-compat code live inside the definition modules themselves;
+        tests may call anything."""
         tcs_root = Path(tcs.__file__).parent
         offenders = []
         for py in sorted(tcs_root.rglob("*.py")):
             if py.name in _DEFINITION_MODULES:
                 continue
+            if (py.parent.name, py.name) in _LEGACY_TRIO_ALLOWED:
+                continue
             tree = ast.parse(py.read_text(encoding="utf-8"))
+            referenced = set(_call_names(tree))
             for node in ast.walk(tree):
-                referenced = set()
-                if isinstance(node, ast.Name):
-                    referenced.add(node.id)
-                elif isinstance(node, ast.Attribute):
-                    referenced.add(node.attr)
-                elif isinstance(node, ast.ImportFrom):
-                    # Detects renamed imports too:
-                    #   from tcs.tis_engine import compute_tis_v2 as x
+                if isinstance(node, ast.ImportFrom):
                     referenced.update(a.name for a in node.names)
                 elif isinstance(node, ast.Import):
                     referenced.update(a.name for a in node.names)
-                hits = referenced & _V2_ENTRY_POINTS
-                if hits:
-                    offenders.append((str(py.relative_to(tcs_root)),
-                                      sorted(hits)))
+            hits = referenced & _LEGACY_ISSUANCE_TRIO
+            if hits:
+                offenders.append((str(py.relative_to(tcs_root)),
+                                  sorted(hits)))
         assert not offenders, (
-            f"v2 entry points referenced outside their definition "
-            f"modules before Commit 5: {offenders}"
+            f"legacy issuance trio referenced outside definition modules "
+            f"after the 5b activation: {offenders}"
         )

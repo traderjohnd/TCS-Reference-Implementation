@@ -58,7 +58,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from tcs.canonical import TIS_DECIMAL_CONTEXT
 
 from tcs.adapters.rag_adapter import InterceptedRequest
-from tcs.decision_engine import map_decision
+from tcs.decision_engine import map_decision_versioned
 from tcs.governed_context import (
     CredentialDetectedError,
     assemble_context_v2,
@@ -71,8 +71,8 @@ from tcs.sidecar.enforcement_controller import (
     GovernedResponse,
     enforce_fail_safe,
 )
-from tcs.tis_engine import TISInput, compute_tis
-from tcs.trust_certificate import generate_certificate
+from tcs.tis_engine import TISInput, compute_tis_v2
+from tcs.trust_certificate import generate_certificate_v2
 
 
 # --------------------------------------------------------------------------- #
@@ -295,33 +295,29 @@ class RequestInterceptor:
 
         # Step 3: TIS computation + decision + TC generation
         try:
-            # The scoring policy is Decimal-native (5a). Until Commit 5b
-            # switches this site to compute_tis_v2 / generate_
-            # certificate_v2, the LEGACY engine and v1 wire cannot carry
-            # Decimals, so a float shadow feeds the v1 pipeline. The
-            # shadow (and the float() on elapsed_hours) is REMOVED by
-            # the 5b activation diff; the Decimal originals then flow
-            # through unconverted and become component_scores_raw.
+            # tis-v2 activation (Commit 5b): the scoring policy is
+            # Decimal-native (5a) and the Decimal originals now flow
+            # through unconverted — they become component_scores_raw.
+            # No float shadow, no float() on elapsed_hours.
             tis_input = TISInput(
                 subject_id=request.subject_id,
                 subject_type=request.subject_type,
                 policy_profile=resolved,
-                dimension_scores={
-                    d: float(v) for d, v in dim_scores.items()
-                },
+                dimension_scores=dict(dim_scores),
                 sub_factor_scores={
-                    dim: {sf: float(v) for sf, v in subs.items()}
-                    for dim, subs in sub_scores.items()
+                    dim: dict(subs) for dim, subs in sub_scores.items()
                 },
                 context_metadata=context,
-                elapsed_hours=float(context.get("elapsed_hours", 0.0)),
+                elapsed_hours=context.get("elapsed_hours", Decimal("0")),
                 is_valid=int(context.get("is_valid", 1)),
                 invalidation_event=context.get("invalidation_event"),
                 evaluation_time=datetime.now(timezone.utc),
             )
-            tis_result = compute_tis(tis_input)
-            decision, requires_review = map_decision(tis_input, tis_result)
-            tc = generate_certificate(
+            tis_result = compute_tis_v2(tis_input)
+            decision, requires_review = map_decision_versioned(
+                tis_input, tis_result
+            )
+            tc = generate_certificate_v2(
                 tis_input, tis_result, decision, requires_review
             )
         except Exception as exc:  # noqa: BLE001
@@ -452,9 +448,11 @@ class RequestInterceptor:
         ):
             if original_meta.get(key) is not None:
                 forced_ctx[key] = original_meta[key]
-        # Low C dimension score so the C gate fails.
-        dim_scores = {"B": 0.94, "A": 0.94, "C": 0.31, "K": 0.88}
-        sub_scores = {"C": {"C3": 0.00}}
+        # Low C dimension score so the C gate fails. Decimal-native
+        # (Commit 5b) — the former inline float shadow is gone.
+        dim_scores = {"B": Decimal("0.94"), "A": Decimal("0.94"),
+                      "C": Decimal("0.31"), "K": Decimal("0.88")}
+        sub_scores = {"C": {"C3": Decimal("0.0000")}}
 
         try:
             tis_input = TISInput(
@@ -464,14 +462,16 @@ class RequestInterceptor:
                 dimension_scores=dim_scores,
                 sub_factor_scores=sub_scores,
                 context_metadata=forced_ctx,
-                elapsed_hours=0.0,
+                elapsed_hours=Decimal("0.0000"),
                 is_valid=1,
                 invalidation_event=None,
                 evaluation_time=now,
             )
-            tis_result = compute_tis(tis_input)
-            decision, requires_review = map_decision(tis_input, tis_result)
-            tc = generate_certificate(
+            tis_result = compute_tis_v2(tis_input)
+            decision, requires_review = map_decision_versioned(
+                tis_input, tis_result
+            )
+            tc = generate_certificate_v2(
                 tis_input, tis_result, decision, requires_review
             )
             issued_tc = self._store.issue(tc)

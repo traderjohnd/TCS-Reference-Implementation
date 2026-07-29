@@ -137,16 +137,27 @@ class TestRuleFiresOnLithiumToPregnantPatient:
             if x["rule_id"]
             == "human_composed_patient_specific_medication_in_pregnancy"
         )
-        # All audit fields the user pinned must be present.
-        eff = m["effect"]
-        assert eff["control_class"] == "deterministic_bounded"
-        assert eff["safety_category"] == "prohibited_action"
-        assert eff["override_policy"] == "specialist_review"
-        assert eff["blocking_reason"] == (
+        # All audit fields the user pinned must be present. The tis-v2
+        # certificate serializes rule matches as the FLAT typed
+        # GovernanceRuleMatch record (Commit 4 schema): the former
+        # nested "effect" fields sit at top level, and override_policy
+        # lives in the versioned rule library, resolvable via
+        # (rule_id, rule_version).
+        assert m["control_class"] == "deterministic_bounded"
+        assert m["safety_category"] == "prohibited_action"
+        assert m["blocking_reason"] == (
             "patient_specific_medication_guidance_during_pregnancy"
         )
-        assert eff["requires_human_review"] is True
-        assert eff["decision_pressure"] == "HOLD"
+        assert m["requires_human_review"] is True
+        assert m["decision_pressure"] == "HOLD"
+        assert m["rule_version"]
+        # override_policy: resolved from the registered rule the match
+        # identifies — the certificate carries the pointer, the rule
+        # library carries the static policy text.
+        from tcs.governance.typed_context_rules import TYPED_CONTEXT_RULES
+        rule = next(r_ for r_ in TYPED_CONTEXT_RULES
+                    if r_.rule_id == m["rule_id"])
+        assert rule.effect.override_policy == "specialist_review"
         # And the rule audit links back to the active policy profile.
         assert m["active_policy_profile_id"] == deployed["pack_id"]
 
@@ -258,12 +269,14 @@ class TestMatchedFactsCapturedFromRecipientContext:
             if x["rule_id"]
             == "human_composed_patient_specific_medication_in_pregnancy"
         )
-        facts = m["matched_facts"]
-        # The three recipient_context bindings that satisfied the
-        # rule's fact_predicates must appear in matched_facts.
-        assert facts["pregnant"] is True
-        assert facts["role"] == "patient"
-        assert facts["channel"] == "outbound_message"
+        # tis-v2 privacy contract (Commit 4, owner decision): portable
+        # certificates record fact KEYS only, never fact VALUES — the
+        # typed record carries matched_fact_keys, sorted. The three
+        # recipient_context bindings that satisfied the rule's
+        # fact_predicates must appear by key.
+        assert m["matched_fact_keys"] == sorted(
+            ["channel", "pregnant", "role"]
+        )
 
 
 # --------------------------------------------------------------------------- #

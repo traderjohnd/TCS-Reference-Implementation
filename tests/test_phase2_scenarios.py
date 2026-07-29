@@ -225,8 +225,13 @@ class TestScenario11ResponseInjection:
         assert resp.fail_safe_applied is False
 
         tc = store.get(resp.certificate_id)
-        # C3 sub-factor is 0.00
-        assert tc.failing_dimension_subfactors.get("C", {}).get("C3") == 0.0
+        # C3 is 0.0000 — tis-v2 records the typed c3_score field
+        # (failing_dimension_subfactors is a v1-only alias, superseded
+        # by c3_score + c3_provenance on the v2 wire).
+        from decimal import Decimal as _D
+        assert tc.c3_score == _D("0.0000")
+        assert any(r.source_type == "injection_scan"
+                   for r in tc.c3_provenance)
         # Gate failed
         assert tc.gate_passed is False
         # blocking_reason contains "C3"
@@ -526,10 +531,12 @@ class TestScenario17ChainUncertainty:
         # Connection type resolved as CT-8
         assert tc.connection_type == "CT-8"
         # Chain depth and per-hop scores preserved in the TC for audit
+        # (tis-v2 rehydrates numerics as Decimal — compare numerically)
         assert tc.chain_depth == 3
-        assert tc.chain_u_scores == [0.88, 0.88, 0.88]
+        assert [float(v) for v in tc.chain_u_scores] == [0.88, 0.88, 0.88]
         # U dimension score equals the chain uncertainty value
-        assert tc.component_scores["K"] == pytest.approx(0.3185, abs=1e-4)
+        assert float(tc.component_scores["K"]) == \
+            pytest.approx(0.3185, abs=1e-4)
         # U failed its gate
         assert tc.gate_results["K"] == "fail"
 

@@ -249,8 +249,9 @@ class TestCriterion7_TCSelfDocuments:
         assert tc["policy_set_id"] == deployed_pack["pack_id"]
         # Score
         assert "s_base" in tc and "tis_current" in tc
-        # Gates
-        assert "gate_passed" in tc and "gate_results" in tc
+        # Gates — tis-v2 wire uses the single gate_result vocabulary
+        # (0|1 int) plus per-dimension gate_results.
+        assert "gate_result" in tc and "gate_results" in tc
         # Decision
         assert tc["decision"] in ("Allow", "Observe", "Hold", "Escalate", "Stop")
         # Standards composition (Slice 4 self-documentation)

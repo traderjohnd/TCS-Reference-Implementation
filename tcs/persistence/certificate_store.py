@@ -602,7 +602,11 @@ class CertificateStore:
             cs = tc.component_scores
             if cs:
                 for dim in ("B", "A", "C", "K"):
-                    sums[dim] += cs.get(dim, 0.0)
+                    # Display-tier mean: v2 rows rehydrate component
+                    # scores as canonical Decimals; v1 rows as floats.
+                    # This dashboard metric converts at the read
+                    # boundary — the authoritative values stay on the TC.
+                    sums[dim] += float(cs.get(dim, 0.0))
                 n += 1
         if n == 0:
             return sums

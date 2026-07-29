@@ -234,15 +234,16 @@ class TestC8_RuleMatchesRecordActivePackProfile:
                 f"{active_profile_id!r}"
             )
             # Audit shape must remain complete with the new fields.
+            # tis-v2 serializes the FLAT typed GovernanceRuleMatch
+            # record (Commit 4 schema): the former nested "effect"
+            # fields sit at top level; the c3 signal is the typed
+            # c3_violation bool.
             assert m.get("rule_version"), "rule audit missing rule_version"
-            eff = m["effect"]
-            # New three-class authoritative fields.
-            assert eff.get("control_class"), "rule audit missing control_class"
-            assert eff.get("safety_category"), (
+            assert m.get("control_class"), "rule audit missing control_class"
+            assert m.get("safety_category"), (
                 "rule audit missing safety_category — the new taxonomy field"
             )
-            # Legacy c3_category mirror still emitted for back-compat.
-            assert eff.get("c3_category"), "rule audit missing c3_category (legacy mirror)"
+            assert "c3_violation" in m, "rule audit missing c3_violation"
 
 
 # --------------------------------------------------------------------------- #

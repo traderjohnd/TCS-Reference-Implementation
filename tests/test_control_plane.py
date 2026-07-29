@@ -396,66 +396,47 @@ def _inject_escalate_tc(store, subject_id: str = "test-escalate-01"):
     """
     Construct + issue an Escalate-decision TC directly into the store.
 
-    Engineering an Escalate decision through the RAG adapter requires
-    specific BACK scoring (gate passes, tis_current < theta_escalate)
-    which is brittle. We instead fabricate a TISInput / TISResult that
-    deterministically produces Escalate and route it through the
-    real generate_certificate + store.issue() so the TC is shaped
-    exactly like a runtime-produced Escalate TC.
+    tis-v2 (Commit 5b): the certificate seal REPLAYS the decision from
+    the certificate's own contents, so a forced decision string that the
+    ladder would not produce refuses to seal. The input therefore
+    engineers a GENUINE Escalate: every dimension clears its gate
+    threshold (gate=1) and 20h of decay drives tis_current below
+    theta_escalate=0.70:
+
+        S_base = .25*.95 + .30*.95 + .25*.95 + .20*.85 = 0.9300
+        decay  = e^(-0.05*20) = 0.3679 -> tis_current ~= 0.3422
     """
     from datetime import datetime, timezone
-    from tcs.decision_engine import map_decision
+    from decimal import Decimal
+    from tcs.decision_engine import map_decision_versioned
     from tcs.policy_profiles import load_profile
-    from tcs.tis_engine import TISInput, compute_tis
-    from tcs.trust_certificate import generate_certificate
+    from tcs.tis_engine import TISInput, compute_tis_v2
+    from tcs.trust_certificate import generate_certificate_v2
 
-    # fin-r3-a4-ct4: theta_escalate=0.70, theta_hold=0.85
-    # To land Escalate (gate=1 AND tis_current < theta_escalate),
-    # use B=A=C=K just above the gate thresholds but produce a
-    # composite that's below 0.70. With those weights we need very
-    # uneven scores. Easier path: load a less-strict profile that
-    # makes the Escalate band wide enough to engineer.
     profile = load_profile("fin-r3-a4-ct4")
     inp = TISInput(
         subject_id=subject_id,
         subject_type="recommendation",
         policy_profile=profile,
-        # Scores just above each gate threshold (so gate passes) but
-        # low enough that the weighted composite lands below 0.70.
-        # For fin-r3-a4-ct4 thresholds B=0.80, A=0.85, C=0.80, K=0.80:
-        # use values right at the threshold so S_base ~= 0.81.
-        # That's above theta_escalate (need to be UNDER 0.70).
-        # Force lower-then-threshold scores carefully: nope — gate
-        # requires >= threshold. So we have to drop one dim below
-        # threshold to fail the gate. Escalate via gate-pass + low
-        # TIS is genuinely a narrow band; the easier engineering is
-        # to drop K just under its threshold (gate fails on K) and
-        # then mark the *decision* Escalate via direct construction
-        # — but the decision engine derives Escalate only via the
-        # ladder. Cleanest: pin the decision by going through
-        # generate_certificate with a hand-built TISResult.
-        dimension_scores={"B": 0.85, "A": 0.85, "C": 0.85, "K": 0.85},
-        sub_factor_scores={"C": {"C3": 1.0}},
+        dimension_scores={"B": Decimal("0.95"), "A": Decimal("0.95"),
+                          "C": Decimal("0.95"), "K": Decimal("0.85")},
+        sub_factor_scores={"C": {"C3": Decimal("1.0000")}},
         context_metadata={
             "n_gaps": 0, "context_age_hours": 0.1,
             "novelty_score": 0.0, "days_since_review": 1,
             "is_policy_sensitive": False,
         },
-        elapsed_hours=20.0,  # heavy decay → drives tis_current down
+        elapsed_hours=Decimal("20.0000"),  # heavy decay → below 0.70
         is_valid=1,
         invalidation_event=None,
         evaluation_time=datetime.now(timezone.utc).replace(microsecond=0),
     )
-    res = compute_tis(inp)
-    decision, requires_review = map_decision(inp, res)
-    # If natural scoring landed elsewhere, force Escalate via tweak:
-    # bump elapsed_hours until decision == Escalate, OR build the TC
-    # directly bypassing the engine. For test stability, force the
-    # decision string by constructing the TC manually.
-    if decision != "Escalate":
-        decision = "Escalate"
-        requires_review = True
-    tc = generate_certificate(inp, res, decision, requires_review)
+    res = compute_tis_v2(inp)
+    decision, requires_review = map_decision_versioned(inp, res)
+    assert decision == "Escalate", (
+        f"escalate fixture must land Escalate naturally, got {decision}"
+    )
+    tc = generate_certificate_v2(inp, res, decision, requires_review)
     issued = store.issue(tc)
     return issued.certificate_id
 
@@ -471,33 +452,41 @@ def _inject_hold_tc(store, subject_id: str = "test-hold-01"):
     """
     from datetime import datetime, timezone
     from tcs.decision_engine import map_decision
+    from decimal import Decimal
+    from tcs.decision_engine import map_decision_versioned
     from tcs.policy_profiles import load_profile
-    from tcs.tis_engine import TISInput, compute_tis
-    from tcs.trust_certificate import generate_certificate
+    from tcs.tis_engine import TISInput, compute_tis_v2
+    from tcs.trust_certificate import generate_certificate_v2
 
+    # tis-v2 (Commit 5b): a GENUINE score-band Hold — gate passes
+    # (all dims above threshold), and 4h of decay lands tis_current in
+    # [theta_escalate=0.70, theta_hold=0.85):
+    #     S_base = 0.9300; decay = e^(-0.05*4) = 0.8187
+    #     tis_current ~= 0.7614 -> Hold (Priority 6)
     profile = load_profile("fin-r3-a4-ct4")
     inp = TISInput(
         subject_id=subject_id,
         subject_type="recommendation",
         policy_profile=profile,
-        dimension_scores={"B": 0.85, "A": 0.85, "C": 0.85, "K": 0.85},
-        sub_factor_scores={"C": {"C3": 1.0}},
+        dimension_scores={"B": Decimal("0.95"), "A": Decimal("0.95"),
+                          "C": Decimal("0.95"), "K": Decimal("0.85")},
+        sub_factor_scores={"C": {"C3": Decimal("1.0000")}},
         context_metadata={
             "n_gaps": 0, "context_age_hours": 0.1,
             "novelty_score": 0.0, "days_since_review": 1,
             "is_policy_sensitive": False,
         },
-        elapsed_hours=8.0,
+        elapsed_hours=Decimal("4.0000"),
         is_valid=1,
         invalidation_event=None,
         evaluation_time=datetime.now(timezone.utc).replace(microsecond=0),
     )
-    res = compute_tis(inp)
-    decision, requires_review = map_decision(inp, res)
-    if decision != "Hold":
-        decision = "Hold"
-        requires_review = True
-    tc = generate_certificate(inp, res, decision, requires_review)
+    res = compute_tis_v2(inp)
+    decision, requires_review = map_decision_versioned(inp, res)
+    assert decision == "Hold", (
+        f"hold fixture must land Hold naturally, got {decision}"
+    )
+    tc = generate_certificate_v2(inp, res, decision, requires_review)
     issued = store.issue(tc)
     return issued.certificate_id
 

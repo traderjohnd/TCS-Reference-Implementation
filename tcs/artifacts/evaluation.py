@@ -101,14 +101,15 @@ from tcs.artifacts.models import (
     GovernanceEvaluation,
     ResponseArtifact,
 )
-from tcs.decision_engine import map_decision
+from tcs.canonical import CALCULATION_VERSION_V2
+from tcs.decision_engine import map_decision_versioned
 from tcs.governed_context import assemble_context_v2
 from tcs.policy_profiles import PolicyProfile, load_profile
-from tcs.tis_engine import TISInput, compute_tis, legacy_float_input_view
+from tcs.tis_engine import TISInput, compute_tis_v2
 from tcs.trust_certificate import (
     TrustCertificate,
     compute_tc_hash,
-    generate_certificate,
+    generate_certificate_v2,
 )
 
 
@@ -243,12 +244,21 @@ def snapshot_tis_input(tis_input: TISInput) -> Dict[str, Any]:
         }),
         "context_metadata":   _encode_snapshot_value(
             dict(tis_input.context_metadata or {})),
-        "elapsed_hours":      float(tis_input.elapsed_hours),
+        # Lossless round-trip (no float laundering): a Decimal
+        # elapsed_hours is encoded via the __decimal__ wrapper exactly
+        # like the score fields. Legacy snapshots hold plain floats and
+        # still decode.
+        "elapsed_hours":      _encode_snapshot_value(
+            tis_input.elapsed_hours),
         "is_valid":           int(tis_input.is_valid),
         "invalidation_event": tis_input.invalidation_event,
         "evaluation_time":    tis_input.evaluation_time.strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ),
+        # The calculation semantics this snapshot was captured under.
+        # Absence in a stored snapshot means it predates the tis-v2
+        # activation (captured under the legacy float engine).
+        "calculation_version": CALCULATION_VERSION_V2,
     }
 
 
@@ -271,10 +281,14 @@ def tis_input_from_snapshot(
         that had CT modifiers applied at runtime would see different
         weights and produce a different score.
 
-    Determinism guarantee: ``compute_tis(tis_input_from_snapshot(s))``
-    reproduces the original ``compute_tis(original_tis_input)`` whenever
-    ``s == snapshot_tis_input(original_tis_input)``. The TIS engine is
-    pure; same input gives same output.
+    Determinism guarantee: ``compute_tis_v2(tis_input_from_snapshot(s))``
+    reproduces the original ``compute_tis_v2(original_tis_input)``
+    whenever ``s == snapshot_tis_input(original_tis_input)``. The TIS
+    engine is pure; same input gives same output. (Snapshots captured
+    before the tis-v2 activation — no ``calculation_version`` key —
+    were produced by the legacy float engine; re-evaluating one under
+    tis-v2 is a NEW evaluation, not a reproduction, and the caller
+    records that via ``replayed_from_calculation_version``.)
     """
     from datetime import datetime
     ev = snapshot["evaluation_time"]
@@ -304,7 +318,11 @@ def tis_input_from_snapshot(
         },
         context_metadata=dict(
             _decode_snapshot_value(snapshot.get("context_metadata") or {})),
-        elapsed_hours=float(snapshot.get("elapsed_hours", 0.0)),
+        # Decode preserves the captured representation: Decimal for
+        # v2-era snapshots (__decimal__ wrapper), float for legacy
+        # rows. No float() coercion — that would launder a Decimal.
+        elapsed_hours=_decode_snapshot_value(
+            snapshot.get("elapsed_hours", 0.0)),
         is_valid=int(snapshot.get("is_valid", 1)),
         invalidation_event=snapshot.get("invalidation_event"),
         evaluation_time=datetime.fromisoformat(ev),
@@ -860,16 +878,35 @@ def evaluate_artifact(
             evaluation_time=eval_time,
         )
 
-    # Producers are Decimal-native (5a); the legacy float view feeds
-    # the v1 pipeline until the 5b activation removes this call.
-    tis_input = legacy_float_input_view(tis_input)
-    tis_result = compute_tis(tis_input)
-    decision, requires_review = map_decision(tis_input, tis_result)
+    # tis-v2 activation (Commit 5b): every evaluation runs the canonical
+    # Decimal pipeline. New issuance is tis-v2 ONLY (owner ruling —
+    # answer 2): a legacy runtime snapshot replays under tis-v2 too,
+    # with its source semantics recorded honestly below; reproducing a
+    # HISTORICAL v1 certificate is the frozen v1 replay path in
+    # trust_certificate, never this pipeline.
+    tis_result = compute_tis_v2(tis_input)
+    decision, requires_review = map_decision_versioned(tis_input, tis_result)
 
     # Capture the actual TISInput used for THIS evaluation.
     # Every evaluation (regardless of strategy) carries a snapshot so
     # any future replay can reproduce it deterministically.
     captured_snapshot = snapshot_tis_input(tis_input)
+
+    # Snapshot-based strategies record the SOURCE snapshot's calculation
+    # semantics honestly (Commit 5b). A source captured under tis-v2
+    # replays exactly; a legacy source (absent calculation_version —
+    # captured under the float engine) is re-evaluated under tis-v2, and
+    # this marker says so: the resulting decision is a new tis-v2
+    # evaluation, NOT a claimed reproduction of the historical v1
+    # decision. Historical v1 certificates are verified only through the
+    # frozen v1 replay path in trust_certificate.
+    if resolved_strategy in (
+        EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+        EVALUATION_STRATEGY_WHAT_IF_POLICY_REPLAY,
+    ) and source_snapshot is not None:
+        captured_snapshot["replayed_from_calculation_version"] = str(
+            source_snapshot.get("calculation_version", "tis-v1-legacy")
+        )
     dim_scores = dict(tis_input.dimension_scores)
     ctx = tis_input.context_metadata
 
@@ -881,7 +918,7 @@ def evaluate_artifact(
     tc_id: Optional[str] = None
 
     if mode in (EVALUATION_MODE_OBSERVE, EVALUATION_MODE_ENFORCE):
-        tc = generate_certificate(
+        tc = generate_certificate_v2(
             tis_input, tis_result, decision, requires_review,
         )
         # For observe mode, override the lifecycle_state so the TC
@@ -949,11 +986,16 @@ def evaluate_artifact(
             ctx.get("governance_rule_matches")
             if isinstance(ctx, dict) else None
         ),
-        component_scores={k: round(v, 4) for k, v in dim_scores.items()},
+        # DISPLAY tier: evaluation rows are dashboard/audit-display
+        # values (declared float on the model). The authoritative
+        # canonical Decimals live on the v2 TC (hash-protected decimal
+        # strings) and in governance_input_snapshot (lossless Decimal
+        # round-trip).
+        component_scores={k: float(v) for k, v in dim_scores.items()},
         gate_results=dict(tis_result.gate_results_by_dim),
-        s_base=round(tis_result.s_base, 4),
-        s_adjusted=round(tis_result.s_adj, 4),
-        tis_current=round(tis_result.tis_current, 4),
+        s_base=float(tis_result.s_base),
+        s_adjusted=float(tis_result.s_adj),
+        tis_current=float(tis_result.tis_current),
         decision=decision,
         # enforcement_action is derived from (mode, decision) — don't
         # set it explicitly; the dataclass __post_init__ derives and

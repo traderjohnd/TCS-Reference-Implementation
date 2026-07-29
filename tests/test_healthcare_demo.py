@@ -229,7 +229,9 @@ class TestHealthcareThresholds:
     def test_c_gate_threshold_090(self, all_results):
         r = all_results[0]
         assert r.tc is not None
-        assert r.tc.thresholds["C"] == 0.90
+        # tis-v2 TCs carry canonical Decimal thresholds internally;
+        # compare numerically.
+        assert float(r.tc.thresholds["C"]) == 0.90
 
     def test_all_gates_evaluated(self, all_results):
         r = all_results[0]
