@@ -489,3 +489,186 @@ def _requires_human_review(
         return True
 
     return False
+
+
+# =========================================================================== #
+# tis-v2 — versioned decision semantics (Commit 4 of the landing sequence)    #
+# =========================================================================== #
+#
+# Everything below is ADDITIVE. ``map_decision`` above is frozen — it
+# carries the legacy conjunctive Priority 2 (``gate == 0 and c3 == 0.00``)
+# for v1 production issuance and historical replay, byte-identical.
+#
+# tis-v2 SEMANTIC CORRECTION (owner decision, from the C3 discovery
+# trace): under tis-v2, ``C3_score == 0.0000`` is an UNCONDITIONAL Stop,
+# independent of ``gate_result``. The v1 conjunctive form relied on every
+# producer coupling C3 = 0 with a collapsed C dimension; a decoupled C
+# dimension could leave gate = 1 and let the score ladder continue to
+# Allow. The v2 ladder closes that hole at the decision layer itself.
+#
+# DORMANT: no production caller invokes the v2 path until Commit 5.
+
+from decimal import Decimal
+
+from tcs.canonical import (
+    CALCULATION_VERSION_V2,
+    UnsupportedCalculationVersion,
+    canonical_score,
+)
+
+#: Recognized legacy calculation-version labels (owner guardrail 4):
+#:   "tis-v1"        — results produced by the current legacy engine path
+#:   "tis-v1-legacy" — historical certificates that originally lacked a
+#:                     calculation-version field (internal classification;
+#:                     never serialized into historical v1 wire payloads)
+LEGACY_CALCULATION_VERSIONS = frozenset({"tis-v1", "tis-v1-legacy"})
+
+_NEAR_BOUNDARY_ALLOW_BAND_DECIMAL = Decimal("0.0500")
+_NOVELTY_REVIEW_FLOOR_DECIMAL = Decimal("0.5000")
+
+
+def map_decision_versioned(
+    tis_input: TISInput,
+    tis_result: TISResult,
+) -> Tuple[str, bool]:
+    """Version dispatcher for decision mapping.
+
+    Legacy labels route to the frozen v1 ``map_decision``; "tis-v2"
+    routes to :func:`map_decision_v2`; anything else fails closed.
+    """
+    version = tis_result.calculation_version
+    if version in LEGACY_CALCULATION_VERSIONS:
+        return map_decision(tis_input, tis_result)
+    if version == CALCULATION_VERSION_V2:
+        return map_decision_v2(tis_input, tis_result)
+    raise UnsupportedCalculationVersion(version)
+
+
+def map_decision_v2(
+    tis_input: TISInput,
+    tis_result: TISResult,
+) -> Tuple[str, bool]:
+    """Map a tis-v2 TISResult to an enforcement decision.
+
+    Requires ``tis_result.calculation_version == "tis-v2"`` — the v2
+    ladder must never be applied to a v1 result (and vice versa).
+    All operands are canonical Decimals.
+    """
+    if tis_result.calculation_version != CALCULATION_VERSION_V2:
+        raise UnsupportedCalculationVersion(
+            f"map_decision_v2 requires calculation_version 'tis-v2', "
+            f"got {tis_result.calculation_version!r}"
+        )
+
+    profile = tis_input.policy_profile
+    theta_allow = canonical_score(profile.theta_allow)
+
+    decision = _apply_priority_ladder_v2(
+        is_valid=tis_result.is_valid,
+        c3_score=tis_result.C3_score,
+        gate=tis_result.gate_result,
+        s_base=tis_result.s_base,
+        tis_current=tis_result.tis_current,
+        kappa=canonical_score(profile.soft_hold_ceiling),
+        theta_allow=theta_allow,
+        theta_hold=canonical_score(profile.theta_hold),
+        theta_escalate=canonical_score(profile.theta_escalate),
+        risk_tier=profile.risk_tier,
+    )
+
+    novelty = canonical_score(
+        tis_input.context_metadata.get("novelty_score", 0)
+    )
+    requires_human_review = _requires_human_review_v2(
+        decision=decision,
+        novelty_score=novelty,
+        tis_current=tis_result.tis_current,
+        theta_allow=theta_allow,
+    )
+    return decision, requires_human_review
+
+
+def _apply_priority_ladder_v2(
+    *,
+    is_valid: int,
+    c3_score: Decimal,
+    gate: int,
+    s_base: Decimal,
+    tis_current: Decimal,
+    kappa: Decimal,
+    theta_allow: Decimal,
+    theta_hold: Decimal,
+    theta_escalate: Decimal,
+    risk_tier: str,
+) -> str:
+    """The tis-v2 priority ladder.
+
+    Identical to the v1 ladder EXCEPT Priority 2: under tis-v2,
+    ``c3_score == 0.0000`` is an unconditional Stop — no ``gate == 0``
+    conjunction. It fires before every gate-, kappa-, theta-, and
+    score-based outcome. Only Priority 1 (invalidation) precedes it,
+    and both produce Stop.
+    """
+    # Priority 1 — invalidation (absolute).
+    if is_valid == 0:
+        return "Stop"
+
+    # Priority 2 — hard safety violation. UNCONDITIONAL under tis-v2:
+    # a decoupled C dimension (gate = 1) must not let a C3 = 0 subject
+    # reach the score ladder. Exact canonical equality — C3_score is
+    # canonicalized by the v2 engine.
+    if c3_score == Decimal("0.0000"):
+        return "Stop"
+
+    # Priority 3 — gate failure below the remediability floor.
+    if gate == 0 and s_base < kappa:
+        return "Stop"
+
+    # Priority 4 — gate failure at or above the remediability floor.
+    if gate == 0 and s_base >= kappa:
+        return "Hold"
+
+    # Priority 5 — below escalate threshold.
+    if gate == 1 and tis_current < theta_escalate:
+        return "Escalate"
+
+    # Priority 6 — score-path Hold.
+    if gate == 1 and tis_current < theta_hold:
+        return "Hold"
+
+    # Priority 7 — Observe (r1-only).
+    if gate == 1 and tis_current < theta_allow and risk_tier == "r1":
+        return "Observe"
+
+    # Priority 8 — Allow.
+    if gate == 1 and tis_current >= theta_allow:
+        return "Allow"
+
+    raise ValueError(
+        "tis-v2 decision logic exhausted without resolution. "
+        f"gate={gate} is_valid={is_valid} c3={c3_score} "
+        f"s_base={s_base} tis_current={tis_current} "
+        f"kappa={kappa} theta_allow={theta_allow} theta_hold={theta_hold} "
+        f"theta_escalate={theta_escalate} risk_tier={risk_tier}"
+    )
+
+
+def _requires_human_review_v2(
+    *,
+    decision: str,
+    novelty_score: Decimal,
+    tis_current: Decimal,
+    theta_allow: Decimal,
+) -> bool:
+    """The v1 OR rule on canonical Decimal operands."""
+    if decision == "Stop":
+        return False
+    if decision in ("Hold", "Escalate"):
+        return True
+    if novelty_score > _NOVELTY_REVIEW_FLOOR_DECIMAL:
+        return True
+    if decision == "Allow" and tis_current < (
+        theta_allow + _NEAR_BOUNDARY_ALLOW_BAND_DECIMAL
+    ):
+        return True
+    return False

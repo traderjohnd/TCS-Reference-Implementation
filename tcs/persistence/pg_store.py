@@ -40,8 +40,11 @@ from psycopg.rows import dict_row
 from tcs.trust_certificate import (
     AuditIntegrity,
     TrustCertificate,
+    classify_certificate_schema_version,
     compute_legacy_raw_tc_hash,
+    compute_raw_stored_tc_hash,
     compute_tc_hash,
+    validate_v2_certificate_for_sealing,
 )
 from tcs.persistence.certificate_store import (
     ChainSequenceError,
@@ -195,7 +198,12 @@ class PostgresCertificateStore:
             )
 
             issued_tc = dataclass_replace(tc, audit_integrity=new_audit)
-            final_hash = compute_tc_hash(issued_tc.to_dict())
+            # Sealing boundary (tis-v2 Commit 4) — same explicit contract
+            # as the SQLite store.
+            serialized = issued_tc.to_dict()
+            if classify_certificate_schema_version(serialized) == 2:
+                validate_v2_certificate_for_sealing(serialized)
+            final_hash = compute_tc_hash(serialized)
             issued_tc.audit_integrity = AuditIntegrity(
                 tc_hash=final_hash,
                 previous_tc_hash=new_previous_hash,
@@ -427,7 +435,7 @@ class PostgresCertificateStore:
             if not ai:
                 return False
             try:
-                recomputed = compute_legacy_raw_tc_hash(raw)
+                recomputed = compute_raw_stored_tc_hash(raw)
             except (CertificateInvariantError,
                     UnsupportedCertificateSchemaVersion):
                 return False

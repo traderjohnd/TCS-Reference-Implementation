@@ -166,12 +166,17 @@ class TestSchemaVersionDispatch:
         assert build_hash_payload(with_key) == build_hash_payload(base)
         assert compute_tc_hash(with_key) == FIXTURE_RECORDS[0]["tc_hash"]
 
-    def test_version_2_fails_closed_until_commit_4(self):
+    def test_version_2_marked_v1_content_fails_closed(self):
+        # Since Commit 4 the dispatcher routes version 2 to the real v2
+        # payload builder, whose exact-schema validation rejects
+        # v1-shaped content outright — still fail-closed, now with the
+        # schema-mismatch invariant error. A v1 record can never
+        # masquerade as v2.
         d = json.loads(FIXTURE_RECORDS[0]["content_json"])
         d["certificate_schema_version"] = 2
-        with pytest.raises(UnsupportedCertificateSchemaVersion):
+        with pytest.raises(CertificateInvariantError):
             build_hash_payload(d)
-        with pytest.raises(UnsupportedCertificateSchemaVersion):
+        with pytest.raises(CertificateInvariantError):
             compute_tc_hash(d)
 
     @pytest.mark.parametrize(
@@ -267,10 +272,12 @@ class TestRehydrationReconstruction:
         tc = _tc_from_json(json.dumps(d))
         assert compute_tc_hash(tc.to_dict()) == record["tc_hash"]
 
-    def test_version_2_content_fails_rehydration(self):
+    def test_version_2_marked_v1_content_fails_rehydration(self):
+        # Version 2 now routes to the strict v2 deserializer, whose
+        # exact-schema validation rejects v1-shaped content.
         d = json.loads(FIXTURE_RECORDS[0]["content_json"])
         d["certificate_schema_version"] = 2
-        with pytest.raises(UnsupportedCertificateSchemaVersion):
+        with pytest.raises(CertificateInvariantError):
             _tc_from_json(json.dumps(d))
 
     @pytest.mark.parametrize("bad", [0, 3, True, "1", "2", None])

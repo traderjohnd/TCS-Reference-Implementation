@@ -45,8 +45,12 @@ from typing import Any, Dict, Iterator, List, Optional, Union
 from tcs.trust_certificate import (
     AuditIntegrity,
     TrustCertificate,
+    classify_certificate_schema_version,
     compute_legacy_raw_tc_hash,
+    compute_raw_stored_tc_hash,
     compute_tc_hash,
+    tc_from_dict_v2,
+    validate_v2_certificate_for_sealing,
 )
 from tcs.canonical import (
     CertificateInvariantError,
@@ -231,7 +235,19 @@ class CertificateStore:
 
             # Recompute the hash over the full to_dict() — this is stable
             # because compute_tc_hash drops the "audit_integrity" key.
-            final_hash = compute_tc_hash(issued_tc.to_dict())
+            #
+            # SEALING BOUNDARY (tis-v2 Commit 4): for schema version 2,
+            # the COMPLETE validation-and-replay contract runs here,
+            # explicitly, immediately before the hash is finalized and
+            # the certificate is persisted. compute_tc_hash's v2 payload
+            # path runs the same contract, so the guarantee holds even
+            # for callers that bypass the store — but the store states
+            # it at the persistence boundary rather than relying on the
+            # hash path alone.
+            serialized = issued_tc.to_dict()
+            if classify_certificate_schema_version(serialized) == 2:
+                validate_v2_certificate_for_sealing(serialized)
+            final_hash = compute_tc_hash(serialized)
             issued_tc.audit_integrity = AuditIntegrity(
                 tc_hash=final_hash,
                 previous_tc_hash=new_previous_hash,
@@ -618,9 +634,14 @@ class CertificateStore:
             if not ai:
                 return False
 
-            # (a) content hash verified from the raw persisted dict
+            # (a) content hash verified from the raw persisted dict.
+            # Version-dispatched (tis-v2 Commit 4): absence of
+            # certificate_schema_version -> frozen legacy raw path;
+            # explicit 2 -> the validating v2 payload (exact-schema
+            # check detects injected fields); anything else does not
+            # match either wire contract and fails verification.
             try:
-                recomputed = compute_legacy_raw_tc_hash(raw)
+                recomputed = compute_raw_stored_tc_hash(raw)
             except (CertificateInvariantError,
                     UnsupportedCertificateSchemaVersion):
                 return False
@@ -876,18 +897,17 @@ def _tc_from_json(content_json: str) -> TrustCertificate:
         - verify_chain() (needs audit_integrity + content hash)
         - get() returning a TC that to_dict() reproduces identically
 
-    Schema-version dispatch (tis-v2 Commit 3): absence of
+    Schema-version dispatch (tis-v2 Commit 3/4): absence of
     ``certificate_schema_version`` means v1 — never a model default.
     Explicit integer 1 is accepted as internal dispatch metadata and
-    deliberately stripped before the legacy constructor (the current
-    dataclass carries no such field; Commit 4 adds it for v2). Version
-    2 fails closed until Commit 4 lands v2 deserialization. Anything
-    else is unsupported.
+    deliberately stripped before the legacy constructor. Version 2
+    routes to the strict v2 deserializer (which validates the complete
+    sealing contract before parsing). Anything else is unsupported.
     """
     d = json.loads(content_json)
 
     if "certificate_schema_version" in d:
-        version = d.pop("certificate_schema_version")
+        version = d["certificate_schema_version"]
         if isinstance(version, bool) or not isinstance(version, int) \
                 or version not in (1, 2):
             raise UnsupportedCertificateSchemaVersion(
@@ -895,12 +915,10 @@ def _tc_from_json(content_json: str) -> TrustCertificate:
                 f"got {version!r}"
             )
         if version == 2:
-            raise UnsupportedCertificateSchemaVersion(
-                "certificate_schema_version=2: v2 certificate "
-                "deserialization lands in Commit 4; failing closed"
-            )
+            return tc_from_dict_v2(d)
         # version == 1: dispatch metadata only — continue on the
         # legacy path with the key stripped.
+        d.pop("certificate_schema_version")
 
     return TrustCertificate(
         # Identity

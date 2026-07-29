@@ -165,7 +165,7 @@ def chain_walk(
         CertificateInvariantError,
         UnsupportedCertificateSchemaVersion,
     )
-    from tcs.trust_certificate import compute_legacy_raw_tc_hash
+    from tcs.trust_certificate import compute_raw_stored_tc_hash
 
     store = request.app.state.store
     tcs = store.list_chain(chain_id)
@@ -217,7 +217,7 @@ def chain_walk(
         else:
             try:
                 content_hash_ok = (
-                    compute_legacy_raw_tc_hash(raw) == ai.tc_hash
+                    compute_raw_stored_tc_hash(raw) == ai.tc_hash
                 )
             except (CertificateInvariantError,
                     UnsupportedCertificateSchemaVersion):
