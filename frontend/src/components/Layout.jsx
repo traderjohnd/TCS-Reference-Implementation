@@ -24,6 +24,7 @@ const NAV_SECTIONS = [
     label: 'RUN',
     items: [
       { path: '/chat',      label: 'Chat',      short: 'Ch', view: 'chat' },
+      { path: '/compare',   label: 'Model Comparison', short: 'MC', view: 'compare' },
       { path: '/decisions', label: 'Live',      short: 'Li', view: 'decisions' },
     ],
   },

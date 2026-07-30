@@ -288,11 +288,19 @@ def _persist_query_artifact_and_evaluation(
     decision: str,
     issued_tc: Any,
     composer_metadata: Optional[Dict[str, Any]],
+    identity_role: str = "runtime_query_path",
+    recipient_context_extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Best-effort persistence of artifact + evaluation rows for a query.
     Raises are caught at the call site so /v2/query semantics never
     break on a persistence failure.
+
+    ``identity_role`` and ``recipient_context_extra`` let the Commit-4
+    comparison path reuse this helper with its own audit identity and
+    bounded correlation metadata (comparison_id, member id, common
+    prompt/context hashes — never credentials) without changing the
+    default /v2/query behavior.
     """
     from tcs.artifacts import (
         EVALUATION_MODE_ENFORCE,
@@ -357,11 +365,14 @@ def _persist_query_artifact_and_evaluation(
         retrieved_sources=retrieved_sources,
         workflow_trace_id=trace.workflow_id,
         workflow_trace=trace.to_dict(),
-        recipient_context={"industry_hint": industry} if industry else {},
+        recipient_context={
+            **({"industry_hint": industry} if industry else {}),
+            **(recipient_context_extra or {}),
+        },
         generation_identity={
             "requesting_identity": "query_endpoint",
             "identity_type": "system",
-            "role": "runtime_query_path",
+            "role": identity_role,
             "session_id": getattr(trace, "workflow_id", None),
         },
     )
@@ -417,7 +428,7 @@ def _persist_query_artifact_and_evaluation(
         evaluator_identity={
             "requesting_identity": "query_endpoint",
             "identity_type": "system",
-            "role": "runtime_query_path",
+            "role": identity_role,
         },
         evaluation_completeness_score=1.0,
         evaluation_origin=EVALUATION_ORIGIN_QUERY,
