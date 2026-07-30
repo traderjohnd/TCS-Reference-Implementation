@@ -249,12 +249,49 @@ class TestAnthropicResponseNormalization:
         p = self._provider(monkeypatch, usage=None)
         assert p.generate_result("q", []).usage == {}
 
-    def test_empty_content_produces_bounded_diagnostic(self, monkeypatch):
+    def test_empty_content_is_provider_failure_not_model_output(self, monkeypatch):
+        # Fixup after eb80246: no text blocks -> no model output. The
+        # diagnostic is a SYSTEM message riding the provider-failure
+        # path — never placed in content, never scored, never certified.
         p = self._provider(monkeypatch, text=None, stop_reason="refusal")
-        result = p.generate_result("q", [])
-        assert "returned no content" in result.content
-        assert "stop_reason=refusal" in result.content
-        assert len(result.content) < 300  # bounded diagnostic, not a dump
+        with pytest.raises(ProviderError) as excinfo:
+            p.generate_result("q", [])
+        assert excinfo.value.category == "empty_content"
+        assert "returned no usable text" in excinfo.value.detail
+        assert len(excinfo.value.detail) < 300  # bounded diagnostic
+        last = p.last_result
+        assert last.content == ""              # established empty repr
+        assert last.error_category == "empty_content"
+        assert last.finish_status == "refusal"  # provider's own status
+        assert last.request_id == "msg_abc123"  # telemetry preserved
+        assert last.usage["total_tokens"] == 46
+        assert last.provenance["anthropic_stop_reason"] == "refusal"
+
+    def test_tool_actions_without_final_text_is_empty_output(self, monkeypatch):
+        # Non-text blocks but no final answer: bounded tool-action
+        # provenance is preserved; tool inputs are never treated as the
+        # answer; no ProviderResult with content is returned.
+        p = self._provider(
+            monkeypatch,
+            text=None,
+            stop_reason="tool_use",
+            extra_blocks=(
+                SimpleNamespace(type="tool_use", id="tu_1",
+                                name="search_corpus",
+                                input={"query": "secret args"}),
+            ),
+        )
+        with pytest.raises(ProviderError) as excinfo:
+            p.generate_result("q", [])
+        assert excinfo.value.category == "empty_content"
+        assert "tool action" in excinfo.value.detail
+        last = p.last_result
+        assert last.content == ""
+        assert last.tool_actions == [
+            {"type": "tool_use", "id": "tu_1", "name": "search_corpus"},
+        ]
+        # Bounded provenance only — tool arguments never recorded.
+        assert "secret args" not in str(last)
 
 
 # --------------------------------------------------------------------------- #

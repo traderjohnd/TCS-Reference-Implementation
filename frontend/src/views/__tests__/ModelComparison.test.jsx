@@ -295,6 +295,35 @@ describe('ModelComparison — results', () => {
     expect(screen.getByText(/1 governed · 1 provider failure/)).toBeInTheDocument();
   });
 
+  it('shows empty provider output as a provider-layer failure, never a decision', async () => {
+    await runWith([
+      member(),
+      member({ comparison_member_id: 'cmp-1-m1', ordinal: 1,
+               provider: 'anthropic', model: 'claude-opus-5',
+               status: 'empty_output',
+               error: 'LLM provider error: anthropic: claude-opus-5 returned no usable text (stop_reason=refusal).',
+               response: null, decision: null, certificate_id: null,
+               artifact_id: null, component_scores: null,
+               gate_results: null,
+               provider_request_id: 'msg-anthropic-1',
+               usage: { total_tokens: 33 } }),
+    ]);
+    expect(await screen.findByText(/Provider returned no usable output/i))
+      .toBeInTheDocument();
+    // The diagnostic is clearly a system message, not model content.
+    expect(screen.getByText(/System diagnostic \(not model output\)/i))
+      .toBeInTheDocument();
+    // No governance decision is displayed for the empty member —
+    // only the sibling's Allow badge exists, and no Hold/Stop/Escalate.
+    expect(screen.getAllByText('Allow')).toHaveLength(1);
+    expect(screen.queryByText('Hold')).not.toBeInTheDocument();
+    expect(screen.queryByText('Stop')).not.toBeInTheDocument();
+    expect(screen.queryByText('Escalate')).not.toBeInTheDocument();
+    // Safe provenance remains visible; sibling stays certified.
+    expect(screen.getByText(/33 tokens/)).toBeInTheDocument();
+    expect(screen.getAllByRole('link', { name: /certificate/i })).toHaveLength(1);
+  });
+
   it('remains usable when every provider fails', async () => {
     await runWith([
       member({ status: 'provider_error', error: 'openai down',

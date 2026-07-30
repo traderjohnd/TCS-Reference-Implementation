@@ -48,6 +48,7 @@ class ProviderResult:
     usage: Dict[str, Any] = field(default_factory=dict)
     tool_actions: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None         # provider error detail (no secrets)
+    error_category: Optional[str] = None  # e.g. "empty_content"
     latency_ms: Optional[float] = None
     finish_status: str = "unknown"      # stop | length | error | ...
     provenance: Dict[str, Any] = field(default_factory=dict)
@@ -65,20 +66,35 @@ class ProviderResult:
             "finish_status": self.finish_status,
             "provider_latency_ms": self.latency_ms,
             "error": self.error,
+            "error_category": self.error_category,
             **{k: v for k, v in self.provenance.items()},
         }
 
 
 class ProviderError(RuntimeError):
     """A provider-side failure (auth, model availability, network,
-    content policy). ALWAYS distinct from a governance outcome — no
-    Trust Certificate is issued for a provider failure. The message
-    must never contain credential material."""
+    content policy, or a technically-successful response with no usable
+    model-generated text). ALWAYS distinct from a governance outcome —
+    no Trust Certificate is issued for a provider failure. The message
+    must never contain credential material.
 
-    def __init__(self, provider: str, detail: str) -> None:
+    ``category`` classifies the failure ("provider_error" default;
+    "empty_content" when the provider returned no usable text — an
+    adapter diagnostic is a SYSTEM message, never model output, so it
+    rides ``detail``/``result.error`` and is never placed in
+    ``ProviderResult.content``). ``result`` optionally carries a
+    pre-built error-shaped ProviderResult preserving truthful provider
+    telemetry (request id, usage, finish status, bounded tool actions)
+    for trace provenance."""
+
+    def __init__(self, provider: str, detail: str,
+                 category: str = "provider_error",
+                 result: "Optional[ProviderResult]" = None) -> None:
         super().__init__(f"{provider}: {detail}")
         self.provider = provider
         self.detail = detail
+        self.category = category
+        self.result = result
 
 
 class BaseLiveProvider:
@@ -98,7 +114,15 @@ class BaseLiveProvider:
         try:
             result = self._call(query, context)
         except ProviderError as exc:
-            self._record_error(exc, t0)
+            if exc.result is not None:
+                # Adapter supplied an error-shaped result carrying the
+                # provider's truthful telemetry — keep it, stamped with
+                # latency, as the trace-provenance source.
+                exc.result.latency_ms = round(
+                    (time.perf_counter() - t0) * 1000, 1)
+                self.last_result = exc.result
+            else:
+                self._record_error(exc, t0)
             raise
         except Exception as exc:  # noqa: BLE001 — normalize to ProviderError
             err = ProviderError(self.name, f"{type(exc).__name__}: {exc}")
@@ -118,6 +142,7 @@ class BaseLiveProvider:
             model=self.model,
             content="",
             error=exc.detail,
+            error_category=exc.category,
             latency_ms=round((time.perf_counter() - t0) * 1000, 1),
             finish_status="error",
         )

@@ -91,17 +91,31 @@ function MemberCard({ member: m }) {
         </span>
       </div>
 
-      {/* Provider failure — explicitly NOT a governance decision */}
+      {/* Provider-layer failure — explicitly NOT a governance decision.
+          empty_output means the provider answered without any usable
+          model-generated text; the message shown is a system
+          diagnostic, never provider content. */}
       {isProviderFailure && (
         <div className="bg-red-900/15 border border-red-900/60 rounded p-2">
           <div className="text-[11px] font-semibold text-red-400 uppercase tracking-wide">
-            Provider {m.status === 'timeout' ? 'timeout' : 'error'}
+            {m.status === 'timeout' ? 'Provider timeout'
+              : m.status === 'empty_output' ? 'Provider returned no usable output'
+              : 'Provider error'}
           </div>
-          <p className="text-xs text-red-300 mt-1 break-words">{m.error}</p>
+          <p className="text-xs text-red-300 mt-1 break-words">
+            <span className="text-gray-500">System diagnostic (not model output): </span>
+            {m.error}
+          </p>
           <p className="text-[10px] text-gray-500 mt-1">
             No model output was produced, so no governance decision or
             Trust Certificate exists for this member.
           </p>
+          {(m.provider_request_id || m.usage?.total_tokens != null) && (
+            <p className="text-[10px] text-gray-600 font-mono mt-1">
+              {m.provider_request_id && `req ${String(m.provider_request_id).slice(0, 18)} `}
+              {m.usage?.total_tokens != null && `· ${m.usage.total_tokens} tokens`}
+            </p>
+          )}
         </div>
       )}
 

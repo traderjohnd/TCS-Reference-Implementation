@@ -76,11 +76,13 @@ def _fake_anthropic(monkeypatch, text="Claude answer.", raise_exc=None):
             calls["n"] += 1
             if raise_exc is not None:
                 raise raise_exc
+            blocks = [] if text is None else \
+                [SimpleNamespace(type="text", text=text)]
             return SimpleNamespace(
                 id="msg-anthropic-1",
                 stop_reason="end_turn",
                 usage=SimpleNamespace(input_tokens=11, output_tokens=22),
-                content=[SimpleNamespace(type="text", text=text)],
+                content=blocks,
             )
 
     messages = _Messages()
@@ -492,18 +494,69 @@ class TestFailureIsolation:
         assert by["openai"]["certificate_id"] is None
         assert by["mock"]["status"] == "ok"
 
-    def test_empty_content_still_governed(self, client, monkeypatch):
+    def test_empty_output_is_provider_layer_failure(self, client, monkeypatch):
+        # Fixup after eb80246: no usable model-generated text means no
+        # model output — the member is a bounded provider-layer failure
+        # with safe provenance preserved, never a governed success.
         _go_live(client)
-        _fake_openai(monkeypatch, text=None)  # empty-content response
+        _fake_openai(monkeypatch, text=None)
         r = _compare(client, [
             {"provider": "openai", "model": "gpt-4o", "api_key": "sk"},
             _mock_target(),
         ])
+        assert r.status_code == 200
         by = {m["provider"]: m for m in r.json()["members"]}
-        # The adapter's bounded diagnostic IS model output — it is
-        # governed and certified like any other content.
-        assert by["openai"]["status"] == "ok"
-        assert by["openai"]["certificate_id"]
+        empty = by["openai"]
+        assert empty["status"] == "empty_output"
+        assert "returned no usable text" in empty["error"]
+        # No authoritative governance artifacts of any kind.
+        assert empty["decision"] is None
+        assert empty["component_scores"] is None
+        assert empty["gate_results"] is None
+        assert empty["certificate_id"] is None
+        assert empty["artifact_id"] is None
+        assert empty["response"] is None
+        # Safe provider provenance is preserved.
+        assert empty["provider_request_id"] == "req-openai-1"
+        assert empty["usage"]["total_tokens"] == 30
+        # The sibling remains governed and certified.
+        assert by["mock"]["status"] == "ok"
+        assert by["mock"]["certificate_id"]
+
+    def test_empty_output_never_reaches_governance(self, client, monkeypatch):
+        # Poison the scoring and certificate layers: an all-empty
+        # comparison must complete without touching either, returning
+        # an intact comparison record with no certificates.
+        import tcs.tis_engine as te
+        import tcs.trust_certificate as tcert
+        monkeypatch.setattr(
+            te, "compute_tis_v2",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("diagnostic must never reach compute_tis_v2")),
+        )
+        monkeypatch.setattr(
+            tcert, "generate_certificate_v2",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("generate_certificate_v2 must not be called")),
+        )
+        _go_live(client)
+        _fake_openai(monkeypatch, text=None)
+        _fake_anthropic(monkeypatch, text=None)
+        artifact_store = client.app.state.artifact_store
+        n_before = len(artifact_store.list_artifacts(limit=1000))
+        r = _compare(client, [
+            {"provider": "openai", "model": "gpt-4o", "api_key": "sk"},
+            {"provider": "anthropic", "model": "claude-opus-5",
+             "api_key": "sk"},
+        ])
+        assert r.status_code == 200
+        body = r.json()
+        assert all(m["status"] == "empty_output" for m in body["members"])
+        assert all(m["certificate_id"] is None for m in body["members"])
+        assert all(m["decision"] is None for m in body["members"])
+        # Comparison input record intact; no artifacts/evaluations added.
+        assert body["prompt_package_hash"]
+        assert len(artifact_store.list_artifacts(limit=1000)) == n_before
 
     def test_all_providers_fail_response_remains_usable(self, client, monkeypatch):
         _go_live(client)
@@ -520,6 +573,53 @@ class TestFailureIsolation:
         assert all(m["certificate_id"] is None for m in body["members"])
         # The comparison input record is still intact for the operator.
         assert body["prompt_package_hash"]
+
+
+# --------------------------------------------------------------------------- #
+# Ordinary Live Chat (/v2/query) empty-output semantics                        #
+# --------------------------------------------------------------------------- #
+
+class TestOrdinaryQueryEmptyOutput:
+    def test_query_empty_output_is_provider_failure_no_certificate(
+            self, client, monkeypatch):
+        _go_live(client)
+        _fake_openai(monkeypatch, text=None)
+        artifact_store = client.app.state.artifact_store
+        n_before = len(artifact_store.list_artifacts(limit=1000))
+        r = client.post("/v2/query", json={
+            "query": "What is the document retention policy?",
+            "provider": "openai", "api_key": "sk-t", "model": "gpt-4o",
+        })
+        assert r.status_code == 200
+        body = r.json()
+        # Provider-layer failure — visibly distinct from any governance
+        # decision, with no certificate and nothing persisted.
+        assert body["decision"] == "Error"
+        assert body["decision"] not in ("Hold", "Stop", "Escalate")
+        assert body["blocked"] is True
+        assert body["certificate_id"] is None
+        assert body["blocking_reason"].startswith("provider_empty_output:")
+        assert "returned no usable text" in body["blocking_reason"]
+        assert len(artifact_store.list_artifacts(limit=1000)) == n_before
+        # The application stays usable: a following mock query succeeds.
+        r2 = client.post("/v2/query", json={
+            "query": "What is the document retention policy?",
+            "provider": "mock", "model": "deterministic",
+        })
+        assert r2.status_code == 200
+        assert r2.json()["certificate_id"]
+
+    def test_query_valid_output_behavior_unchanged(self, client, monkeypatch):
+        _go_live(client)
+        _fake_openai(monkeypatch, text="A perfectly ordinary answer.")
+        r = client.post("/v2/query", json={
+            "query": "What is the document retention policy?",
+            "provider": "openai", "api_key": "sk-t", "model": "gpt-4o",
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["decision"] == "Allow"
+        assert body["certificate_id"]
 
 
 # --------------------------------------------------------------------------- #

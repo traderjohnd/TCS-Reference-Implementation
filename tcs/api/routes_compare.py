@@ -96,7 +96,13 @@ class ComparisonMember(BaseModel):
     connection_name: Optional[str] = None
     label: Optional[str] = None
     execution_mode: str                 # truthful per member
-    status: str                         # ok | provider_error | timeout
+    # ok            — usable model output, independently governed
+    # provider_error — provider-layer failure; no decision, no TC
+    # empty_output  — provider returned no usable model-generated text
+    #                 (a system diagnostic is NOT model output); no
+    #                 decision, no TC, safe provenance preserved
+    # timeout       — bounded timeout hit; no decision, no TC
+    status: str
     response: Optional[str] = None
     blocked: bool = False
     latency_ms: Optional[float] = None
@@ -446,11 +452,23 @@ def run_comparison(body: ComparisonRequest, request: Request) -> ComparisonRespo
         if llm_event and llm_event.error:
             # Provider failure: no model output was produced, so no
             # Trust Certificate is issued — a provider error is never
-            # a governance decision.
+            # a governance decision. When the provider technically
+            # answered but returned no usable text, classify it as
+            # empty_output and preserve the provider's safe telemetry
+            # (request id, usage) from the error-shaped last_result;
+            # the diagnostic text is a SYSTEM message, never scored.
+            last = getattr(m["provider_obj"], "last_result", None)
+            summary = {}
+            if last is not None and hasattr(last, "provenance_summary"):
+                summary = last.provenance_summary()
+            is_empty = summary.get("error_category") == "empty_content"
             members_out.append(ComparisonMember(
-                **base, status="provider_error",
+                **base,
+                status="empty_output" if is_empty else "provider_error",
                 error=f"LLM provider error: {llm_event.error}",
                 latency_ms=llm_event.latency_ms,
+                usage=summary.get("usage") or None,
+                provider_request_id=summary.get("request_id"),
             ))
             continue
 

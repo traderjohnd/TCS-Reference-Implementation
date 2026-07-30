@@ -107,6 +107,17 @@ class AnthropicProvider(BaseLiveProvider):
             b.text for b in blocks if getattr(b, "type", None) == "text"
         )
 
+        # Bounded tool-action provenance: names/ids only — tool inputs
+        # are never treated as (or folded into) a final answer.
+        tool_actions = [
+            {
+                "type": "tool_use",
+                "id": getattr(b, "id", None),
+                "name": getattr(b, "name", None),
+            }
+            for b in blocks if getattr(b, "type", None) == "tool_use"
+        ]
+
         raw_stop = getattr(response, "stop_reason", None)
         finish = STOP_REASON_TO_FINISH_STATUS.get(
             raw_stop, raw_stop or "unknown"
@@ -129,10 +140,38 @@ class AnthropicProvider(BaseLiveProvider):
             }
 
         if not content:
-            content = (
-                f"[{self.model} returned no content. "
-                f"stop_reason={raw_stop}. "
-                "Try restating the question or switching providers.]"
+            # No usable model-generated text — whether the response was
+            # entirely empty or carried only non-text blocks (tool_use,
+            # etc.). An adapter-authored explanation is a system
+            # diagnostic, never model output: it must not enter content,
+            # TIS evaluation, or a Trust Certificate. Raise through the
+            # established provider-failure path, preserving the
+            # provider's truthful telemetry (request id, usage, finish
+            # status, bounded tool actions) for trace provenance.
+            diag = self._sanitize(
+                f"{self.model} returned no usable text "
+                f"(stop_reason={raw_stop}"
+                + (f", {len(tool_actions)} tool action(s) without a "
+                   "final answer" if tool_actions else "")
+                + ")."
+            )
+            raise ProviderError(
+                "anthropic", diag, category="empty_content",
+                result=ProviderResult(
+                    provider=self.name,
+                    model=self.model,
+                    content="",                     # established empty repr
+                    request_id=getattr(response, "id", None),
+                    usage=usage,
+                    tool_actions=tool_actions,
+                    error=diag,
+                    error_category="empty_content",
+                    finish_status=finish,           # provider's own status
+                    provenance={
+                        "display_model": self.display_name,
+                        "anthropic_stop_reason": raw_stop,
+                    },
+                ),
             )
 
         return ProviderResult(
@@ -141,6 +180,7 @@ class AnthropicProvider(BaseLiveProvider):
             content=content,
             request_id=getattr(response, "id", None),
             usage=usage,
+            tool_actions=tool_actions,
             finish_status=finish,
             provenance={
                 "display_model": self.display_name,

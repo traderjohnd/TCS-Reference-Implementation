@@ -281,16 +281,32 @@ class TestOpenAIProviderMapping:
         assert "chunk one" in messages[1]["content"]
         assert "What is the policy?" in messages[1]["content"]
 
-    def test_empty_content_produces_diagnostic(self, monkeypatch):
+    def test_empty_content_is_provider_failure_not_model_output(self, monkeypatch):
+        # Fixup after eb80246: an adapter-authored diagnostic is a
+        # SYSTEM message, never model output. Empty text raises through
+        # the established provider-failure path with category
+        # empty_content; content keeps the established empty
+        # representation, and the provider's truthful telemetry is
+        # preserved on the error-shaped last_result.
         _fake_openai_module(
             monkeypatch,
             response=_openai_response(content=None, finish_reason="length"),
         )
-        result = OpenAIProvider(
-            api_key="sk-test", model="gpt-5.5 (Instant)",
-        ).generate_result("q", [])
-        assert "returned no content" in result.content
-        assert "finish_reason=length" in result.content
+        p = OpenAIProvider(api_key="sk-test", model="gpt-5.5 (Instant)")
+        with pytest.raises(ProviderError) as excinfo:
+            p.generate_result("q", [])
+        assert excinfo.value.category == "empty_content"
+        assert "returned no usable text" in excinfo.value.detail
+        last = p.last_result
+        assert last is not None
+        assert last.content == ""              # no invented sentence
+        assert last.error_category == "empty_content"
+        assert "returned no usable text" in last.error
+        assert last.finish_status == "length"  # provider's own status
+        assert last.request_id == "req-123"    # telemetry preserved
+        assert last.usage["total_tokens"] == 30
+        assert last.latency_ms is not None
+        assert last.provenance_summary()["error_category"] == "empty_content"
 
     def test_custom_model_id_sent_verbatim(self, monkeypatch):
         completions = _fake_openai_module(monkeypatch, response=_openai_response())

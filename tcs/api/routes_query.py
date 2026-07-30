@@ -822,9 +822,20 @@ def _run_query_via_trace(
     latency["workflow_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
     # Surface any connector-level error directly without persisting a TC.
+    # This includes empty provider output: a response with no usable
+    # model-generated text is a provider-layer failure — the adapter's
+    # diagnostic is a SYSTEM message, never model output, so nothing is
+    # scored, no evaluation is written, and no certificate is issued.
     llm_event = trace.get_node("llm-generate").event
     if llm_event and llm_event.error:
         latency["total_ms"] = round((time.perf_counter() - t_total) * 1000, 1)
+        last = getattr(provider, "last_result", None)
+        is_empty = (
+            last is not None
+            and getattr(last, "error_category", None) == "empty_content"
+        )
+        reason_prefix = ("provider_empty_output" if is_empty
+                         else "LLM provider error")
         return QueryResponse(
             query=body.query,
             response=None,
@@ -834,7 +845,7 @@ def _run_query_via_trace(
             tis_current=None,
             tis_raw=None,
             gate_result=None,
-            blocking_reason=f"LLM provider error: {llm_event.error}",
+            blocking_reason=f"{reason_prefix}: {llm_event.error}",
             requires_human_review=False,
             retrieval_chunks=[],
             latency_ms=latency,

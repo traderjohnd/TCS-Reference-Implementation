@@ -96,21 +96,54 @@ class OpenAIProvider(BaseLiveProvider):
                 "completion_tokens": getattr(u, "completion_tokens", None),
                 "total_tokens": getattr(u, "total_tokens", None),
             }
+
+        # Bounded tool-action provenance: names/ids only — tool
+        # arguments are never treated as (or folded into) an answer.
+        tool_actions = []
+        for tc in getattr(choice.message, "tool_calls", None) or []:
+            fn = getattr(tc, "function", None)
+            tool_actions.append({
+                "type": "tool_call",
+                "id": getattr(tc, "id", None),
+                "name": getattr(fn, "name", None) if fn is not None else None,
+            })
+
         if not content:
-            content = (
-                f"[{api_model} returned no content. "
-                f"finish_reason={finish}. "
-                "This usually means the model spent its token budget on "
-                "internal reasoning before producing output, or a content "
-                "policy intervened. Try Thinking mode, switch to gpt-4o, "
-                "or restate the question.]"
+            # No usable model-generated text exists. An explanatory
+            # sentence from THIS adapter is a system diagnostic, not
+            # model output — it must never enter content, TIS
+            # evaluation, or a Trust Certificate. Raise through the
+            # established provider-failure path with the provider's
+            # truthful telemetry preserved for trace provenance.
+            diag = (
+                f"{api_model} returned no usable text "
+                f"(finish_reason={finish}). This usually means the model "
+                "spent its token budget on internal reasoning before "
+                "producing output, or a content policy intervened."
             )
+            raise ProviderError(
+                "openai", diag, category="empty_content",
+                result=ProviderResult(
+                    provider=self.name,
+                    model=api_model,
+                    content="",                     # established empty repr
+                    request_id=getattr(response, "id", None),
+                    usage=usage,
+                    tool_actions=tool_actions,
+                    error=diag,
+                    error_category="empty_content",
+                    finish_status=finish,           # provider's own status
+                    provenance={"display_model": self.display_name},
+                ),
+            )
+
         return ProviderResult(
             provider=self.name,
             model=api_model,
             content=content,
             request_id=getattr(response, "id", None),
             usage=usage,
+            tool_actions=tool_actions,
             finish_status=finish,
             provenance={"display_model": self.display_name},
         )
