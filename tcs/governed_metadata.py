@@ -51,6 +51,9 @@ PROTECTED_METADATA_KEYS: FrozenSet[str] = frozenset({
     "blocking_context",
     # --- validity / decision --------------------------------------------- #
     "is_valid", "invalidation_event", "elapsed_hours",
+    # execution-mode provenance is set server-side from the operating
+    # mode (demo-live branch) — callers must not forge it
+    "execution_mode",
     "action_partially_executed", "compensation_scope", "incident_id",
     "redaction_required", "redacted_fields", "redaction_scope",
     # --- penalty inputs --------------------------------------------------- #

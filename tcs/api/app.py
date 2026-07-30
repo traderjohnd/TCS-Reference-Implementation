@@ -54,6 +54,8 @@ from tcs.api.routes_replay import router as replay_router
 from tcs.api.routes_connections import router as connections_router
 from tcs.api.routes_archive import router as archive_router
 from tcs.api.routes_reporting import router as reporting_router
+from tcs.api.routes_mode import router as mode_router
+from tcs.operating_mode import DEFAULT_MODE
 
 
 #: Version surfaced via /v2/health. Bumped when the API contract or
@@ -138,6 +140,10 @@ def create_app(
     app.state.api_version = API_VERSION
     app.state.policy_version = POLICY_VERSION
     app.state.owns_store = owns_store
+    # Global operating mode (demo-live branch): the application starts
+    # in the deliberate, documented DEFAULT (DEMO — investor-safe).
+    # The backend enforces this at every external provider call site.
+    app.state.operating_mode = DEFAULT_MODE
     app.state.rbac_enabled = False  # off by default for backward compat
 
     # Phase 5: ArtifactStore for /v2/generate and /v2/artifacts/*.
@@ -195,6 +201,7 @@ def create_app(
     app.add_middleware(RBACMiddleware)
 
     # Mount routers
+    app.include_router(mode_router, prefix="/v2", tags=["mode"])
     app.include_router(govern_router, prefix="/v2", tags=["govern"])
     app.include_router(certificates_router, prefix="/v2", tags=["certificates"])
     app.include_router(metrics_router, prefix="/v2", tags=["metrics"])

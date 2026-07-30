@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 
@@ -45,7 +45,7 @@ class TestConnectionResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 
 @router.post("/connections/test")
-def test_connection(body: TestConnectionRequest) -> TestConnectionResponse:
+def test_connection(body: TestConnectionRequest, request: Request) -> TestConnectionResponse:
     """
     Test a connection by making a minimal API call.
 
@@ -53,8 +53,25 @@ def test_connection(body: TestConnectionRequest) -> TestConnectionResponse:
     - OpenAI: sends a 1-token completion to verify auth
     - Anthropic: sends a 1-token message to verify auth
     - RAG / External API: stubbed — returns success for now
+
+    DEMO MODE blocks external test calls (backend enforcement): the
+    operator must switch to LIVE MODE before any real provider is
+    contacted, even for a 1-token auth check.
     """
     t0 = time.perf_counter()
+
+    from tcs.operating_mode import ExternalCallBlockedError, enforce_external_call
+    if body.category == "llm":
+        try:
+            enforce_external_call(request.app.state, body.provider)
+        except ExternalCallBlockedError as e:
+            return TestConnectionResponse(
+                success=False,
+                provider=body.provider,
+                model=body.model or "unknown",
+                latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+                error=f"demo_mode_enforced: {e}",
+            )
 
     if body.category != "llm":
         # Stubbed — RAG and external API testing comes later

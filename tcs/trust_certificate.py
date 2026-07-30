@@ -1559,6 +1559,14 @@ def _build_scope_attestation(
         ),
         "upstream_tc_references": list(meta.get("upstream_tc_references", [])),
     }
+    # Execution-mode provenance (demo-live branch): recorded ONLY when
+    # the trusted server-side context supplies it ("scripted_demo" |
+    # "live_provider"), so scripted output can never be presented as
+    # live provider output. Absent on records that predate the mode
+    # system — the key is conditional, never defaulted.
+    exec_mode = meta.get("execution_mode")
+    if isinstance(exec_mode, str) and exec_mode:
+        scope_attestation["execution_mode"] = exec_mode
     return mcp_server_id, scope_attestation
 
 

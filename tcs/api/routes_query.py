@@ -22,6 +22,11 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request
 
+from tcs.operating_mode import (
+    ExternalCallBlockedError,
+    enforce_external_call,
+    execution_mode_for,
+)
 from tcs.trust_certificate import gate_result_of
 from pydantic import BaseModel
 
@@ -655,6 +660,8 @@ def _route_off_topic_via_baseline(
             "novelty_score": "0.0",
             "days_since_review": 1,
             "is_policy_sensitive": False,
+            # Truthful execution-mode labeling (demo-live branch).
+            "execution_mode": execution_mode_for(provider_name),
         },
         elapsed_hours=Decimal("0.0000"),
         is_valid=1,
@@ -897,6 +904,9 @@ def _run_query_via_trace(
 
     orchestrator = WorkflowOrchestrator()
     t0 = time.perf_counter()
+    # Truthful execution-mode labeling (demo-live branch): scripted
+    # (mock) output must never masquerade as live provider output.
+    execution_mode = execution_mode_for(provider_name)
     trace = orchestrator.execute(
         steps=[
             WorkflowStep(node=rag_node, connector=rag_connector, context_key="rag"),
@@ -905,7 +915,12 @@ def _run_query_via_trace(
         query=body.query,
         base_profile_id=body.profile_id,
         user_identity={"provider": provider_name, "model": model_name},
-        metadata={"source": "routes_query.workflow_trace_path"},
+        metadata={
+            "source": "routes_query.workflow_trace_path",
+            "execution_mode": execution_mode,
+            "llm_provider": provider_name,
+            "llm_model": model_name,
+        },
     )
     latency["workflow_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
@@ -937,6 +952,9 @@ def _run_query_via_trace(
     # generate_certificate() carries it onto the issued TC.
     if composer_metadata:
         tis_input.context_metadata["composer_metadata"] = dict(composer_metadata)
+    # Execution mode onto the certificate's scope attestation (via the
+    # trusted server-side context — never caller input).
+    tis_input.context_metadata["execution_mode"] = execution_mode
     # tis-v2 activation (Commit 5b): Decimal-native producer values flow
     # straight into the canonical v2 pipeline and become
     # component_scores_raw.
@@ -1093,6 +1111,29 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
     # Stash on app state for downstream consumers / debugging.
     request.app.state._active_composer_metadata = _active_composer_metadata
     request.app.state._active_industry = _active_industry
+
+    # Backend operating-mode enforcement (demo-live branch): DEMO MODE
+    # blocks every external provider call HERE, regardless of frontend
+    # state. Only the deterministic mock provider executes in demo.
+    try:
+        enforce_external_call(request.app.state, body.provider)
+    except ExternalCallBlockedError as e:
+        return QueryResponse(
+            query=body.query,
+            response=None,
+            blocked=True,
+            decision="Error",
+            certificate_id=None,
+            tis_current=None,
+            tis_raw=None,
+            gate_result=None,
+            blocking_reason=f"demo_mode_enforced: {e}",
+            requires_human_review=False,
+            retrieval_chunks=[],
+            latency_ms={},
+            llm_provider=body.provider,
+            llm_model=body.model or "unknown",
+        )
 
     # Build provider from request
     try:

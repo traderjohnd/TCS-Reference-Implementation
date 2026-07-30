@@ -229,6 +229,18 @@ def post_generate(body: GenerateRequest, request: Request) -> GenerateResponse:
     """
     Create a ResponseArtifact. No governance is evaluated here.
     """
+    # Backend operating-mode enforcement (demo-live branch): DEMO MODE
+    # blocks external provider generation here, before any client is
+    # constructed. Mock and human_composed generation remain available.
+    from tcs.operating_mode import ExternalCallBlockedError, enforce_external_call
+    try:
+        enforce_external_call(request.app.state, body.provider)
+    except ExternalCallBlockedError as e:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "demo_mode_enforced", "message": str(e)},
+        )
+
     # Per-mode input validation up front. Pydantic only enforces types;
     # the cross-field rules (e.g. human_composed requires draft) live
     # here so the error message is clear.

@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { ThemeProvider } from './hooks/useTheme';
 import { ConnectionsProvider } from './hooks/useConnections';
+import { OperatingModeProvider } from './hooks/useOperatingMode';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import Layout from './components/Layout';
 import Login from './views/Login';
@@ -68,9 +69,11 @@ export default function App() {
       <BrowserRouter>
         <ThemeProvider>
           <AuthProvider>
-            <ConnectionsProvider>
-              <AppRoutes />
-            </ConnectionsProvider>
+            <OperatingModeProvider>
+              <ConnectionsProvider>
+                <AppRoutes />
+              </ConnectionsProvider>
+            </OperatingModeProvider>
           </AuthProvider>
         </ThemeProvider>
       </BrowserRouter>
