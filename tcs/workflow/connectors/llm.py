@@ -171,8 +171,8 @@ class LLMConnector(GovernedConnector):
     def _lift_provider_provenance(self, raw_metadata: dict) -> None:
         """Lift the provider's normalized ProviderResult provenance into
         the governed trace event. Providers outside the neutral contract
-        (the inline anthropic branch until Commit 3) simply contribute
-        nothing — the connector never reaches into provider payloads."""
+        simply contribute nothing — the connector never reaches into
+        provider payloads."""
         last = getattr(self.provider, "last_result", None)
         summary = getattr(last, "provenance_summary", None)
         if callable(summary):

@@ -183,55 +183,15 @@ def _get_vector_store(industry: Optional[str] = None):
 def _build_provider(provider_name: str, api_key: Optional[str], model: Optional[str]):
     """Build an LLM provider from the request parameters.
 
-    mock and openai construct through the provider-neutral layer
-    (tcs.providers.build_provider), which returns objects implementing
-    the ProviderResult contract — the workflow trace lifts their
-    normalized provenance. The inline anthropic branch remains here
-    until Commit 3 moves it behind the same contract.
+    All providers (mock, openai, anthropic) construct through the
+    provider-neutral layer (tcs.providers.build_provider), which
+    returns objects implementing the ProviderResult contract — the
+    workflow trace lifts their normalized provenance.
 
     Unknown provider names raise ValueError instead of silently falling
     back to the scripted mock: a scripted response must never be able
     to masquerade as live provider output.
     """
-    if provider_name == "anthropic":
-        if not api_key:
-            raise ValueError("Anthropic API key is required")
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        model_name = model or "claude-sonnet-4-20250514"
-
-        class RequestScopedAnthropic:
-            def generate(self, query, context):
-                context_text = "\n\n".join(context) if context else ""
-                if context_text:
-                    user_content = (
-                        "You are a careful, domain-aware assistant. "
-                        "Answer based on the provided context. Cite sources "
-                        "when possible. If the context does not cover the "
-                        "question, answer from general knowledge while making "
-                        "clear that the answer is not grounded in the supplied "
-                        "sources.\n\n"
-                        f"Context:\n{context_text}\n\nQuestion: {query}"
-                    )
-                else:
-                    user_content = (
-                        "You are a careful, helpful assistant. Answer the "
-                        f"user's question directly and concisely.\n\n{query}"
-                    )
-                response = client.messages.create(
-                    model=model_name,
-                    max_tokens=2000,
-                    messages=[
-                        {"role": "user", "content": user_content},
-                    ],
-                )
-                return response.content[0].text if response.content else (
-                    f"[{model_name} returned no content. "
-                    "Try restating the question or switching providers.]"
-                )
-
-        return RequestScopedAnthropic(), model_name
-
     from tcs.providers import build_provider
     return build_provider(provider_name, api_key, model)
 
@@ -262,7 +222,14 @@ def query_status() -> Dict[str, Any]:
             {
                 "id": "anthropic",
                 "name": "Anthropic",
-                "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
+                # Current supported Claude model IDs (convenience catalog —
+                # the Connections UI also offers a custom model-ID field,
+                # so the catalog is never a hard dependency).
+                "models": [
+                    "claude-opus-5", "claude-sonnet-5",
+                    "claude-opus-4-8", "claude-sonnet-4-6",
+                    "claude-haiku-4-5",
+                ],
                 "requires_key": True,
             },
             {

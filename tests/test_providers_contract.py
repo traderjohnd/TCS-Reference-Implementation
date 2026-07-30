@@ -8,8 +8,8 @@ Covers:
     "scripted" so scripted output can never read as live).
   * build_provider construction/error semantics (mock default, missing
     key, unknown provider is an error — no silent mock fallback).
-  * routes_query._build_provider rewire (mock/openai via the neutral
-    layer, inline anthropic branch preserved until Commit 3).
+  * routes_query._build_provider rewire (all providers via the neutral
+    layer as of Commit 3).
   * Monkeypatched OpenAI mapping: message framing, token-budget kwargs,
     result normalization, empty-content diagnostic.
   * Model-not-found surfaces verbatim; custom model IDs pass through
@@ -204,7 +204,9 @@ class TestRoutesBuildProviderRewire:
         with pytest.raises(ValueError, match="Unknown provider"):
             _build_provider("not-a-provider", "key", "model")
 
-    def test_anthropic_missing_key_stays_inline_until_commit_3(self):
+    def test_anthropic_missing_key_error_message_preserved(self):
+        # Commit 3: anthropic now routes through the neutral layer with
+        # the same error message the inline branch produced.
         from tcs.api.routes_query import _build_provider
         with pytest.raises(ValueError, match="Anthropic API key is required"):
             _build_provider("anthropic", None, None)

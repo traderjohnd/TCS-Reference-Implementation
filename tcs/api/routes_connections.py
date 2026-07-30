@@ -40,6 +40,15 @@ class TestConnectionResponse(BaseModel):
     error: Optional[str] = None
 
 
+def _sanitize_error(exc: Exception, api_key: Optional[str]) -> str:
+    """Provider errors can echo request headers; the operator's key must
+    never surface in a response, log, or trace."""
+    text = str(exc)
+    if api_key and api_key in text:
+        text = text.replace(api_key, "[redacted]")
+    return text
+
+
 # --------------------------------------------------------------------------- #
 # POST /v2/connections/test                                                    #
 # --------------------------------------------------------------------------- #
@@ -125,7 +134,7 @@ def test_connection(body: TestConnectionRequest, request: Request) -> TestConnec
                 success=False, provider="openai",
                 model=body.model or "unknown",
                 latency_ms=round((time.perf_counter() - t0) * 1000, 1),
-                error=str(e),
+                error=_sanitize_error(e, body.api_key),
             )
 
     if body.provider == "anthropic":
@@ -137,8 +146,9 @@ def test_connection(body: TestConnectionRequest, request: Request) -> TestConnec
             )
         try:
             import anthropic
+            from tcs.providers.anthropic_provider import DEFAULT_ANTHROPIC_MODEL
             client = anthropic.Anthropic(api_key=body.api_key)
-            model_name = body.model or "claude-sonnet-4-20250514"
+            model_name = body.model or DEFAULT_ANTHROPIC_MODEL
             client.messages.create(
                 model=model_name, max_tokens=1,
                 messages=[{"role": "user", "content": "ping"}],
@@ -152,7 +162,7 @@ def test_connection(body: TestConnectionRequest, request: Request) -> TestConnec
                 success=False, provider="anthropic",
                 model=body.model or "unknown",
                 latency_ms=round((time.perf_counter() - t0) * 1000, 1),
-                error=str(e),
+                error=_sanitize_error(e, body.api_key),
             )
 
     return TestConnectionResponse(

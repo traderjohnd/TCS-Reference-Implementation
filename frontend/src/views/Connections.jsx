@@ -233,7 +233,7 @@ function AddConnectionForm({ providerCatalog, onAdd, onCancel }) {
             type="text"
             value={customModel}
             onChange={(e) => setCustomModel(e.target.value)}
-            placeholder={provider === 'openai' ? 'e.g. gpt-5.5-turbo-preview' : 'e.g. claude-sonnet-4-5'}
+            placeholder={provider === 'openai' ? 'e.g. gpt-5.5-turbo-preview' : 'e.g. claude-opus-4-7'}
             className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm placeholder-gray-600 focus:outline-none focus:border-blue-500 font-mono"
             required
           />
