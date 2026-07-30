@@ -215,6 +215,8 @@ class APIConnector(GovernedConnector):
                 c3_pattern=f"unauthorized_endpoint:{url}",
                 policy_violations=(f"endpoint_not_in_allowlist:{url}",),
                 score_contribution=0.0,
+                score_contribution_decimal="0",
+                c3_detail_code="unauthorized_endpoint",
             )
             known = KnownStateSignal(
                 confidence_calibrated=False,

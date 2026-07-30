@@ -92,6 +92,11 @@ def _make_tc(
         checkpoint_id="chk-001",
         gca_context_id="gca-001",
         policy_set_id="fin-r3-a4-ct4",
+        # s_base/s_adjusted became required fields after this fixture
+        # was written; the module always skipped without psycopg, so
+        # the drift surfaced only when Commit 5a ran it for real.
+        s_base=tis_raw,
+        s_adjusted=tis_raw * 0.98,
         tis_raw=tis_raw,
         tis_adjusted=tis_raw * 0.98,
         tis_current=tis_current,

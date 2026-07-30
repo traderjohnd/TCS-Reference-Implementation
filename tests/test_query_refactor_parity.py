@@ -81,7 +81,7 @@ class TestQueryExternalShapeUnchanged:
         # consumers (chat UI, demos) silently break.
         for field in (
             "query", "response", "blocked", "decision", "certificate_id",
-            "tis_current", "tis_raw", "s_base", "gate_passed",
+            "tis_current", "tis_raw", "s_base", "gate_result",
             "blocking_reason", "requires_human_review", "retrieval_chunks",
             "latency_ms", "llm_provider", "llm_model",
             "component_scores", "component_weights", "gate_results",

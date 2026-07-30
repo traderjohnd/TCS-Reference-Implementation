@@ -28,6 +28,7 @@ from tcs.persistence.certificate_store import (
     CertificateStore,
     ChainSequenceError,
     CertificateNotFoundError,
+    IssuanceVersionRegressionError,
 )
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "CertificateStore",
     "ChainSequenceError",
     "CertificateNotFoundError",
+    "IssuanceVersionRegressionError",
 ]
 
 # PostgresCertificateStore is available only when psycopg is installed.

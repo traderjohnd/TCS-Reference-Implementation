@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useApi, apiFetch, apiPost } from '../hooks/useApi';
+import { displayGoverned } from '../lib/governedDecimal';
 
 // ─── Decision badge ─────────────────────────────────────────────────────────
 
@@ -148,7 +149,7 @@ function ArchiveCard({ archive, onExpand, expanded }) {
                         <DecisionBadge decision={cert.decision} count="" />
                       </td>
                       <td className="py-1.5 pr-3 text-gray-300 font-mono">
-                        {cert.tis_current?.toFixed(4)}
+                        {displayGoverned(cert.tis_current)}
                       </td>
                       <td className="py-1.5 pr-3 text-gray-500">
                         {cert.domain} {cert.risk_tier}/{cert.action_class}

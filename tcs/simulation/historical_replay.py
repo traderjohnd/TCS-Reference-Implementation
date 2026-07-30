@@ -193,7 +193,10 @@ def replay(
 
         # Re-run TIS computation
         tis_result = compute_tis(replay_input)
-        new_decision, _ = map_decision(replay_input, tis_result)
+        # Version-aware dispatch (5a): historical records replay under
+        # the calculation semantics they were issued with.
+        from tcs.decision_engine import map_decision_versioned
+        new_decision, _ = map_decision_versioned(replay_input, tis_result)
         new_tis = tis_result.tis_current
 
         dist_after[new_decision] = dist_after.get(new_decision, 0) + 1

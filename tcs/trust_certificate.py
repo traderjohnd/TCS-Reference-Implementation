@@ -44,7 +44,67 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from tcs.policy_profiles import PolicyProfile
-from tcs.tis_engine import TISInput, TISResult
+from tcs.tis_engine import (
+    TISInput,
+    TISResult,
+    # tis-v2 Commit 4 — Decimal penalty maxima for pre-seal validation.
+    DELTA_D_MAX_DECIMAL,
+    DELTA_H_MAX_DECIMAL,
+    P_CB_MAX_V2,
+    W_NOVELTY_BY_TIER_DECIMAL,
+    _W_PS_DEFAULT_DECIMAL,
+    _W_PS_SPECIAL_DECIMAL,
+)
+
+# tis-v2 Commit 3 — schema-version dispatch exceptions live in the
+# canonical numerical module (added in Commit 1).
+from tcs.canonical import (
+    CertificateInvariantError,
+    UnsupportedCertificateSchemaVersion,
+)
+
+# tis-v2 Commit 4 — the v2 certificate core. Decimal-native fields,
+# validating serializers, versioned hash payload, typed C3 provenance.
+import re as _re
+from dataclasses import replace as _dataclass_replace
+from decimal import Decimal, localcontext
+
+from tcs.canonical import (
+    AdjustmentApplied,
+    CALCULATION_VERSION_V2,
+    DECAY_ALGORITHM_VERSION,
+    SCORE_PRECISION_POLICY,
+    SCORE_QUANTUM,
+    SCORE_ROUNDING,
+    TIS_DECIMAL_CONTEXT,
+    UnsupportedCalculationVersion,
+    canonical_nonnegative_parameter,
+    canonical_score,
+    require_canonical_parameter,
+    require_canonical_score,
+    serialize_canonical_score,
+    serialize_raw_decimal,
+)
+from tcs.provenance import (
+    ACTIVE_CREDENTIAL_PATTERN_SET_VERSION,
+    ACTIVE_INJECTION_PATTERN_SET_VERSION,
+    C3_PROVENANCE_SCHEMA_VERSION,
+    C3ProvenanceRecord,
+    CREDENTIAL_PATTERN_IDS_BY_VERSION,
+    GOVERNANCE_RULE_MATCH_SCHEMA_VERSION,
+    GovernanceRuleMatch,
+    INJECTION_PATTERN_IDS_BY_VERSION,
+    MatchedTermGroup,
+    RuleMatchRef,
+    c3_provenance_record_from_dict,
+    c3_record_sort_key,
+    governance_rule_match_from_dict,
+    rule_match_sort_key,
+    serialize_c3_provenance_record,
+    serialize_governance_rule_match,
+    validate_c3_provenance_record,
+    validate_governance_rule_match,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -233,30 +293,242 @@ class OverrideRecord:
 
 
 # --------------------------------------------------------------------------- #
-# Hash chain helper                                                            #
+# Hash chain helpers — frozen v1 contract + schema-version dispatch            #
+# (tis-v2 Commit 3)                                                            #
 # --------------------------------------------------------------------------- #
+#
+# Two DISTINCT version-1 behaviors, deliberately not conflated:
+#
+#   Raw stored-v1 verification
+#       A stored legacy record is hash-verified from its original
+#       persisted dictionary BEFORE rehydration or conversion, via
+#       ``build_legacy_raw_hash_payload``. Absence of
+#       ``certificate_schema_version`` IS the historical wire contract;
+#       a raw dictionary carrying the key is rejected as not matching
+#       the historical v1 wire shape, and any other injected field
+#       changes the payload and fails verification. Nothing is silently
+#       ignored, and no second accepted stored-v1 wire representation
+#       exists.
+#
+#   Post-rehydration v1 reconstruction
+#       A rehydrated / in-memory v1 certificate is serialized and hashed
+#       via ``build_v1_hash_payload``, which projects the dict onto the
+#       FROZEN historical field set below. Explicit integer
+#       ``certificate_schema_version = 1`` is permitted on internal
+#       representations as dispatch metadata and is excluded from the
+#       projection — it never becomes a newly hashed historical field.
+#       Commit 4 may add model and serialization fields; the projection
+#       guarantees they cannot leak into the historical v1 payload, so
+#       neither the allowlist nor its tests ever need amendment.
+
+#: The frozen historical v1 top-level field set. Captured from the
+#: 249 stored certificates across data/tcs.db and the 2026-06-25
+#: archive — every stored record carries EXACTLY these 75 keys plus
+#: ``audit_integrity`` (which the hash excludes). This is a permanent
+#: historical contract: it is written as a literal, never computed from
+#: the live dataclass, and MUST NOT change when Commit 4+ adds fields.
+V1_REQUIRED_HASH_FIELDS = frozenset({
+    "action_class", "archived", "audit_log_id", "blocking_reason",
+    "certificate_id", "chain_depth", "chain_of_custody_id",
+    "chain_u_scores", "checkpoint_id", "compensation_scope",
+    "component_scores", "component_weights", "composer_metadata",
+    "connection_type", "connection_type_modifier_id", "decay_rate",
+    "decision", "domain", "enhanced_logging", "escalation_routed_to",
+    "evaluation_timestamp", "explanation_summary",
+    "failing_dimension_subfactors", "failure_mode", "gate_passed",
+    "gate_results", "gate_set", "gca_context_id",
+    "governance_rule_matches", "governance_status", "identity_binding",
+    "incident_id", "integration_boundary_gaps", "invalidation_status",
+    "invalidation_triggers", "key_concerns", "key_factors",
+    "last_invalidation_event", "lifecycle_state", "mcp_server_id",
+    "override_record", "penalty_aggregate", "penalty_breakdown",
+    "policy_set_id", "policy_severity", "proximity_to_threshold",
+    "qualified_decision", "reason_code", "recompute_required",
+    "recomputed_from_certificate_id", "recovery_mode_activated",
+    "redacted_fields", "redaction_applied", "redaction_scope",
+    "regulatory_explanation_level", "regulatory_mapping",
+    "requires_human_review", "resolved_policy_profile_id",
+    "retrieval_ids", "risk_tier", "s_adjusted", "s_base",
+    "scope_attestation", "source_references",
+    "state_transition_history", "step_up_completed",
+    "step_up_required", "subject_id", "subject_type",
+    "superseded_by_certificate_id", "thresholds", "tis_adjusted",
+    "tis_current", "tis_raw", "valid_until",
+})
+
+#: Historically, no stored v1 record omits any top-level key — the
+#: optional set is empty and stays empty permanently. It exists as a
+#: named contract slot so the required/optional split is explicit.
+V1_OPTIONAL_HASH_FIELDS = frozenset()
+
+V1_HASH_FIELD_SET = V1_REQUIRED_HASH_FIELDS | V1_OPTIONAL_HASH_FIELDS
+
+
+def _canonical_json_bytes(content: Dict[str, Any]) -> bytes:
+    """The historical canonical JSON encoding — frozen.
+
+    ``sort_keys=True`` so key order does not affect the hash;
+    ``separators=(",", ":")`` to eliminate whitespace variance;
+    UTF-8 encoding. Non-JSON-serializable values raise TypeError,
+    which is correct — such content would fail round-trip anyway.
+    """
+    return json.dumps(
+        content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def build_legacy_raw_hash_payload(raw_dict: Dict[str, Any]) -> bytes:
+    """Raw stored-v1 verification payload — FROZEN historical behavior.
+
+    Input is the dictionary parsed directly from persisted
+    ``content_json``, before any rehydration or conversion. Removes only
+    ``audit_integrity`` and hashes everything else exactly as stored —
+    original keys, values, representations, and omission state. A field
+    injected into raw persisted content changes the payload and fails
+    verification; it is never silently ignored.
+
+    A raw dictionary carrying ``certificate_schema_version`` does not
+    match the historical v1 wire shape (no stored legacy record has the
+    key) and is rejected. Explicit version 1 is an internal dispatch
+    classification only — see ``build_v1_hash_payload``.
+    """
+    if "certificate_schema_version" in raw_dict:
+        raise CertificateInvariantError(
+            "raw legacy v1 content must not carry "
+            "certificate_schema_version; absence is the historical "
+            "wire contract"
+        )
+    content = {k: v for k, v in raw_dict.items() if k != "audit_integrity"}
+    return _canonical_json_bytes(content)
+
+
+def compute_legacy_raw_tc_hash(raw_dict: Dict[str, Any]) -> str:
+    """SHA-256 hex digest of the raw stored-v1 payload."""
+    return hashlib.sha256(build_legacy_raw_hash_payload(raw_dict)).hexdigest()
+
+
+def build_v1_hash_payload(serialized: Dict[str, Any]) -> bytes:
+    """Post-rehydration v1 reconstruction payload — FROZEN projection.
+
+    Projects a serialized model dict onto ``V1_HASH_FIELD_SET``,
+    preserving presence/absence (a key absent from the input stays
+    absent — no defaults are injected). ``audit_integrity``,
+    ``certificate_schema_version``, and every v2-only field added by
+    Commit 4 and later are excluded by construction, without depending
+    on any ``to_dict()`` caller remembering to omit them.
+    """
+    content = {
+        k: v for k, v in serialized.items() if k in V1_HASH_FIELD_SET
+    }
+    return _canonical_json_bytes(content)
+
+
+def classify_certificate_schema_version(tc_dict: Dict[str, Any]) -> int:
+    """Classify a serialized certificate's schema version.
+
+    Absence of ``certificate_schema_version`` means v1 — NEVER a model
+    default. When present, the value must be exactly the integer 1 or 2:
+    bool is rejected (it is an int subclass), and no ``int(...)``
+    coercion is applied. Anything else fails closed.
+    """
+    version = tc_dict.get("certificate_schema_version", 1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise UnsupportedCertificateSchemaVersion(
+            f"certificate_schema_version must be int 1 or 2, "
+            f"got {version!r}"
+        )
+    if version not in (1, 2):
+        raise UnsupportedCertificateSchemaVersion(version)
+    return version
+
+
+def build_hash_payload(tc_dict: Dict[str, Any]) -> bytes:
+    """Version-dispatched hash payload for serialized model content.
+
+    v1 (absent key, or explicit internal 1) routes to the frozen v1
+    reconstruction projection. v2 routes to the validating-and-replaying
+    v2 payload builder (Commit 4) — a v2 certificate that does not
+    reproduce its own computation cannot acquire a hash at all.
+    """
+    version = classify_certificate_schema_version(tc_dict)
+    if version == 1:
+        return build_v1_hash_payload(tc_dict)
+    return build_v2_hash_payload(tc_dict)
+
+
+def gate_result_from_serialized(d: Dict[str, Any]) -> int:
+    """One authoritative gate aggregate from either wire version.
+
+    v2 payloads carry ``gate_result`` (0|1) directly; v1 payloads carry
+    only ``gate_passed`` and are derived ONCE here at the read boundary.
+    v2 values are never reconstructed from the legacy alias.
+    """
+    if d.get("gate_result") is not None:
+        return int(d["gate_result"])
+    return 1 if d.get("gate_passed") else 0
+
+
+def gate_result_of(tc: "TrustCertificate") -> int:
+    """Model-instance counterpart of gate_result_from_serialized."""
+    if tc.gate_result is not None:
+        return int(tc.gate_result)
+    return 1 if tc.gate_passed else 0
+
+
+def wire_number(value: Any, default: float = 0.0) -> float:
+    """Version-tolerant DISPLAY conversion for analytics readers:
+    v1 wire numbers are floats, v2 wire numbers are canonical decimal
+    strings. Authoritative values live in the certificate itself; this
+    is for dashboard aggregation only."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def compute_raw_stored_tc_hash(raw_dict: Dict[str, Any]) -> str:
+    """Version-dispatched hash of RAW persisted content (pre-rehydration).
+
+    Absence of ``certificate_schema_version`` → the frozen legacy raw
+    path. Explicit 2 → the v2 payload builder, whose exact-schema
+    validation makes any injected field a hard failure. Explicit 1 (or
+    anything else) in RAW stored content does not match either wire
+    contract and is rejected (Commit 3 rule: version 1 is an internal
+    dispatch classification, never a stored wire representation).
+    """
+    if "certificate_schema_version" not in raw_dict:
+        return compute_legacy_raw_tc_hash(raw_dict)
+    version = raw_dict["certificate_schema_version"]
+    if isinstance(version, bool) or version != 2:
+        raise CertificateInvariantError(
+            f"raw stored content carries unsupported "
+            f"certificate_schema_version {version!r}"
+        )
+    return hashlib.sha256(build_v2_hash_payload(raw_dict)).hexdigest()
+
 
 def compute_tc_hash(tc_dict: Dict[str, Any]) -> str:
     """
-    Compute the SHA-256 hash of a TC's content, excluding the audit layer.
+    Compute the SHA-256 hash of a TC's serialized content.
 
-    The hash covers every serialized field *except* ``audit_integrity``
-    itself — that layer would otherwise have to reference its own hash,
-    which is a chicken-and-egg problem. Excluding it also lets the hash
-    carry forward unchanged when we later add chain bookkeeping.
+    The payload is version-dispatched via ``build_hash_payload``: for
+    every v1 certificate this is byte-identical to the historical
+    algorithm (drop ``audit_integrity``, canonical JSON, SHA-256) —
+    proven by the stored-legacy fixture tests — and a v2-marked dict
+    fails closed until Commit 4 lands the v2 payload builder.
 
-    Canonicalization rules (critical for reproducible hashing):
-        - ``sort_keys=True`` so key order does not affect the hash
-        - ``separators=(",", ":")`` to eliminate whitespace variance
-        - UTF-8 encoding before hashing
+    The hash excludes ``audit_integrity`` because that layer would
+    otherwise have to reference its own hash, and excluding it lets the
+    hash carry forward unchanged through chain bookkeeping.
 
-    Passing any non-JSON-serializable value in ``tc_dict`` will raise
-    TypeError here, which is the correct behavior — the TC would fail
-    JSON round-trip anyway.
+    NOTE: verification of RAW PERSISTED legacy content must use
+    ``compute_legacy_raw_tc_hash`` (before rehydration), not this
+    function — the reconstruction projection would silently drop a
+    field injected into stored content, whereas the raw path detects it.
     """
-    content = {k: v for k, v in tc_dict.items() if k != "audit_integrity"}
-    canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(build_hash_payload(tc_dict)).hexdigest()
 
 
 def verify_chain(tcs: List["TrustCertificate"]) -> bool:
@@ -285,6 +557,38 @@ def verify_chain(tcs: List["TrustCertificate"]) -> bool:
             if tc.audit_integrity.chain_sequence != prev.audit_integrity.chain_sequence + 1:
                 return False  # TC deleted from chain
     return True
+
+
+# --------------------------------------------------------------------------- #
+# v2 serialization helpers (tis-v2 Commit 4)                                   #
+# --------------------------------------------------------------------------- #
+
+def _iso_z(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _round_floats_v2(obj: Any) -> Any:
+    """Same float-normalization the v1 serializer applies to free-form
+    nested audit blocks (scope_attestation, TEL layers)."""
+    if isinstance(obj, float):
+        return _r(obj)
+    if isinstance(obj, dict):
+        return {k: _round_floats_v2(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_round_floats_v2(v) for v in obj]
+    return obj
+
+
+def _tel_layer_to_dict(layer: Any) -> Optional[Dict[str, Any]]:
+    if layer is None:
+        return None
+    return _round_floats_v2({k: v for k, v in layer.__dict__.items()})
+
+
+def _serialize_parameter_4dp(value: Decimal, name: str) -> str:
+    """Validating 4dp serializer for the non-negative parameter domain."""
+    require_canonical_parameter(value, name)
+    return format(value, ".4f")
 
 
 # --------------------------------------------------------------------------- #
@@ -475,11 +779,57 @@ class TrustCertificate:
     incident_id: Optional[str] = None
     recovery_mode_activated: bool = False
 
+    # ---- tis-v2 additions (Commit 4) — defaulted, appended -------------- #
+    #
+    # Model defaults describe LEGACY (v1) certificates: every v2
+    # identifier below is assigned explicitly by generate_certificate_v2
+    # and validated at sealing — never populated by these defaults.
+    # On a v2 instance the pre-existing numeric fields above hold
+    # canonical Decimal values; on v1 they hold floats exactly as before
+    # (same version-discriminated-content pattern as TISResult).
+    # ``governance_rule_matches`` holds legacy audit dicts on v1 and
+    # List[GovernanceRuleMatch] on v2.
+    component_scores_raw: Dict[str, Decimal] = field(default_factory=dict)
+    component_scores_observed: Dict[str, Decimal] = field(default_factory=dict)
+    adjustments_applied: List[AdjustmentApplied] = field(default_factory=list)
+    c3_provenance: List[C3ProvenanceRecord] = field(default_factory=list)
+    gate_result: Optional[int] = None            # v2 authoritative gate aggregate
+    resolved_penalty_weights: Dict[str, Decimal] = field(default_factory=dict)
+    resolved_decay_rate: Optional[Decimal] = None
+    elapsed_hours: Optional[Decimal] = None
+    decay_factor: Optional[Decimal] = None
+    resolved_theta_allow: Optional[Decimal] = None
+    resolved_theta_hold: Optional[Decimal] = None
+    resolved_theta_escalate: Optional[Decimal] = None
+    resolved_kappa: Optional[Decimal] = None
+    c3_score: Optional[Decimal] = None
+    is_valid: Optional[int] = None
+    certificate_schema_version: int = 1          # v2 builder assigns 2 EXPLICITLY
+    calculation_version: str = "tis-v1-legacy"   # v2 builder assigns "tis-v2" EXPLICITLY
+    score_precision_policy: str = ""             # v2 builder assigns the named constant
+    decay_algorithm_version: str = ""            # v2 builder assigns the named constant
+    provenance_schema_version: int = 0           # v2 builder assigns 1
+
     # ---- Serialization -------------------------------------------------- #
 
     def to_dict(self) -> Dict[str, Any]:
         """
         Return the TC as a JSON-serializable dict.
+
+        Version-aware (tis-v2 Commit 4): a v1 certificate serializes
+        EXACTLY the historical 76-key wire shape — none of the v2 fields
+        appear, so newly issued v1 certificates keep verifying through
+        both the frozen projection and the raw stored-content path. A
+        v2 certificate serializes the exact V2_FIELD_SET via validating
+        (never repairing) serializers.
+        """
+        if self.certificate_schema_version == 2:
+            return self._to_dict_v2()
+        return self._to_dict_v1()
+
+    def _to_dict_v1(self) -> Dict[str, Any]:
+        """
+        The FROZEN historical v1 serialization.
 
         Datetimes become ISO-8601 strings with a 'Z' suffix, floats are
         rounded to 4 decimal places, and nested collections are copied
@@ -632,6 +982,192 @@ class TrustCertificate:
             # over every other serialized field (compute_tc_hash skips this
             # key), so its position in the dict is irrelevant to the hash.
             "audit_integrity":    _layer_to_dict(self.audit_integrity),
+        }
+
+    def _to_dict_v2(self) -> Dict[str, Any]:
+        """
+        The tis-v2 serialization: exactly V2_FIELD_SET, one authoritative
+        field per concept, canonical fixed-scale strings for every
+        score-domain value, and validating serializers that REFUSE to
+        repair a non-canonical internal value.
+
+        Omitted legacy aliases (single-vocabulary rule): ``gate_passed``
+        (superseded by ``gate_result``), ``decay_rate`` (superseded by
+        ``resolved_decay_rate``), and ``failing_dimension_subfactors``
+        (superseded by ``c3_score``; sub-factor detail beyond C3 is not
+        part of the v2 computation contract).
+        """
+        def _score(name: str) -> str:
+            return serialize_canonical_score(getattr(self, name), name)
+
+        def _score_dict(name: str) -> Dict[str, str]:
+            return {
+                k: serialize_canonical_score(v, f"{name}.{k}")
+                for k, v in getattr(self, name).items()
+            }
+
+        def _param(name: str) -> str:
+            value = getattr(self, name)
+            require_canonical_parameter(value, name)
+            return format(value, ".4f")
+
+        return {
+            # Identity
+            "certificate_id": self.certificate_id,
+            "subject_id": self.subject_id,
+            "subject_type": self.subject_type,
+            "domain": self.domain,
+            "risk_tier": self.risk_tier,
+            "action_class": self.action_class,
+            "policy_severity": self.policy_severity,
+            "checkpoint_id": self.checkpoint_id,
+            "gca_context_id": self.gca_context_id,
+            "policy_set_id": self.policy_set_id,
+
+            # Score — canonical fixed-scale strings
+            "s_base": _score("s_base"),
+            "s_adjusted": _score("s_adjusted"),
+            "tis_raw": _score("tis_raw"),
+            "tis_adjusted": _score("tis_adjusted"),
+            "tis_current": _score("tis_current"),
+            "component_scores": _score_dict("component_scores"),
+            "component_scores_observed": _score_dict("component_scores_observed"),
+            "component_scores_raw": {
+                k: serialize_raw_decimal(v)
+                for k, v in self.component_scores_raw.items()
+            },
+            "component_weights": _score_dict("component_weights"),
+            "penalty_aggregate": _score("penalty_aggregate"),
+            "penalty_breakdown": {
+                k: _serialize_parameter_4dp(v, f"penalty_breakdown.{k}")
+                for k, v in self.penalty_breakdown.items()
+            },
+            "resolved_penalty_weights": _score_dict("resolved_penalty_weights"),
+            "adjustments_applied": [
+                {
+                    "rule_id": a.rule_id,
+                    "dimension": a.dimension,
+                    "value_before": serialize_canonical_score(
+                        a.value_before, "adjustments_applied.value_before"),
+                    "value_after": serialize_canonical_score(
+                        a.value_after, "adjustments_applied.value_after"),
+                    "reason": a.reason,
+                }
+                for a in self.adjustments_applied
+            ],
+
+            # Gate — one authoritative aggregate
+            "gate_set": list(self.gate_set),
+            "thresholds": _score_dict("thresholds"),
+            "gate_results": dict(self.gate_results),
+            "gate_result": self.gate_result,
+            "blocking_reason": self.blocking_reason,
+            "failure_mode": self.failure_mode,
+
+            # Decision inputs and outcome
+            "decision": self.decision,
+            "requires_human_review": bool(self.requires_human_review),
+            "escalation_routed_to": list(self.escalation_routed_to),
+            "c3_score": _score("c3_score"),
+            "is_valid": self.is_valid,
+            "resolved_theta_allow": _score("resolved_theta_allow"),
+            "resolved_theta_hold": _score("resolved_theta_hold"),
+            "resolved_theta_escalate": _score("resolved_theta_escalate"),
+            "resolved_kappa": _score("resolved_kappa"),
+
+            # Decay
+            "resolved_decay_rate": _param("resolved_decay_rate"),
+            "elapsed_hours": _param("elapsed_hours"),
+            "decay_factor": _score("decay_factor"),
+
+            # Provenance layers
+            "source_references": list(self.source_references),
+            "retrieval_ids": list(self.retrieval_ids),
+            "chain_of_custody_id": self.chain_of_custody_id,
+            "audit_log_id": self.audit_log_id,
+            "integration_boundary_gaps": int(self.integration_boundary_gaps),
+            "governance_rule_matches": [
+                serialize_governance_rule_match(m)
+                for m in sorted(
+                    self.governance_rule_matches or [],
+                    key=rule_match_sort_key,
+                )
+            ],
+            "c3_provenance": [
+                serialize_c3_provenance_record(r)
+                for r in sorted(self.c3_provenance, key=c3_record_sort_key)
+            ],
+
+            # Temporal
+            "evaluation_timestamp": _iso_z(self.evaluation_timestamp),
+            "valid_until": _iso_z(self.valid_until),
+            "recompute_required": bool(self.recompute_required),
+            "invalidation_triggers": list(self.invalidation_triggers),
+            "last_invalidation_event": dict(self.last_invalidation_event),
+            "invalidation_status": self.invalidation_status,
+
+            # Explanation
+            "explanation_summary": self.explanation_summary,
+            "key_factors": list(self.key_factors),
+            "key_concerns": list(self.key_concerns),
+            "regulatory_explanation_level": self.regulatory_explanation_level,
+            "regulatory_mapping": list(self.regulatory_mapping),
+
+            # Lifecycle
+            "lifecycle_state": self.lifecycle_state,
+            "state_transition_history": [
+                dict(entry) for entry in self.state_transition_history
+            ],
+            "recomputed_from_certificate_id": self.recomputed_from_certificate_id,
+            "superseded_by_certificate_id": self.superseded_by_certificate_id,
+            "archived": bool(self.archived),
+
+            # MCP / CT / composer audit
+            "mcp_server_id": self.mcp_server_id,
+            "scope_attestation": _round_floats_v2(dict(self.scope_attestation)),
+            "connection_type": self.connection_type,
+            "connection_type_modifier_id": self.connection_type_modifier_id,
+            "resolved_policy_profile_id": self.resolved_policy_profile_id,
+            "chain_depth": int(self.chain_depth),
+            "chain_u_scores": [
+                round(float(v), 4) for v in self.chain_u_scores
+            ],
+            "composer_metadata": (
+                dict(self.composer_metadata) if self.composer_metadata else None
+            ),
+
+            # Trust Enforcement Layer
+            "identity_binding": _tel_layer_to_dict(self.identity_binding),
+            "governance_status": _tel_layer_to_dict(self.governance_status),
+            "override_record": _tel_layer_to_dict(self.override_record),
+
+            # Nine-outcome decision metadata
+            "qualified_decision": self.qualified_decision,
+            "enhanced_logging": bool(self.enhanced_logging),
+            "reason_code": self.reason_code,
+            "proximity_to_threshold": (
+                round(float(self.proximity_to_threshold), 4)
+                if self.proximity_to_threshold is not None else None
+            ),
+            "redaction_applied": bool(self.redaction_applied),
+            "redacted_fields": list(self.redacted_fields),
+            "redaction_scope": self.redaction_scope,
+            "step_up_required": bool(self.step_up_required),
+            "step_up_completed": self.step_up_completed,
+            "compensation_scope": self.compensation_scope,
+            "incident_id": self.incident_id,
+            "recovery_mode_activated": bool(self.recovery_mode_activated),
+
+            # Version identifiers — from explicit construction, validated
+            # at sealing; never dataclass defaults.
+            "certificate_schema_version": int(self.certificate_schema_version),
+            "calculation_version": self.calculation_version,
+            "score_precision_policy": self.score_precision_policy,
+            "decay_algorithm_version": self.decay_algorithm_version,
+            "provenance_schema_version": int(self.provenance_schema_version),
+
+            # audit_integrity last; excluded from the hash payload.
+            "audit_integrity": _tel_layer_to_dict(self.audit_integrity),
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -964,6 +1500,164 @@ def _stub_id(prefix: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Version-neutral construction helpers (tis-v2 Commit 5a)                      #
+# --------------------------------------------------------------------------- #
+#
+# Extracted verbatim from generate_certificate() so BOTH builders share
+# them — generate_certificate_v2() must not call the legacy builder
+# (owner correction 4), and duplicating these blocks would let the two
+# drift. The v1 builder's output is byte-identical after extraction
+# (pinned by the stored-legacy fixtures and the fresh-v1 wire test).
+
+def _initial_transition(
+    lifecycle_state: str, decision: str, evaluation_time: datetime,
+) -> Dict[str, Any]:
+    return {
+        "from": "computed",
+        "to": lifecycle_state,
+        "timestamp": evaluation_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reason": f"Initial evaluation -- decision: {decision}",
+    }
+
+
+def _derive_provenance_refs(meta: Dict[str, Any]):
+    source_references = list(meta.get("source_references", []))
+    retrieval_ids = list(meta.get("retrieval_ids", []))
+    checkpoint_id = str(meta.get("checkpoint_id") or _stub_id("ckpt"))
+    gca_context_id = str(meta.get("gca_context_id") or _stub_id("gca"))
+    chain_of_custody_id = str(
+        meta.get("chain_of_custody_id") or _stub_id("coc")
+    )
+    audit_log_id = str(meta.get("audit_log_id") or _stub_id("audit"))
+    return (source_references, retrieval_ids, checkpoint_id,
+            gca_context_id, chain_of_custody_id, audit_log_id)
+
+
+def _build_scope_attestation(
+    meta: Dict[str, Any],
+    tis_result: TISResult,
+    evaluation_time: datetime,
+):
+    mcp_server_id = str(meta.get("mcp_server_id") or _stub_id("mcp"))
+    context_expanded = bool(
+        meta.get("context_expanded_after_evaluation")
+        or tis_result.invalidation_event == "context_expansion"
+    )
+    scope_attestation: Dict[str, Any] = {
+        "mcp_servers_in_scope": list(meta.get("mcp_servers_in_scope", [mcp_server_id])),
+        "mcp_servers_out_of_scope": list(meta.get("mcp_servers_out_of_scope", [])),
+        "downstream_agents_in_scope": list(meta.get("downstream_agents_in_scope", [])),
+        "downstream_agents_out_of_scope": list(meta.get("downstream_agents_out_of_scope", [])),
+        "context_frozen_at": evaluation_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "context_expanded_after_evaluation": context_expanded,
+        "context_expansion_events": list(meta.get("context_expansion_events", [])),
+        "enforcement_perimeter_complete": bool(
+            meta.get("enforcement_perimeter_complete", True)
+        ),
+        "attestation_basis": str(
+            meta.get("attestation_basis", "deployment-manifest-stub-v1")
+        ),
+        "upstream_tc_references": list(meta.get("upstream_tc_references", [])),
+    }
+    return mcp_server_id, scope_attestation
+
+
+def _derive_ct_audit(meta: Dict[str, Any], profile: PolicyProfile):
+    connection_type = str(meta.get("connection_type") or "CT-0")
+    connection_type_modifier_id = str(
+        meta.get("connection_type_modifier_id") or "ct-modifier-stub-v0"
+    )
+    resolved_policy_profile_id = str(
+        meta.get("resolved_policy_profile_id")
+        or f"{profile.profile_id}::{connection_type}::stub"
+    )
+    chain_depth = int(meta.get("chain_depth", 0))
+    chain_u_scores = [float(v) for v in meta.get("chain_u_scores", [])]
+    return (connection_type, connection_type_modifier_id,
+            resolved_policy_profile_id, chain_depth, chain_u_scores)
+
+
+def _derive_composer_metadata(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    cm_raw = meta.get("composer_metadata")
+    return dict(cm_raw) if isinstance(cm_raw, dict) else None
+
+
+def _build_identity_binding(meta: Dict[str, Any]) -> IdentityBinding:
+    return IdentityBinding(
+        requesting_identity=str(
+            meta.get("requesting_identity") or _stub_id("id")
+        ),
+        identity_type=str(meta.get("identity_type") or "human"),
+        role=str(meta.get("role") or "evaluation_requester"),
+        authorization_tier=str(meta.get("authorization_tier") or "T3"),
+        identity_confidence=float(meta.get("identity_confidence", 1.0)),
+        identity_verified=bool(meta.get("identity_verified", True)),
+        authentication_method=str(
+            meta.get("authentication_method") or "oauth2_mfa"
+        ),
+        requesting_session_id=str(
+            meta.get("requesting_session_id") or _stub_id("sess")
+        ),
+    )
+
+
+def _build_governance_status_layer(meta: Dict[str, Any]) -> GovernanceStatus:
+    return GovernanceStatus(
+        governance_status=str(meta.get("governance_status") or "complete"),
+        evaluation_completeness_score=float(
+            meta.get("evaluation_completeness_score", 1.0)
+        ),
+        components_evaluated=list(
+            meta.get(
+                "components_evaluated",
+                [
+                    "context_assembly",
+                    "dimension_scoring",
+                    "penalty_computation",
+                    "gate_evaluation",
+                    "decay_application",
+                    "invalidation_check",
+                    "decision_mapping",
+                    "certificate_generation",
+                ],
+            )
+        ),
+        components_skipped=list(meta.get("components_skipped", [])),
+        skip_reasons=dict(meta.get("skip_reasons", {})),
+        fail_safe_applied=bool(meta.get("fail_safe_applied", False)),
+        fail_safe_type=meta.get("fail_safe_type"),  # None by default
+        governance_integrity_score=float(
+            meta.get("governance_integrity_score", 1.0)
+        ),
+    )
+
+
+def _build_override_record_layer(meta: Dict[str, Any]) -> OverrideRecord:
+    return OverrideRecord(
+        override_invoked=bool(meta.get("override_invoked", False)),
+        original_decision=meta.get("original_decision"),
+        override_decision=meta.get("override_decision"),
+        override_actor=meta.get("override_actor"),
+        override_actor_role=meta.get("override_actor_role"),
+        override_reason=meta.get("override_reason"),
+        override_type=meta.get("override_type"),
+        policy_exception_id=meta.get("policy_exception_id"),
+        regulatory_basis=meta.get("regulatory_basis"),
+        co_authorizer=meta.get("co_authorizer"),
+        post_override_review_required=bool(
+            meta.get("post_override_review_required", False)
+        ),
+        post_override_review_deadline=meta.get("post_override_review_deadline"),
+        post_override_review_completed=bool(
+            meta.get("post_override_review_completed", False)
+        ),
+        override_creates_tc_amendment=bool(
+            meta.get("override_creates_tc_amendment", False)
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Public entry point                                                           #
 # --------------------------------------------------------------------------- #
 
@@ -1004,24 +1698,16 @@ def generate_certificate(
 
     # Initial state transition: every TC begins life in "computed" and then
     # settles into its assigned initial state (per TC_SCHEMA.md Layer L).
-    initial_transition = {
-        "from": "computed",
-        "to": lifecycle_state,
-        "timestamp": tis_input.evaluation_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "reason": f"Initial evaluation -- decision: {decision}",
-    }
+    initial_transition = _initial_transition(
+        lifecycle_state, decision, tis_input.evaluation_time
+    )
 
     # Provenance references. In Phase 1 these are generated stubs; context
     # metadata may override any of them if the scenario provides real IDs.
     meta = tis_input.context_metadata
-    source_references = list(meta.get("source_references", []))
-    retrieval_ids = list(meta.get("retrieval_ids", []))
-    checkpoint_id = str(meta.get("checkpoint_id") or _stub_id("ckpt"))
-    gca_context_id = str(meta.get("gca_context_id") or _stub_id("gca"))
-    chain_of_custody_id = str(
-        meta.get("chain_of_custody_id") or _stub_id("coc")
-    )
-    audit_log_id = str(meta.get("audit_log_id") or _stub_id("audit"))
+    (source_references, retrieval_ids, checkpoint_id,
+     gca_context_id, chain_of_custody_id, audit_log_id) = \
+        _derive_provenance_refs(meta)
 
     # recompute_required: True for r3 per TC_SCHEMA.md Layer T.
     recompute_required = (profile.risk_tier == "r3")
@@ -1037,30 +1723,9 @@ def generate_certificate(
     # Scenario metadata may override any of these by providing the same
     # keys in context_metadata — this lets Phase 2 scenarios (9/10/11)
     # exercise the bypass rules without touching generate_certificate().
-    mcp_server_id = str(meta.get("mcp_server_id") or _stub_id("mcp"))
-
-    # context_expanded flows from the invalidation_event if it's "context_expansion";
-    # everything else is a stub default.
-    context_expanded = bool(
-        meta.get("context_expanded_after_evaluation")
-        or tis_result.invalidation_event == "context_expansion"
+    mcp_server_id, scope_attestation = _build_scope_attestation(
+        meta, tis_result, tis_input.evaluation_time
     )
-    scope_attestation: Dict[str, Any] = {
-        "mcp_servers_in_scope": list(meta.get("mcp_servers_in_scope", [mcp_server_id])),
-        "mcp_servers_out_of_scope": list(meta.get("mcp_servers_out_of_scope", [])),
-        "downstream_agents_in_scope": list(meta.get("downstream_agents_in_scope", [])),
-        "downstream_agents_out_of_scope": list(meta.get("downstream_agents_out_of_scope", [])),
-        "context_frozen_at": tis_input.evaluation_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "context_expanded_after_evaluation": context_expanded,
-        "context_expansion_events": list(meta.get("context_expansion_events", [])),
-        "enforcement_perimeter_complete": bool(
-            meta.get("enforcement_perimeter_complete", True)
-        ),
-        "attestation_basis": str(
-            meta.get("attestation_basis", "deployment-manifest-stub-v1")
-        ),
-        "upstream_tc_references": list(meta.get("upstream_tc_references", [])),
-    }
 
     # ---- CT Audit Fields (TCS-CATC-001 §18) ---------------------------- #
     # Phase-1 stubs. In Phase 2 these will be populated from the
@@ -1070,26 +1735,16 @@ def generate_certificate(
     # has not yet run". Scenario metadata may override any of these keys,
     # which lets Phase 2 scenarios 12/13/14 exercise connection-aware
     # scoring without touching generate_certificate() further.
-    connection_type = str(meta.get("connection_type") or "CT-0")
-    connection_type_modifier_id = str(
-        meta.get("connection_type_modifier_id") or "ct-modifier-stub-v0"
-    )
-    resolved_policy_profile_id = str(
-        meta.get("resolved_policy_profile_id")
-        or f"{profile.profile_id}::{connection_type}::stub"
-    )
-    chain_depth = int(meta.get("chain_depth", 0))
-    chain_u_scores = [float(v) for v in meta.get("chain_u_scores", [])]
+    (connection_type, connection_type_modifier_id,
+     resolved_policy_profile_id, chain_depth, chain_u_scores) = \
+        _derive_ct_audit(meta, profile)
 
     # ---- Standards Composer audit (Slice 4) ---------------------------- #
     # If the active policy profile was produced by the Standards
     # Composer, the route/GCA will have stashed its composer_metadata
     # in context_metadata. Pass it through to the TC verbatim so the
     # audit trail is self-contained.
-    cm_raw = meta.get("composer_metadata")
-    composer_metadata: Optional[Dict[str, Any]] = (
-        dict(cm_raw) if isinstance(cm_raw, dict) else None
-    )
+    composer_metadata = _derive_composer_metadata(meta)
 
     # ---- Governance Risk Rule audit (Slice 4.5) ------------------------ #
     # The GCA stashes one audit dict per triggered rule in
@@ -1118,78 +1773,15 @@ def generate_certificate(
     # context_metadata to exercise degraded and override workflows.
     #
     # Layer Id — IdentityBinding
-    identity_binding = IdentityBinding(
-        requesting_identity=str(
-            meta.get("requesting_identity") or _stub_id("id")
-        ),
-        identity_type=str(meta.get("identity_type") or "human"),
-        role=str(meta.get("role") or "evaluation_requester"),
-        authorization_tier=str(meta.get("authorization_tier") or "T3"),
-        identity_confidence=float(meta.get("identity_confidence", 1.0)),
-        identity_verified=bool(meta.get("identity_verified", True)),
-        authentication_method=str(
-            meta.get("authentication_method") or "oauth2_mfa"
-        ),
-        requesting_session_id=str(
-            meta.get("requesting_session_id") or _stub_id("sess")
-        ),
-    )
+    identity_binding = _build_identity_binding(meta)
 
     # Layer GS — GovernanceStatus
-    governance_status_obj = GovernanceStatus(
-        governance_status=str(meta.get("governance_status") or "complete"),
-        evaluation_completeness_score=float(
-            meta.get("evaluation_completeness_score", 1.0)
-        ),
-        components_evaluated=list(
-            meta.get(
-                "components_evaluated",
-                [
-                    "context_assembly",
-                    "dimension_scoring",
-                    "penalty_computation",
-                    "gate_evaluation",
-                    "decay_application",
-                    "invalidation_check",
-                    "decision_mapping",
-                    "certificate_generation",
-                ],
-            )
-        ),
-        components_skipped=list(meta.get("components_skipped", [])),
-        skip_reasons=dict(meta.get("skip_reasons", {})),
-        fail_safe_applied=bool(meta.get("fail_safe_applied", False)),
-        fail_safe_type=meta.get("fail_safe_type"),  # None by default
-        governance_integrity_score=float(
-            meta.get("governance_integrity_score", 1.0)
-        ),
-    )
+    governance_status_obj = _build_governance_status_layer(meta)
 
     # Layer Ov — OverrideRecord
     # Phase 1 scenarios do not invoke overrides — every field stays at
     # its null/False default. Phase 2 scenario 16 populates this block.
-    override_record = OverrideRecord(
-        override_invoked=bool(meta.get("override_invoked", False)),
-        original_decision=meta.get("original_decision"),
-        override_decision=meta.get("override_decision"),
-        override_actor=meta.get("override_actor"),
-        override_actor_role=meta.get("override_actor_role"),
-        override_reason=meta.get("override_reason"),
-        override_type=meta.get("override_type"),
-        policy_exception_id=meta.get("policy_exception_id"),
-        regulatory_basis=meta.get("regulatory_basis"),
-        co_authorizer=meta.get("co_authorizer"),
-        post_override_review_required=bool(
-            meta.get("post_override_review_required", False)
-        ),
-        post_override_review_deadline=meta.get("post_override_review_deadline"),
-        post_override_review_completed=bool(
-            meta.get("post_override_review_completed", False)
-        ),
-        override_creates_tc_amendment=bool(
-            meta.get("override_creates_tc_amendment", False)
-        ),
-    )
+    override_record = _build_override_record_layer(meta)
 
     tc = TrustCertificate(
         # Identity
@@ -1296,6 +1888,1363 @@ def generate_certificate(
     tc.audit_integrity = AuditIntegrity(
         tc_hash=tc_hash,
         previous_tc_hash=meta.get("previous_tc_hash"),  # None in Phase 1
+        chain_sequence=int(meta.get("chain_sequence", 1)),
+        chain_id=str(meta.get("chain_id") or _stub_id("chain")),
+        hash_algorithm="sha256",
+        integrity_verified=True,
+        issued_by=str(meta.get("issued_by") or "tcs-reference-impl-v0.1"),
+    )
+    return tc
+
+
+# =========================================================================== #
+# tis-v2 — v2 certificate core (Commit 4 of the landing sequence)             #
+# =========================================================================== #
+#
+# Everything below is ADDITIVE. Production issuance remains on the v1
+# path (generate_certificate + map_decision) until Commit 5 atomically
+# switches the orchestration call sites; generate_certificate_v2 is
+# reachable only from tests in this commit.
+#
+# The sealing guarantee does NOT depend on callers remembering to
+# validate: build_v2_hash_payload — reached exclusively through
+# compute_tc_hash's version dispatch, the only way any certificate hash
+# is produced — executes the complete validation-and-replay contract
+# before returning payload bytes. A v2 certificate that does not
+# reproduce its own computation cannot acquire a hash at all. The
+# certificate store additionally invokes the same validator explicitly
+# at the persistence boundary.
+
+
+# --------------------------------------------------------------------------- #
+# The exact v2 wire field set                                                  #
+# --------------------------------------------------------------------------- #
+#
+# Single-vocabulary rule: one authoritative field per concept. The
+# legacy aliases gate_passed (superseded by gate_result), decay_rate
+# (superseded by resolved_decay_rate), and failing_dimension_subfactors
+# (superseded by c3_score) are OMITTED from the v2 wire; they survive
+# only in the frozen v1 representation.
+#
+# V2_OPTIONAL_FIELDS is empty by design: the v2 wire always emits every
+# field; nullability is a per-field type rule, never key omission.
+
+_V2_REMOVED_LEGACY_ALIASES = frozenset({
+    "gate_passed", "decay_rate", "failing_dimension_subfactors",
+})
+
+_V2_NEW_FIELDS = frozenset({
+    "component_scores_raw", "component_scores_observed",
+    "adjustments_applied", "c3_provenance", "gate_result",
+    "resolved_penalty_weights", "resolved_decay_rate", "elapsed_hours",
+    "decay_factor", "resolved_theta_allow", "resolved_theta_hold",
+    "resolved_theta_escalate", "resolved_kappa", "c3_score", "is_valid",
+    "certificate_schema_version", "calculation_version",
+    "score_precision_policy", "decay_algorithm_version",
+    "provenance_schema_version",
+})
+
+V2_REQUIRED_FIELDS = frozenset(
+    (V1_HASH_FIELD_SET - _V2_REMOVED_LEGACY_ALIASES)
+    | _V2_NEW_FIELDS
+    | {"audit_integrity"}
+)
+V2_OPTIONAL_FIELDS = frozenset()
+V2_FIELD_SET = V2_REQUIRED_FIELDS | V2_OPTIONAL_FIELDS
+
+_BACK_DIMS = frozenset({"B", "A", "C", "K"})
+_ALLOWED_GATE_RESULTS = frozenset({"pass", "fail", "not_applicable"})
+_ALLOWED_DECISIONS = frozenset({"Allow", "Observe", "Hold", "Escalate", "Stop"})
+_CANONICAL_PENALTY_KEYS = frozenset({"cb", "d", "n", "h", "ps"})
+
+_FIXED_4DP_SCORE = _re.compile(r"^(?:0\.\d{4}|1\.0000)$")
+_FIXED_4DP_PARAM = _re.compile(r"^(?:0|[1-9]\d*)\.\d{4}$")
+
+
+# --------------------------------------------------------------------------- #
+# Strict wire parsers (validate, never repair)                                 #
+# --------------------------------------------------------------------------- #
+
+def _parse_score_string(value: Any, name: str) -> Decimal:
+    if not isinstance(value, str) or not _FIXED_4DP_SCORE.fullmatch(value):
+        raise CertificateInvariantError(
+            f"{name} is not a canonical fixed-scale 4dp score string: "
+            f"{value!r}"
+        )
+    return Decimal(value)
+
+
+def _parse_param_string(value: Any, name: str) -> Decimal:
+    if not isinstance(value, str) or not _FIXED_4DP_PARAM.fullmatch(value):
+        raise CertificateInvariantError(
+            f"{name} is not a canonical 4dp parameter string: {value!r}"
+        )
+    return Decimal(value)
+
+
+def _parse_raw_string(value: Any, name: str) -> Decimal:
+    """Variable-scale raw-evidence string: lossless, deterministic form."""
+    if not isinstance(value, str):
+        raise CertificateInvariantError(
+            f"{name} must be a decimal string, got {type(value).__name__}"
+        )
+    try:
+        d = Decimal(value)
+    except Exception as exc:  # noqa: BLE001
+        raise CertificateInvariantError(
+            f"{name} is not a parseable decimal: {value!r}"
+        ) from exc
+    if not d.is_finite() or d < 0 or d > 1:
+        raise CertificateInvariantError(
+            f"{name} outside [0, 1]: {value!r}"
+        )
+    # The deterministic raw form is exactly what serialize_raw_decimal
+    # emits; anything else (trailing zeros, exponent notation) is not
+    # the canonical raw representation.
+    if serialize_raw_decimal(d) != value:
+        raise CertificateInvariantError(
+            f"{name} is not in deterministic raw form: {value!r}"
+        )
+    return d
+
+
+def _require_int01(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) \
+            or value not in (0, 1):
+        raise CertificateInvariantError(
+            f"{name} must be int 0 or 1, got {value!r}"
+        )
+    return value
+
+
+# --------------------------------------------------------------------------- #
+# v2 sealing validation — the complete contract                                #
+# --------------------------------------------------------------------------- #
+
+def _resolve_penalty_maxima_for_seal(
+    risk_tier: str, action_class: str,
+) -> Dict[str, Decimal]:
+    """Per-component penalty maxima from the recorded (r, a) axes.
+
+    These are tis-v2 CALCULATION CONSTANTS (versioned by
+    calculation_version), not a mutable rule registry — consulting them
+    during verification is permitted.
+    """
+    if risk_tier not in W_NOVELTY_BY_TIER_DECIMAL:
+        raise CertificateInvariantError(
+            f"unknown risk_tier {risk_tier!r} for penalty maxima"
+        )
+    return {
+        "cb": P_CB_MAX_V2,
+        "d": canonical_score(DELTA_D_MAX_DECIMAL),
+        "n": canonical_score(W_NOVELTY_BY_TIER_DECIMAL[risk_tier]),
+        "h": canonical_score(DELTA_H_MAX_DECIMAL),
+        "ps": canonical_score(_W_PS_SPECIAL_DECIMAL.get(
+            (risk_tier, action_class), _W_PS_DEFAULT_DECIMAL,
+        )),
+    }
+
+
+def _quantize_pinned(value: Decimal) -> Decimal:
+    with localcontext(TIS_DECIMAL_CONTEXT):
+        result = value.quantize(SCORE_QUANTUM, rounding=SCORE_ROUNDING)
+    return Decimal("0.0000") if result == 0 else result
+
+
+def _replay_decision_v2_from_values(
+    *,
+    is_valid: int,
+    c3_score: Decimal,
+    gate: int,
+    s_base: Decimal,
+    tis_current: Decimal,
+    kappa: Decimal,
+    theta_allow: Decimal,
+    theta_hold: Decimal,
+    theta_escalate: Decimal,
+    risk_tier: str,
+) -> str:
+    """Replay the tis-v2 decision from hash-protected certificate
+    contents only — no live or mutable lookups."""
+    # Lazy import avoids any module-order coupling; decision_engine does
+    # not import trust_certificate, so there is no cycle either way.
+    from tcs.decision_engine import _apply_priority_ladder_v2
+    return _apply_priority_ladder_v2(
+        is_valid=is_valid, c3_score=c3_score, gate=gate, s_base=s_base,
+        tis_current=tis_current, kappa=kappa, theta_allow=theta_allow,
+        theta_hold=theta_hold, theta_escalate=theta_escalate,
+        risk_tier=risk_tier,
+    )
+
+
+def validate_v2_certificate_for_sealing(serialized: Dict[str, Any]) -> None:
+    """The complete tis-v2 sealing contract, over SERIALIZED content.
+
+    Runs immediately before any v2 hash is produced (via
+    build_v2_hash_payload) and again explicitly at the certificate
+    store's persistence boundary. Registry-independent: consults only
+    the serialized content, tis-v2 calculation constants, and the
+    append-only pattern-version registry.
+
+    Order: exact schema -> canonical form -> independent replay of every
+    derived value and the decision -> provenance validation.
+    """
+    # ---- 1. Exact versioned schema ------------------------------------- #
+    version = classify_certificate_schema_version(serialized)
+    if version != 2:
+        raise CertificateInvariantError(
+            f"validate_v2_certificate_for_sealing requires schema "
+            f"version 2, got {version}"
+        )
+    keys = set(serialized)
+    if keys != V2_FIELD_SET:
+        unexpected = sorted(keys - V2_FIELD_SET)
+        missing = sorted(V2_FIELD_SET - keys)
+        raise CertificateInvariantError(
+            f"v2 wire schema mismatch: unexpected={unexpected} "
+            f"missing={missing}"
+        )
+
+    calc_version = serialized["calculation_version"]
+    if calc_version != CALCULATION_VERSION_V2:
+        raise UnsupportedCalculationVersion(calc_version)
+    if serialized["score_precision_policy"] != SCORE_PRECISION_POLICY:
+        raise CertificateInvariantError(
+            f"unsupported score_precision_policy "
+            f"{serialized['score_precision_policy']!r}"
+        )
+    if serialized["decay_algorithm_version"] != DECAY_ALGORITHM_VERSION:
+        raise CertificateInvariantError(
+            f"unsupported decay_algorithm_version "
+            f"{serialized['decay_algorithm_version']!r}"
+        )
+    if serialized["provenance_schema_version"] != C3_PROVENANCE_SCHEMA_VERSION:
+        raise CertificateInvariantError(
+            f"unsupported provenance_schema_version "
+            f"{serialized['provenance_schema_version']!r}"
+        )
+
+    # ---- 2. Canonical form of every numerical field --------------------- #
+    effective = {
+        k: _parse_score_string(v, f"component_scores.{k}")
+        for k, v in serialized["component_scores"].items()
+    }
+    raw = {
+        k: _parse_raw_string(v, f"component_scores_raw.{k}")
+        for k, v in serialized["component_scores_raw"].items()
+    }
+    del raw  # validated for form and range; raw evidence is attested
+    observed = {
+        k: _parse_score_string(v, f"component_scores_observed.{k}")
+        for k, v in serialized["component_scores_observed"].items()
+    }
+    del observed  # validated; observed tier is attested, not recomputed
+    weights = {
+        k: _parse_score_string(v, f"component_weights.{k}")
+        for k, v in serialized["component_weights"].items()
+    }
+    thresholds = {
+        k: _parse_score_string(v, f"thresholds.{k}")
+        for k, v in serialized["thresholds"].items()
+    }
+    for name in ("component_scores", "component_scores_observed",
+                 "component_scores_raw", "component_weights"):
+        if set(serialized[name]) != _BACK_DIMS:
+            raise CertificateInvariantError(f"{name} key set incomplete")
+    if not set(thresholds).issubset(_BACK_DIMS):
+        raise CertificateInvariantError("unknown threshold dimension")
+
+    s_base = _parse_score_string(serialized["s_base"], "s_base")
+    s_adjusted = _parse_score_string(serialized["s_adjusted"], "s_adjusted")
+    tis_raw = _parse_score_string(serialized["tis_raw"], "tis_raw")
+    tis_adjusted = _parse_score_string(
+        serialized["tis_adjusted"], "tis_adjusted")
+    tis_current = _parse_score_string(
+        serialized["tis_current"], "tis_current")
+    penalty_aggregate = _parse_score_string(
+        serialized["penalty_aggregate"], "penalty_aggregate")
+    decay_factor = _parse_score_string(
+        serialized["decay_factor"], "decay_factor")
+    c3_score = _parse_score_string(serialized["c3_score"], "c3_score")
+    theta_allow = _parse_score_string(
+        serialized["resolved_theta_allow"], "resolved_theta_allow")
+    theta_hold = _parse_score_string(
+        serialized["resolved_theta_hold"], "resolved_theta_hold")
+    theta_escalate = _parse_score_string(
+        serialized["resolved_theta_escalate"], "resolved_theta_escalate")
+    kappa = _parse_score_string(serialized["resolved_kappa"], "resolved_kappa")
+
+    risk_tier = serialized["risk_tier"]
+    action_class = serialized["action_class"]
+    maxima = _resolve_penalty_maxima_for_seal(risk_tier, action_class)
+    penalty_breakdown = {}
+    for k, v in serialized["penalty_breakdown"].items():
+        parsed = _parse_param_string(v, f"penalty_breakdown.{k}")
+        if k not in maxima:
+            raise CertificateInvariantError(
+                f"unknown penalty component {k!r}"
+            )
+        if parsed > maxima[k]:
+            raise CertificateInvariantError(
+                f"penalty_breakdown.{k} exceeds maximum {maxima[k]}"
+            )
+        penalty_breakdown[k] = parsed
+    penalty_weights = {
+        k: _parse_score_string(v, f"resolved_penalty_weights.{k}")
+        for k, v in serialized["resolved_penalty_weights"].items()
+    }
+    if set(penalty_breakdown) != _CANONICAL_PENALTY_KEYS:
+        raise CertificateInvariantError("penalty_breakdown key set invalid")
+    if set(penalty_weights) != _CANONICAL_PENALTY_KEYS:
+        raise CertificateInvariantError(
+            "resolved_penalty_weights key set invalid")
+
+    resolved_decay_rate = _parse_param_string(
+        serialized["resolved_decay_rate"], "resolved_decay_rate")
+    elapsed_hours = _parse_param_string(
+        serialized["elapsed_hours"], "elapsed_hours")
+
+    gate_result = _require_int01(serialized["gate_result"], "gate_result")
+    is_valid = _require_int01(serialized["is_valid"], "is_valid")
+
+    gate_set = serialized["gate_set"]
+    if (not isinstance(gate_set, list)
+            or gate_set != sorted(set(gate_set))
+            or not set(gate_set).issubset(_BACK_DIMS)):
+        raise CertificateInvariantError(
+            f"gate_set must be a sorted, deduplicated subset of BACK: "
+            f"{gate_set!r}"
+        )
+    missing_thresholds = set(gate_set) - set(thresholds)
+    if missing_thresholds:
+        raise CertificateInvariantError(
+            f"gated dimensions missing thresholds: "
+            f"{sorted(missing_thresholds)}"
+        )
+    gate_results = serialized["gate_results"]
+    if set(gate_results) != _BACK_DIMS:
+        raise CertificateInvariantError(
+            "gate_results must cover all four dimensions")
+    if any(v not in _ALLOWED_GATE_RESULTS for v in gate_results.values()):
+        raise CertificateInvariantError(
+            "gate_results contains an unknown result")
+
+    decision = serialized["decision"]
+    if decision not in _ALLOWED_DECISIONS:
+        raise CertificateInvariantError(f"unknown decision {decision!r}")
+
+    # Adjustments: canonical score strings, valid shape.
+    for a in serialized["adjustments_applied"]:
+        if not isinstance(a, dict) or set(a) != {
+            "rule_id", "dimension", "value_before", "value_after", "reason",
+        }:
+            raise CertificateInvariantError(
+                "adjustments_applied entry has invalid shape")
+        if a["dimension"] not in _BACK_DIMS:
+            raise CertificateInvariantError(
+                f"adjustments_applied dimension {a['dimension']!r} unknown")
+        _parse_score_string(a["value_before"], "adjustments.value_before")
+        _parse_score_string(a["value_after"], "adjustments.value_after")
+
+    # ---- 3. Structural invariants --------------------------------------- #
+    with localcontext(TIS_DECIMAL_CONTEXT):
+        weight_sum = sum(weights.values(), Decimal("0"))
+        pweight_sum = sum(penalty_weights.values(), Decimal("0"))
+    if weight_sum != Decimal("1.0000"):
+        raise CertificateInvariantError(
+            f"component_weights sum {weight_sum} != 1.0000")
+    if pweight_sum != Decimal("1.0000"):
+        raise CertificateInvariantError(
+            f"resolved_penalty_weights sum {pweight_sum} != 1.0000")
+    if not (theta_escalate <= theta_hold <= theta_allow):
+        raise CertificateInvariantError(
+            f"threshold ordering violated: escalate={theta_escalate} "
+            f"hold={theta_hold} allow={theta_allow}"
+        )
+    if penalty_aggregate > Decimal("0.5000"):
+        raise CertificateInvariantError(
+            f"penalty_aggregate {penalty_aggregate} exceeds the 0.5000 cap")
+
+    # ---- 4. Independent replay of every derived value -------------------- #
+    with localcontext(TIS_DECIMAL_CONTEXT):
+        recomputed_s_base = sum(
+            (weights[k] * _parse_score_string(
+                serialized["component_scores"][k], f"component_scores.{k}")
+             for k in weights),
+            Decimal("0"),
+        ).quantize(SCORE_QUANTUM, rounding=SCORE_ROUNDING)
+    if recomputed_s_base == 0:
+        recomputed_s_base = Decimal("0.0000")
+    if recomputed_s_base != s_base:
+        raise CertificateInvariantError(
+            "component scores do not reproduce s_base; refusing to seal")
+
+    recomputed_gates = {}
+    for dim in ("B", "A", "C", "K"):
+        if dim not in gate_set:
+            recomputed_gates[dim] = "not_applicable"
+        elif effective[dim] >= thresholds[dim]:
+            recomputed_gates[dim] = "pass"
+        else:
+            recomputed_gates[dim] = "fail"
+    if recomputed_gates != gate_results:
+        raise CertificateInvariantError(
+            "recorded gate results are not reproduced by recorded "
+            "effective scores and thresholds")
+    recomputed_gate = 0 if any(
+        recomputed_gates[d] == "fail" for d in gate_set
+    ) else 1
+    if recomputed_gate != gate_result:
+        raise CertificateInvariantError(
+            "aggregate gate result is not reproduced by recorded gates")
+
+    with localcontext(TIS_DECIMAL_CONTEXT):
+        weighted_penalty = sum(
+            (penalty_weights[k] * penalty_breakdown[k]
+             for k in sorted(penalty_breakdown)),
+            Decimal("0"),
+        )
+        recomputed_penalty = min(Decimal("0.5000"), weighted_penalty)
+    recomputed_penalty = _quantize_pinned(recomputed_penalty)
+    if recomputed_penalty != penalty_aggregate:
+        raise CertificateInvariantError(
+            "penalty_breakdown does not reproduce penalty_aggregate")
+
+    with localcontext(TIS_DECIMAL_CONTEXT):
+        recomputed_s_adj = _quantize_pinned(
+            s_base * (Decimal("1.0000") - penalty_aggregate))
+        recomputed_tis_raw = _quantize_pinned(
+            Decimal(gate_result) * s_base)
+        recomputed_tis_adj = _quantize_pinned(
+            Decimal(gate_result) * s_adjusted)
+        decay_input = (-resolved_decay_rate * elapsed_hours).exp()
+    if recomputed_s_adj != s_adjusted:
+        raise CertificateInvariantError(
+            "recorded s_adjusted is not reproduced")
+    if recomputed_tis_raw != tis_raw:
+        raise CertificateInvariantError("recorded tis_raw is not reproduced")
+    if recomputed_tis_adj != tis_adjusted:
+        raise CertificateInvariantError(
+            "recorded tis_adjusted is not reproduced")
+    if not decay_input.is_finite() or decay_input < 0 or decay_input > 1:
+        raise CertificateInvariantError(
+            f"replayed decay factor out of range: {decay_input}")
+    recomputed_decay = _quantize_pinned(decay_input)
+    if recomputed_decay != decay_factor:
+        raise CertificateInvariantError(
+            "recorded decay_factor is not reproduced")
+    with localcontext(TIS_DECIMAL_CONTEXT):
+        recomputed_current = _quantize_pinned(
+            tis_adjusted * decay_factor * Decimal(is_valid))
+    if recomputed_current != tis_current:
+        raise CertificateInvariantError(
+            "recorded tis_current is not reproduced")
+
+    # ---- 5. Decision replay (versioned; unconditional C3-zero Stop) ----- #
+    recomputed_decision = _replay_decision_v2_from_values(
+        is_valid=is_valid, c3_score=c3_score, gate=gate_result,
+        s_base=s_base, tis_current=tis_current, kappa=kappa,
+        theta_allow=theta_allow, theta_hold=theta_hold,
+        theta_escalate=theta_escalate, risk_tier=risk_tier,
+    )
+    if recomputed_decision != decision:
+        raise CertificateInvariantError(
+            f"recorded decision {decision!r} is not reproduced by "
+            f"certificate contents (replay: {recomputed_decision!r})")
+    if c3_score == Decimal("0.0000") and decision != "Stop":
+        raise CertificateInvariantError(
+            "tis-v2 invariant violated: c3_score == 0.0000 requires "
+            "decision == 'Stop' independently of gate_result")
+
+    # ---- 6. Provenance --------------------------------------------------- #
+    typed_matches = [
+        governance_rule_match_from_dict(m)
+        for m in serialized["governance_rule_matches"]
+    ]
+    match_sort = [rule_match_sort_key(m) for m in typed_matches]
+    if match_sort != sorted(match_sort):
+        raise CertificateInvariantError(
+            "governance_rule_matches not in canonical order")
+    records = [
+        c3_provenance_record_from_dict(r)
+        for r in serialized["c3_provenance"]
+    ]
+    record_sort = [c3_record_sort_key(r) for r in records]
+    if record_sort != sorted(record_sort):
+        raise CertificateInvariantError(
+            "c3_provenance not in canonical order")
+
+    if c3_score == Decimal("0.0000"):
+        if not records:
+            raise CertificateInvariantError(
+                "c3_score == 0.0000 requires at least one "
+                "C3ProvenanceRecord")
+    else:
+        if records:
+            raise CertificateInvariantError(
+                "c3_provenance must be empty when c3_score != 0.0000")
+
+    # Internal references only — never a live registry lookup.
+    match_keys = {(m.rule_id, m.rule_version) for m in typed_matches}
+    for r in records:
+        if r.source_type == "rule":
+            for ref in r.rule_match_refs:
+                if (ref.rule_id, ref.rule_version) not in match_keys:
+                    raise CertificateInvariantError(
+                        f"c3_provenance rule ref "
+                        f"({ref.rule_id!r}, {ref.rule_version!r}) does "
+                        f"not resolve to a recorded governance rule match")
+
+
+def build_v2_hash_payload(serialized: Dict[str, Any]) -> bytes:
+    """The tis-v2 hash payload: validate-and-replay, then hash as-given.
+
+    Because v2 owns its wire shape from birth, the payload is the
+    canonical JSON of the serialized dict minus ``audit_integrity`` —
+    after the COMPLETE sealing contract has passed. The exact-schema
+    check makes any injected field a hard failure, giving stored v2
+    content the same tamper-detection property the raw v1 path has.
+    """
+    validate_v2_certificate_for_sealing(serialized)
+    content = {
+        k: v for k, v in serialized.items() if k != "audit_integrity"
+    }
+    return _canonical_json_bytes(content)
+
+
+# --------------------------------------------------------------------------- #
+# v2 deserialization (strict, never repairing)                                 #
+# --------------------------------------------------------------------------- #
+
+_IDENTITY_BINDING_KEYS = frozenset({
+    "requesting_identity", "identity_type", "role", "authorization_tier",
+    "identity_confidence", "identity_verified", "authentication_method",
+    "requesting_session_id",
+})
+_GOVERNANCE_STATUS_KEYS = frozenset({
+    "governance_status", "evaluation_completeness_score",
+    "components_evaluated", "components_skipped", "skip_reasons",
+    "fail_safe_applied", "fail_safe_type", "governance_integrity_score",
+})
+_OVERRIDE_RECORD_KEYS = frozenset({
+    "override_invoked", "original_decision", "override_decision",
+    "override_actor", "override_actor_role", "override_reason",
+    "override_type", "policy_exception_id", "regulatory_basis",
+    "co_authorizer", "post_override_review_required",
+    "post_override_review_deadline", "post_override_review_completed",
+    "override_creates_tc_amendment",
+})
+_AUDIT_INTEGRITY_KEYS = frozenset({
+    "tc_hash", "previous_tc_hash", "chain_sequence", "chain_id",
+    "hash_algorithm", "integrity_verified", "issued_by",
+})
+
+
+def _strict_layer(d: Optional[Dict[str, Any]], keys: frozenset,
+                  cls: Any, name: str) -> Any:
+    if d is None:
+        return None
+    if not isinstance(d, dict) or set(d) != keys:
+        raise CertificateInvariantError(
+            f"{name} layer has invalid key set: "
+            f"{sorted(d) if isinstance(d, dict) else type(d).__name__}"
+        )
+    return cls(**d)
+
+
+def _parse_iso_z(value: str, name: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise CertificateInvariantError(
+            f"{name} must be an ISO-8601 Z string, got {value!r}"
+        )
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+
+
+def tc_from_dict_v2(d: Dict[str, Any]) -> "TrustCertificate":
+    """Rebuild a v2 TrustCertificate from its serialized dict.
+
+    Strict: runs the complete sealing validation first (which also
+    proves replayability), then parses. Registry-independent. The
+    model fields that exist only for v1 compatibility (gate_passed,
+    decay_rate, failing_dimension_subfactors) are derived
+    deterministically from their v2 authoritative counterparts — they
+    are never serialized on v2.
+    """
+    validate_v2_certificate_for_sealing(d)
+
+    adjustments = [
+        AdjustmentApplied(
+            rule_id=a["rule_id"], dimension=a["dimension"],
+            value_before=Decimal(a["value_before"]),
+            value_after=Decimal(a["value_after"]),
+            reason=a["reason"],
+        )
+        for a in d["adjustments_applied"]
+    ]
+    typed_matches = [
+        governance_rule_match_from_dict(m)
+        for m in d["governance_rule_matches"]
+    ]
+    records = [
+        c3_provenance_record_from_dict(r) for r in d["c3_provenance"]
+    ]
+
+    resolved_decay_rate = Decimal(d["resolved_decay_rate"])
+
+    return TrustCertificate(
+        certificate_id=d["certificate_id"],
+        subject_id=d["subject_id"],
+        subject_type=d["subject_type"],
+        domain=d["domain"],
+        risk_tier=d["risk_tier"],
+        action_class=d["action_class"],
+        policy_severity=d["policy_severity"],
+        checkpoint_id=d["checkpoint_id"],
+        gca_context_id=d["gca_context_id"],
+        policy_set_id=d["policy_set_id"],
+        s_base=Decimal(d["s_base"]),
+        s_adjusted=Decimal(d["s_adjusted"]),
+        tis_raw=Decimal(d["tis_raw"]),
+        tis_adjusted=Decimal(d["tis_adjusted"]),
+        tis_current=Decimal(d["tis_current"]),
+        component_scores={
+            k: Decimal(v) for k, v in d["component_scores"].items()
+        },
+        component_weights={
+            k: Decimal(v) for k, v in d["component_weights"].items()
+        },
+        penalty_aggregate=Decimal(d["penalty_aggregate"]),
+        penalty_breakdown={
+            k: Decimal(v) for k, v in d["penalty_breakdown"].items()
+        },
+        failing_dimension_subfactors={},   # v1-only alias; not on v2 wire
+        gate_set=list(d["gate_set"]),
+        thresholds={k: Decimal(v) for k, v in d["thresholds"].items()},
+        gate_results=dict(d["gate_results"]),
+        gate_passed=(d["gate_result"] == 1),   # derived; not serialized on v2
+        blocking_reason=d["blocking_reason"],
+        failure_mode=d["failure_mode"],
+        decision=d["decision"],
+        requires_human_review=d["requires_human_review"],
+        escalation_routed_to=list(d["escalation_routed_to"]),
+        source_references=list(d["source_references"]),
+        retrieval_ids=list(d["retrieval_ids"]),
+        chain_of_custody_id=d["chain_of_custody_id"],
+        audit_log_id=d["audit_log_id"],
+        integration_boundary_gaps=d["integration_boundary_gaps"],
+        evaluation_timestamp=_parse_iso_z(
+            d["evaluation_timestamp"], "evaluation_timestamp"),
+        valid_until=_parse_iso_z(d["valid_until"], "valid_until"),
+        decay_rate=float(resolved_decay_rate),   # derived; not serialized on v2
+        recompute_required=d["recompute_required"],
+        invalidation_triggers=list(d["invalidation_triggers"]),
+        last_invalidation_event=dict(d["last_invalidation_event"]),
+        invalidation_status=d["invalidation_status"],
+        explanation_summary=d["explanation_summary"],
+        key_factors=list(d["key_factors"]),
+        key_concerns=list(d["key_concerns"]),
+        regulatory_explanation_level=d["regulatory_explanation_level"],
+        regulatory_mapping=list(d["regulatory_mapping"]),
+        lifecycle_state=d["lifecycle_state"],
+        state_transition_history=[
+            dict(e) for e in d["state_transition_history"]
+        ],
+        recomputed_from_certificate_id=d["recomputed_from_certificate_id"],
+        superseded_by_certificate_id=d["superseded_by_certificate_id"],
+        archived=d["archived"],
+        mcp_server_id=d["mcp_server_id"],
+        scope_attestation=dict(d["scope_attestation"]),
+        connection_type=d["connection_type"],
+        connection_type_modifier_id=d["connection_type_modifier_id"],
+        resolved_policy_profile_id=d["resolved_policy_profile_id"],
+        chain_depth=d["chain_depth"],
+        chain_u_scores=list(d["chain_u_scores"]),
+        composer_metadata=(
+            dict(d["composer_metadata"])
+            if d["composer_metadata"] is not None else None
+        ),
+        governance_rule_matches=typed_matches,
+        identity_binding=_strict_layer(
+            d["identity_binding"], _IDENTITY_BINDING_KEYS,
+            IdentityBinding, "identity_binding"),
+        governance_status=_strict_layer(
+            d["governance_status"], _GOVERNANCE_STATUS_KEYS,
+            GovernanceStatus, "governance_status"),
+        audit_integrity=_strict_layer(
+            d["audit_integrity"], _AUDIT_INTEGRITY_KEYS,
+            AuditIntegrity, "audit_integrity"),
+        override_record=_strict_layer(
+            d["override_record"], _OVERRIDE_RECORD_KEYS,
+            OverrideRecord, "override_record"),
+        qualified_decision=d["qualified_decision"],
+        enhanced_logging=d["enhanced_logging"],
+        reason_code=d["reason_code"],
+        proximity_to_threshold=d["proximity_to_threshold"],
+        redaction_applied=d["redaction_applied"],
+        redacted_fields=list(d["redacted_fields"]),
+        redaction_scope=d["redaction_scope"],
+        step_up_required=d["step_up_required"],
+        step_up_completed=d["step_up_completed"],
+        compensation_scope=d["compensation_scope"],
+        incident_id=d["incident_id"],
+        recovery_mode_activated=d["recovery_mode_activated"],
+        component_scores_raw={
+            k: Decimal(v) for k, v in d["component_scores_raw"].items()
+        },
+        component_scores_observed={
+            k: Decimal(v)
+            for k, v in d["component_scores_observed"].items()
+        },
+        adjustments_applied=adjustments,
+        c3_provenance=records,
+        gate_result=d["gate_result"],
+        resolved_penalty_weights={
+            k: Decimal(v)
+            for k, v in d["resolved_penalty_weights"].items()
+        },
+        resolved_decay_rate=resolved_decay_rate,
+        elapsed_hours=Decimal(d["elapsed_hours"]),
+        decay_factor=Decimal(d["decay_factor"]),
+        resolved_theta_allow=Decimal(d["resolved_theta_allow"]),
+        resolved_theta_hold=Decimal(d["resolved_theta_hold"]),
+        resolved_theta_escalate=Decimal(d["resolved_theta_escalate"]),
+        resolved_kappa=Decimal(d["resolved_kappa"]),
+        c3_score=Decimal(d["c3_score"]),
+        is_valid=d["is_valid"],
+        certificate_schema_version=2,
+        calculation_version=d["calculation_version"],
+        score_precision_policy=d["score_precision_policy"],
+        decay_algorithm_version=d["decay_algorithm_version"],
+        provenance_schema_version=d["provenance_schema_version"],
+    )
+
+
+TrustCertificate.from_dict_v2 = staticmethod(tc_from_dict_v2)
+
+
+# --------------------------------------------------------------------------- #
+# Issuance-time provenance construction                                        #
+# --------------------------------------------------------------------------- #
+#
+# These helpers MAY consult the live rule registries — issuance is the
+# one moment the registered rule is authoritative. After construction
+# the certificate stands alone; nothing in validation or replay above
+# consults a registry.
+
+def _registered_rule_for(rule_id: str, rule_version: str, evaluator: str):
+    """Look up the registered rule at ISSUANCE time (never at replay)."""
+    from tcs.governance import SCENARIO_RULES, TYPED_CONTEXT_RULES
+    registry = (
+        TYPED_CONTEXT_RULES if evaluator == "typed_context"
+        else SCENARIO_RULES
+    )
+    for rule in registry:
+        version = getattr(rule, "version", None)
+        if rule.rule_id == rule_id and version == rule_version:
+            return rule
+    raise CertificateInvariantError(
+        f"rule ({rule_id!r}, {rule_version!r}, {evaluator!r}) is not "
+        f"registered; cannot lift typed provenance at issuance"
+    )
+
+
+def lift_governance_rule_matches(
+    audit_dicts: List[Dict[str, Any]],
+) -> List[GovernanceRuleMatch]:
+    """Lift GCA audit dicts into typed, privacy-reduced records.
+
+    Resolves matched lexical terms to (group_index, term_index)
+    positions against the registered rule, reduces matched_facts to
+    sorted KEYS, and verifies blocking_reason / explanation are the
+    rule's static definition text. Fails closed on anything it cannot
+    resolve — it never records lexical content as a fallback.
+    """
+    lifted: List[GovernanceRuleMatch] = []
+    for d in audit_dicts:
+        if not isinstance(d, dict):
+            raise CertificateInvariantError(
+                "governance_rule_matches audit entry is not a dict")
+        evaluator = (
+            "typed_context"
+            if d.get("rule_evaluator") == "typed_context" else "term_group"
+        )
+        rule_id = str(d.get("rule_id") or "")
+        rule_version = str(d.get("rule_version") or "")
+        rule = _registered_rule_for(rule_id, rule_version, evaluator)
+
+        term_groups_src = (
+            rule.draft_term_groups if evaluator == "typed_context"
+            else rule.required_term_groups
+        )
+        groups: List[MatchedTermGroup] = []
+        for g in d.get("matched_term_groups") or []:
+            gi = int(g["group_index"])
+            term = str(g["matched_term"])
+            if gi < 0 or gi >= len(term_groups_src):
+                raise CertificateInvariantError(
+                    f"rule {rule_id!r}: matched group_index {gi} out of "
+                    f"range")
+            try:
+                ti = list(term_groups_src[gi]).index(term)
+            except ValueError as exc:
+                raise CertificateInvariantError(
+                    f"rule {rule_id!r}: matched term for group {gi} is "
+                    f"not in the registered vocabulary"
+                ) from exc
+            groups.append(MatchedTermGroup(group_index=gi, term_index=ti))
+        groups.sort(key=lambda g: (g.group_index, g.term_index))
+
+        effect = d.get("effect") or {}
+        registered_effect = rule.effect
+        recorded_blocking = str(effect.get("blocking_reason") or "")
+        registered_blocking = str(registered_effect.blocking_reason or "")
+        if recorded_blocking != registered_blocking:
+            raise CertificateInvariantError(
+                f"rule {rule_id!r}: blocking_reason is not the static "
+                f"rule-definition text")
+        recorded_explanation = str(effect.get("explanation") or "")
+        registered_explanation = str(registered_effect.explanation or "")
+        if recorded_explanation != registered_explanation:
+            raise CertificateInvariantError(
+                f"rule {rule_id!r}: explanation is not the static "
+                f"rule-definition text")
+
+        fact_keys = tuple(sorted(set(
+            str(k) for k in (d.get("matched_facts") or {}).keys()
+        )))
+
+        def _param(value: Any, name: str) -> Decimal:
+            return canonical_nonnegative_parameter(
+                value if value is not None else 0,
+                field_name=name,
+            )
+
+        m = GovernanceRuleMatch(
+            schema_version=GOVERNANCE_RULE_MATCH_SCHEMA_VERSION,
+            rule_id=rule_id,
+            rule_version=rule_version,
+            evaluator=evaluator,
+            applies_to_domains=tuple(sorted(set(
+                str(x) for x in (d.get("applies_to_domains") or [])
+            ))),
+            matched_domain=str(d.get("matched_domain") or ""),
+            matched_term_groups=tuple(groups),
+            matched_fact_keys=fact_keys,
+            control_class=str(effect.get("control_class") or ""),
+            safety_category=str(effect.get("safety_category") or ""),
+            c3_violation=bool(effect.get("c3_violation", False)),
+            blocking_reason=recorded_blocking,
+            decision_pressure=str(effect.get("decision_pressure") or ""),
+            requires_human_review=bool(
+                effect.get("requires_human_review", False)),
+            boundedness_penalty=_param(
+                effect.get("boundedness_penalty"), "boundedness_penalty"),
+            attribution_penalty=_param(
+                effect.get("attribution_penalty"), "attribution_penalty"),
+            known_calibration_penalty=_param(
+                effect.get("known_calibration_penalty"),
+                "known_calibration_penalty"),
+            novelty_lift=_param(effect.get("novelty_lift"), "novelty_lift"),
+            explanation=recorded_explanation,
+            active_policy_profile_id=str(
+                d.get("active_policy_profile_id") or ""),
+        )
+        validate_governance_rule_match(m)
+        lifted.append(m)
+    lifted.sort(key=rule_match_sort_key)
+    return lifted
+
+
+def derive_c3_provenance(
+    meta: Dict[str, Any],
+    typed_matches: List[GovernanceRuleMatch],
+) -> List[C3ProvenanceRecord]:
+    """Derive C3 provenance from STRUCTURED context signals only.
+
+    (tis-v2 Commit 5a, owner correction 3.) Two sources, both typed:
+
+        * governance rule matches with ``c3_violation`` → one ``rule``
+          record referencing the certificate's own typed matches;
+        * ``meta["c3_signals"]`` — structured dicts emitted at the
+          producers (injection scan, connectors, credential detection).
+
+    Human-readable strings (``injection_reason``, ``credential_reason``)
+    are explanatory metadata and are NEVER parsed. Structured signal
+    missing → fail closed before sealing; callers with out-of-band
+    producers supply an explicit caller_supplied record with a
+    nonempty producer_id.
+    """
+    records: List[C3ProvenanceRecord] = []
+
+    c3_matches = [m for m in typed_matches if m.c3_violation]
+    if c3_matches:
+        refs = tuple(sorted(
+            {RuleMatchRef(rule_id=m.rule_id, rule_version=m.rule_version)
+             for m in c3_matches},
+            key=lambda x: (x.rule_id, x.rule_version),
+        ))
+        records.append(C3ProvenanceRecord(
+            schema_version=C3_PROVENANCE_SCHEMA_VERSION,
+            source_type="rule",
+            pattern_id="", pattern_set_version="", location_tag="",
+            connector_type="",
+            detail_code="governance_rule_c3_violation",
+            producer_id="",
+            rule_match_refs=refs,
+        ))
+
+    for signal in meta.get("c3_signals") or []:
+        if not isinstance(signal, dict):
+            raise CertificateInvariantError(
+                "c3_signals entries must be structured dicts"
+            )
+        record = C3ProvenanceRecord(
+            schema_version=C3_PROVENANCE_SCHEMA_VERSION,
+            source_type=str(signal.get("source_type") or ""),
+            pattern_id=str(signal.get("pattern_id") or ""),
+            pattern_set_version=str(
+                signal.get("pattern_set_version") or ""),
+            location_tag=str(signal.get("location_tag") or ""),
+            connector_type=str(signal.get("connector_type") or ""),
+            detail_code=str(signal.get("detail_code") or ""),
+            producer_id=str(signal.get("producer_id") or ""),
+        )
+        validate_c3_provenance_record(record)
+        records.append(record)
+
+    if not records:
+        raise CertificateInvariantError(
+            "c3_score == 0.0000 but no structured signal explains it; "
+            "producers must emit c3_signals, or the caller must supply "
+            "an explicit caller_supplied record with a nonempty "
+            "producer_id")
+    # Deduplicate identical signals (e.g. the same detection surfaced
+    # by two aggregation layers), then canonical order.
+    records = list({c3_record_sort_key(r): r for r in records}.values())
+    records.sort(key=c3_record_sort_key)
+    return records
+
+
+# --------------------------------------------------------------------------- #
+# v2 explanation — rendered from the recorded effective scores and             #
+# adjustments_applied (tis-v2 Commit 5a)                                       #
+# --------------------------------------------------------------------------- #
+#
+# The original brief's display defect: an explanation showing a
+# pre-adjustment score beside a post-adjustment verdict. The invariant
+# here: EVERY numerical score displayed beside a gate verdict is the
+# score that produced that verdict.
+
+_ADJUSTMENT_VERBS = {
+    "TCS_SPEC_19_1": ("clamped to", "§19.1"),
+    "TCS_SPEC_19_2": ("set to", "§19.2"),
+}
+
+
+def _fmt_dec(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return format(value, ".4f")
+    return f"{_r(float(value)):.4f}"
+
+
+def _generate_explanation_v2(
+    inp: TISInput,
+    tis_result: TISResult,
+    decision: str,
+    profile: PolicyProfile,
+) -> tuple:
+    effective = tis_result.effective_dimension_scores
+    observed = tis_result.observed_dimension_scores
+    thresholds = {
+        d: canonical_score(v) for d, v in profile.thresholds.items()
+    }
+
+    adj_by_dim: Dict[str, List[AdjustmentApplied]] = {}
+    for a in tis_result.adjustments_applied:
+        adj_by_dim.setdefault(a.dimension, []).append(a)
+
+    gate_lines: List[str] = []
+    for dim in ("B", "A", "C", "K"):
+        eff = effective[dim]
+        status = tis_result.gate_results_by_dim[dim]
+        clause = ""
+        if adj_by_dim.get(dim):
+            steps = []
+            for a in adj_by_dim[dim]:
+                verb, ref = _ADJUSTMENT_VERBS.get(
+                    a.rule_id, ("adjusted to", a.rule_id))
+                steps.append(f"{verb} {_fmt_dec(a.value_after)} by {ref}")
+            clause = (
+                f"{dim} observed {_fmt_dec(observed[dim])}; "
+                + "; ".join(steps) + "; "
+            )
+        else:
+            clause = f"{dim}={_fmt_dec(eff)} "
+        if status == "pass":
+            gate_lines.append(
+                clause + f"PASS — required {dim} >= "
+                f"{_fmt_dec(thresholds[dim])}"
+            )
+        elif status == "fail":
+            gate_lines.append(
+                clause + f"FAIL — required {dim} >= "
+                f"{_fmt_dec(thresholds[dim])}"
+            )
+        else:
+            gate_lines.append(clause + "not_gated")
+
+    gates_str = ", ".join(gate_lines)
+    gate_set_str = "{" + ",".join(sorted(profile.gate_set)) + "}"
+
+    if decision == "Stop" and tis_result.is_valid == 0:
+        decision_fragment = (
+            f"Invalidation event '{tis_result.invalidation_event}' fired "
+            f"at Priority 1. TIS_current forced to 0.0000 and decision set "
+            f"to Stop regardless of dimensional scores."
+        )
+    elif decision == "Stop" and tis_result.C3_score == Decimal("0.0000"):
+        decision_fragment = (
+            "C3 prohibited-pattern sub-factor = 0.0000 -> unconditional "
+            "tis-v2 Stop (fires independently of gate state; kappa does "
+            "not apply)."
+        )
+    elif decision == "Stop":
+        decision_fragment = (
+            f"Gate collapsed (G=0) and S_base={_fmt_dec(tis_result.s_base)} "
+            f"is below remediability floor kappa="
+            f"{_fmt_dec(canonical_score(profile.soft_hold_ceiling))} "
+            f"-> Stop (too degraded to remediate)."
+        )
+    elif decision == "Hold" and tis_result.gate_result == 0:
+        decision_fragment = (
+            f"Gate collapsed (G=0) but S_base={_fmt_dec(tis_result.s_base)} "
+            f"remains at or above remediability floor kappa="
+            f"{_fmt_dec(canonical_score(profile.soft_hold_ceiling))} "
+            f"-> Hold (remediable through review)."
+        )
+    elif decision == "Hold":
+        decision_fragment = (
+            f"TIS_current={_fmt_dec(tis_result.tis_current)} is below "
+            f"theta_hold={_fmt_dec(canonical_score(profile.theta_hold))} "
+            f"-> Hold (standard review queue)."
+        )
+    elif decision == "Escalate":
+        decision_fragment = (
+            f"TIS_current={_fmt_dec(tis_result.tis_current)} is below the "
+            f"escalate threshold theta_escalate="
+            f"{_fmt_dec(canonical_score(profile.theta_escalate))} -> "
+            f"Escalate."
+        )
+    elif decision == "Observe":
+        decision_fragment = (
+            f"TIS_current={_fmt_dec(tis_result.tis_current)} is below "
+            f"theta_allow={_fmt_dec(canonical_score(profile.theta_allow))} "
+            f"but above theta_hold="
+            f"{_fmt_dec(canonical_score(profile.theta_hold))} at r1 -> "
+            f"Observe."
+        )
+    else:  # Allow
+        decision_fragment = (
+            f"All gates in {gate_set_str} passed. "
+            f"TIS_current={_fmt_dec(tis_result.tis_current)} >= theta_allow="
+            f"{_fmt_dec(canonical_score(profile.theta_allow))} -> Allow."
+        )
+
+    reg_fragment = ""
+    if profile.regulatory_mapping:
+        reg_fragment = (
+            " Regulatory scope: "
+            + "; ".join(profile.regulatory_mapping[:3])
+            + ("; ..." if len(profile.regulatory_mapping) > 3 else "")
+            + "."
+        )
+
+    if inp.subject_type == "human_composed":
+        subject_clause = (
+            f"Human-composed draft message '{inp.subject_id}' (no LLM "
+            f"in the loop) evaluated against"
+        )
+    else:
+        subject_clause = (
+            f"Subject '{inp.subject_id}' ({inp.subject_type}) evaluated against"
+        )
+
+    summary = (
+        f"{subject_clause} "
+        f"policy '{profile.profile_id}' at {profile.risk_tier}/{profile.action_class} "
+        f"in domain '{profile.domain}'. "
+        f"Gate set {gate_set_str} evaluated: {gates_str}. "
+        f"{decision_fragment}"
+        f"{reg_fragment}"
+    )
+
+    key_factors: List[str] = []
+    key_concerns: List[str] = []
+    for dim in ("B", "A", "C", "K"):
+        status = tis_result.gate_results_by_dim[dim]
+        eff = effective[dim]
+        label = _DIM_LABELS[dim]
+        if status == "pass":
+            key_factors.append(
+                f"{label} ({dim}) passed at {_fmt_dec(eff)}")
+        elif status == "fail":
+            key_concerns.append(
+                f"{label} ({dim}) failed at {_fmt_dec(eff)} "
+                f"(required >= {_fmt_dec(thresholds[dim])})"
+            )
+    for a in tis_result.adjustments_applied:
+        verb, ref = _ADJUSTMENT_VERBS.get(
+            a.rule_id, ("adjusted to", a.rule_id))
+        key_concerns.append(
+            f"{a.dimension} observed {_fmt_dec(a.value_before)} "
+            f"{verb} {_fmt_dec(a.value_after)} by {ref} ({a.reason})"
+        )
+    if tis_result.C3_score == Decimal("0.0000"):
+        key_concerns.append(
+            "C3 prohibited-pattern sub-factor = 0.0000 "
+            "(unconditional tis-v2 stop condition)"
+        )
+    if tis_result.penalty_aggregate > 0:
+        key_concerns.append(
+            f"Aggregate penalty P = {_fmt_dec(tis_result.penalty_aggregate)}"
+        )
+    if tis_result.is_valid == 0:
+        key_concerns.append(
+            f"Invalidation event: {tis_result.invalidation_event}"
+        )
+    if not key_factors:
+        key_factors.append("No dimension passed its gate")
+    if not key_concerns:
+        key_concerns.append("No blocking concerns")
+
+    return summary, key_factors, key_concerns
+
+
+# --------------------------------------------------------------------------- #
+# v2 certificate construction — DORMANT until Commit 5b                        #
+# --------------------------------------------------------------------------- #
+
+def generate_certificate_v2(
+    tis_input: TISInput,
+    tis_result: TISResult,
+    decision: str,
+    requires_human_review: bool,
+    *,
+    c3_provenance: Optional[List[C3ProvenanceRecord]] = None,
+) -> TrustCertificate:
+    """Generate a tis-v2 Trust Certificate.
+
+    Accepts an EXPLICITLY SUPPLIED v2 TISResult — it never re-invokes
+    the engine. Refuses to seal anything whose calculation_version is
+    not "tis-v2". The non-numeric layers (identity, governance status,
+    explanation, scope attestation, chain metadata) are built by the
+    frozen v1 builder over float shadows; every numeric, gate, decision,
+    provenance, and version field is then assigned EXPLICITLY from the
+    v2 sources below, and the hash is recomputed through the validating
+    v2 payload path — which independently replays the entire
+    computation before any hash exists.
+
+    Raw-evidence fidelity (owner delta 2): every TISInput dimension
+    score must already be a finite Decimal in [0, 1]. A float-originated
+    score is rejected rather than silently recorded as exact source
+    evidence; Commit 5's Decimal-aware transport boundary removes this
+    restriction for production API issuance.
+    """
+    if tis_result.calculation_version != CALCULATION_VERSION_V2:
+        raise CertificateInvariantError(
+            f"generate_certificate_v2 requires calculation_version "
+            f"'tis-v2', got {tis_result.calculation_version!r}; "
+            f"refusing to seal"
+        )
+    effective = tis_result.effective_dimension_scores
+    if not effective:
+        raise CertificateInvariantError(
+            "TISResult missing effective_dimension_scores; refusing "
+            "to seal")
+    if set(effective) != _BACK_DIMS:
+        raise CertificateInvariantError(
+            "effective dimension scores incomplete")
+    observed = tis_result.observed_dimension_scores
+    if set(observed) != _BACK_DIMS:
+        raise CertificateInvariantError(
+            "observed dimension scores incomplete")
+
+    if set(tis_input.dimension_scores) != _BACK_DIMS:
+        raise CertificateInvariantError("raw dimension scores incomplete")
+    for dim, value in tis_input.dimension_scores.items():
+        if not isinstance(value, Decimal):
+            raise CertificateInvariantError(
+                f"component_scores_raw fidelity requires Decimal input "
+                f"scores; dimension {dim!r} was supplied as "
+                f"{type(value).__name__} — a binary float cannot be "
+                f"recorded as exact source evidence"
+            )
+        if not value.is_finite() or value < 0 or value > 1:
+            raise CertificateInvariantError(
+                f"raw dimension score {dim!r} outside [0, 1]: {value}")
+
+    profile = tis_input.policy_profile
+    meta = tis_input.context_metadata
+
+    # ---- Typed provenance (issuance-time registry consultation) --------- #
+    typed_matches = lift_governance_rule_matches(
+        list(meta.get("governance_rule_matches") or [])
+    )
+    c3 = tis_result.C3_score
+    if c3 == Decimal("0.0000"):
+        if c3_provenance is not None:
+            records = list(c3_provenance)
+            for r in records:
+                validate_c3_provenance_record(r)
+            if not records:
+                raise CertificateInvariantError(
+                    "c3_score == 0.0000 requires at least one "
+                    "C3ProvenanceRecord")
+        else:
+            records = derive_c3_provenance(meta, typed_matches)
+    else:
+        if c3_provenance:
+            raise CertificateInvariantError(
+                "c3_provenance must be empty when c3_score != 0.0000")
+        records = []
+    records.sort(key=c3_record_sort_key)
+
+    # ---- Version-neutral derived blocks (shared with the v1 builder;
+    #      generate_certificate_v2 does NOT call generate_certificate) -- #
+    lifecycle_state = _derive_lifecycle_state(decision, tis_result.is_valid)
+    invalidation_status = _derive_invalidation_status(tis_result.is_valid)
+    blocking_reason = _derive_blocking_reason(tis_result, decision, tis_input)
+    failure_mode = _derive_failure_mode(tis_result, decision)
+    escalation_routed_to = _derive_escalation_routing(
+        decision, profile.domain)
+    last_invalidation_event = _derive_last_invalidation_event(
+        tis_result, tis_input.evaluation_time)
+    initial_transition = _initial_transition(
+        lifecycle_state, decision, tis_input.evaluation_time)
+    (source_references, retrieval_ids, checkpoint_id,
+     gca_context_id, chain_of_custody_id, audit_log_id) = \
+        _derive_provenance_refs(meta)
+    recompute_required = (profile.risk_tier == "r3")
+    mcp_server_id, scope_attestation = _build_scope_attestation(
+        meta, tis_result, tis_input.evaluation_time)
+    (connection_type, connection_type_modifier_id,
+     resolved_policy_profile_id, chain_depth, chain_u_scores) = \
+        _derive_ct_audit(meta, profile)
+    composer_metadata = _derive_composer_metadata(meta)
+    identity_binding = _build_identity_binding(meta)
+    governance_status_obj = _build_governance_status_layer(meta)
+    override_record = _build_override_record_layer(meta)
+
+    # v2 explanation — rendered from the recorded EFFECTIVE scores and
+    # adjustments_applied, so no score appears beside a verdict it did
+    # not produce.
+    explanation_summary, key_factors, key_concerns = \
+        _generate_explanation_v2(tis_input, tis_result, decision, profile)
+
+    # ---- Explicit, exhaustive v2 construction mapping ------------------- #
+    tc = TrustCertificate(
+        certificate_id=str(uuid.uuid4()),
+        subject_id=tis_input.subject_id,
+        subject_type=tis_input.subject_type,
+        domain=profile.domain,
+        risk_tier=profile.risk_tier,
+        action_class=profile.action_class,
+        policy_severity="standard",
+        checkpoint_id=checkpoint_id,
+        gca_context_id=gca_context_id,
+        policy_set_id=profile.profile_id,
+        s_base=tis_result.s_base,
+        s_adjusted=tis_result.s_adj,          # name maps across the boundary
+        tis_raw=tis_result.tis_raw,
+        tis_adjusted=tis_result.tis_adj,      # name maps across the boundary
+        tis_current=tis_result.tis_current,
+        component_scores=dict(tis_result.effective_dimension_scores),
+        component_weights={
+            dim: canonical_score(profile.weights[dim]) for dim in _BACK_DIMS
+        },
+        penalty_aggregate=tis_result.penalty_aggregate,
+        penalty_breakdown=dict(tis_result.penalty_breakdown),
+        failing_dimension_subfactors={},      # v1-only alias; not on v2 wire
+        gate_set=sorted(profile.gate_set),
+        thresholds={
+            dim: canonical_score(v) for dim, v in profile.thresholds.items()
+        },
+        gate_results=dict(tis_result.gate_results_by_dim),
+        gate_passed=(tis_result.gate_result == 1),  # derived; not on v2 wire
+        blocking_reason=blocking_reason,
+        failure_mode=failure_mode,
+        decision=decision,
+        requires_human_review=requires_human_review,
+        escalation_routed_to=escalation_routed_to,
+        source_references=source_references,
+        retrieval_ids=retrieval_ids,
+        chain_of_custody_id=chain_of_custody_id,
+        audit_log_id=audit_log_id,
+        integration_boundary_gaps=int(meta.get("n_gaps", 0)),
+        evaluation_timestamp=tis_input.evaluation_time,
+        valid_until=tis_result.valid_until,
+        decay_rate=float(profile.decay_rate),   # derived; not on v2 wire
+        recompute_required=recompute_required,
+        invalidation_triggers=list(profile.invalidation_triggers),
+        last_invalidation_event=last_invalidation_event,
+        invalidation_status=invalidation_status,
+        explanation_summary=explanation_summary,
+        key_factors=key_factors,
+        key_concerns=key_concerns,
+        regulatory_explanation_level="regulatory",
+        regulatory_mapping=list(profile.regulatory_mapping),
+        lifecycle_state=lifecycle_state,
+        state_transition_history=[initial_transition],
+        recomputed_from_certificate_id=None,
+        superseded_by_certificate_id=None,
+        archived=False,
+        mcp_server_id=mcp_server_id,
+        scope_attestation=scope_attestation,
+        connection_type=connection_type,
+        connection_type_modifier_id=connection_type_modifier_id,
+        resolved_policy_profile_id=resolved_policy_profile_id,
+        chain_depth=chain_depth,
+        chain_u_scores=chain_u_scores,
+        composer_metadata=composer_metadata,
+        governance_rule_matches=typed_matches,
+        identity_binding=identity_binding,
+        governance_status=governance_status_obj,
+        audit_integrity=None,                 # attached after hashing below
+        override_record=override_record,
+        component_scores_raw=dict(tis_input.dimension_scores),
+        component_scores_observed=dict(
+            tis_result.observed_dimension_scores),
+        adjustments_applied=list(tis_result.adjustments_applied),
+        c3_provenance=records,
+        gate_result=int(tis_result.gate_result),
+        resolved_penalty_weights={
+            k: canonical_score(v) for k, v in profile.penalty_weights.items()
+        },
+        resolved_decay_rate=canonical_nonnegative_parameter(
+            profile.decay_rate, field_name="resolved_decay_rate"),
+        elapsed_hours=canonical_nonnegative_parameter(
+            tis_input.elapsed_hours, field_name="elapsed_hours"),
+        decay_factor=tis_result.decay_factor,
+        resolved_theta_allow=canonical_score(profile.theta_allow),
+        resolved_theta_hold=canonical_score(profile.theta_hold),
+        resolved_theta_escalate=canonical_score(profile.theta_escalate),
+        resolved_kappa=canonical_score(profile.soft_hold_ceiling),
+        c3_score=c3,
+        is_valid=int(tis_result.is_valid),
+        # Version identifiers — explicit, from named constants; never
+        # dataclass defaults.
+        certificate_schema_version=2,
+        calculation_version=tis_result.calculation_version,
+        score_precision_policy=SCORE_PRECISION_POLICY,
+        decay_algorithm_version=DECAY_ALGORITHM_VERSION,
+        provenance_schema_version=C3_PROVENANCE_SCHEMA_VERSION,
+    )
+
+    # ---- Hash through the VALIDATING v2 payload path -------------------- #
+    tc_hash = compute_tc_hash(tc.to_dict())   # validates + replays first
+    tc.audit_integrity = AuditIntegrity(
+        tc_hash=tc_hash,
+        previous_tc_hash=meta.get("previous_tc_hash"),
         chain_sequence=int(meta.get("chain_sequence", 1)),
         chain_id=str(meta.get("chain_id") or _stub_id("chain")),
         hash_algorithm="sha256",

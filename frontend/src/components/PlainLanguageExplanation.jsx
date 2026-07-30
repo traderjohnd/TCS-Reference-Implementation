@@ -22,6 +22,8 @@
 // has.
 // =============================================================================
 
+import { displayGoverned } from '../lib/governedDecimal';
+
 const DIMENSION_NAME = {
   B: 'Boundedness',
   A: 'Attribution',
@@ -85,14 +87,23 @@ function shortPromptRef(prompt) {
   return trimmed.slice(0, 67).replace(/[\s.,;:]+$/, '') + '…';
 }
 
-// Number formatters used in the optional supplementary parenthetical.
-function fmtScore(n) {
-  if (typeof n !== 'number' || Number.isNaN(n)) return '—';
-  return n.toFixed(4);
+// Governed display formatters for the optional supplementary
+// parenthetical. tis-v2 records carry canonical decimal STRINGS
+// (rendered verbatim — no precision loss); legacy v1 records carry
+// numbers (formatted for display). displayGoverned handles both.
+function fmtScore(v) {
+  return displayGoverned(v, 4);
 }
-function fmtThreshold(n) {
-  if (typeof n !== 'number' || Number.isNaN(n)) return '—';
-  return n.toFixed(2);
+function fmtThreshold(v) {
+  return displayGoverned(v, 2);
+}
+
+// True when a value is a displayable governed score (v2 canonical
+// string or v1 number). Used to decide whether the parenthetical can
+// show numbers at all (slim replay summaries may carry neither).
+function hasScoreValue(v) {
+  return (typeof v === 'number' && !Number.isNaN(v))
+    || (typeof v === 'string' && v !== '');
 }
 
 // Format an override event timestamp for display. Compact form
@@ -107,6 +118,12 @@ function shortOverrideTime(iso) {
 // Find which BACK dimensions failed their gate, if any. Returns
 // {dim, score, threshold} entries (score/threshold may be null when
 // the input shape doesn't carry them, e.g. slim replay summary).
+//
+// IMPORTANT (tis-v2): on a v2 certificate, `component_scores` is the
+// EFFECTIVE (post-adjustment) tier — exactly the values that produced
+// the gate verdicts. The number displayed beside a verdict is always
+// the number that produced it; observed/raw tiers never appear here.
+// Scores may be canonical decimal strings (v2) or numbers (v1).
 function failedGateDetails(tc) {
   const gateResults = tc.gate_results || {};
   const componentScores = tc.component_scores || {};
@@ -119,8 +136,8 @@ function failedGateDetails(tc) {
     if (result === 'fail') {
       out.push({
         dim,
-        score:     typeof componentScores[dim] === 'number' ? componentScores[dim] : null,
-        threshold: typeof thresholds[dim] === 'number'    ? thresholds[dim]    : null,
+        score:     hasScoreValue(componentScores[dim]) ? componentScores[dim] : null,
+        threshold: hasScoreValue(thresholds[dim])      ? thresholds[dim]      : null,
       });
     }
   }
@@ -184,7 +201,11 @@ function ruleExplanation(tc) {
     ? tc.governance_rule_matches
     : Array.isArray(tc.rule_matches) ? tc.rule_matches : [];
   for (const m of matches) {
-    const explanation = m?.effect?.explanation;
+    // tis-v2 typed records are FLAT (explanation at top level);
+    // legacy v1 records nest it under `effect`.
+    const explanation = typeof m?.explanation === 'string'
+      ? m.explanation
+      : m?.effect?.explanation;
     if (typeof explanation === 'string' && explanation.trim()) {
       return explanation.trim();
     }
@@ -215,9 +236,17 @@ export default function PlainLanguageExplanation({
 
   const failed = failedGateDetails(tc);
   const ruleSays = ruleExplanation(tc);
-  const sBase = typeof tc.s_base === 'number' ? tc.s_base : null;
-  const kappa = tc.policy_profile_snapshot?.soft_hold_ceiling;
+  const sBase = hasScoreValue(tc.s_base) ? tc.s_base : null;
+  // κ: tis-v2 certificates carry the resolved snapshot value
+  // (canonical string); evaluation rows carry the profile-snapshot
+  // float. Never mix — use whichever the record actually has.
+  const kappa = hasScoreValue(tc.resolved_kappa)
+    ? tc.resolved_kappa
+    : tc.policy_profile_snapshot?.soft_hold_ceiling;
   const offTopic = offTopicInfo(tc);
+  const adjustments = Array.isArray(tc.adjustments_applied)
+    ? tc.adjustments_applied
+    : [];
 
   // ---- Lead sentence: "what happened" + reference to the prompt --------- //
   // For Allow/Observe we frame positively ("This {topic} was delivered.").
@@ -411,7 +440,7 @@ export default function PlainLanguageExplanation({
           {' '}({numbered.map(f =>
             `${f.dim} = ${fmtScore(f.score)}, required ≥ ${fmtThreshold(f.threshold)}`
           ).join('; ')}
-          {decision === 'Hold' && sBase != null && typeof kappa === 'number'
+          {decision === 'Hold' && sBase != null && hasScoreValue(kappa)
             ? `; overall S_base = ${fmtScore(sBase)}, above floor κ = ${fmtThreshold(kappa)}`
             : ''}
           )
@@ -468,6 +497,29 @@ export default function PlainLanguageExplanation({
         <p className={`${textSize} text-gray-400 leading-relaxed mt-2 italic`}>
           {nextJsx}
         </p>
+      )}
+
+      {adjustments.length > 0 && (
+        <div className="mt-2 border-t border-gray-800/70 pt-1.5">
+          <div className={`${headerSize} uppercase tracking-wide text-gray-500 mb-0.5`}>
+            Identity adjustments (in recorded order)
+          </div>
+          <ol className={`${compact ? 'text-[10px]' : 'text-[11px]'} text-gray-400 list-decimal list-inside space-y-0.5`}>
+            {adjustments.map((a, i) => (
+              <li key={`${a.rule_id}-${i}`}>
+                <span className="font-mono">{a.dimension}</span>{' '}
+                <span className="font-mono">{displayGoverned(a.value_before)}</span>
+                {' '}{a.rule_id === 'TCS_SPEC_19_1' ? 'clamped to' : a.rule_id === 'TCS_SPEC_19_2' ? 'set to' : 'changed to'}{' '}
+                <span className="font-mono">{displayGoverned(a.value_after)}</span>
+                <span className="text-gray-600"> — {a.rule_id}</span>
+              </li>
+            ))}
+          </ol>
+          <p className={`${headerSize} text-gray-600 italic mt-1`}>
+            Gate verdicts and S_base use the post-adjustment (effective)
+            scores shown above; observed values are pre-adjustment.
+          </p>
+        </div>
       )}
 
       {overrideList.length > 0 && (

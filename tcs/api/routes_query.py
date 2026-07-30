@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import os
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request
+
+from tcs.trust_certificate import gate_result_of
 from pydantic import BaseModel
 
 
@@ -83,7 +86,7 @@ class QueryResponse(BaseModel):
     tis_current: Optional[float]
     tis_raw: Optional[float]
     s_base: Optional[float] = None
-    gate_passed: Optional[bool] = None
+    gate_result: Optional[int] = None   # 0|1 — single gate vocabulary (5a)
     blocking_reason: Optional[str] = None
     requires_human_review: bool = False
     retrieval_chunks: List[Dict[str, Any]] = []
@@ -505,13 +508,19 @@ def _persist_query_artifact_and_evaluation(
         selected_standards=selected_standards,
         enabled_controls=[],
         rule_matches=rule_matches,
+        # DISPLAY tier: evaluation rows are dashboard/audit-display
+        # values (declared float on the model). The authoritative
+        # canonical Decimals live on the v2 TC (hash-protected decimal
+        # strings) and in governance_input_snapshot (lossless Decimal
+        # round-trip). Same contract as the documented lossy REAL
+        # dashboard columns in the PG store (5a).
         component_scores={
-            k: round(v, 4) for k, v in tis_input.dimension_scores.items()
+            k: float(v) for k, v in tis_input.dimension_scores.items()
         },
         gate_results=dict(tis_result.gate_results_by_dim),
-        s_base=round(tis_result.s_base, 4),
-        s_adjusted=round(tis_result.s_adj, 4),
-        tis_current=round(tis_result.tis_current, 4),
+        s_base=float(tis_result.s_base),
+        s_adjusted=float(tis_result.s_adj),
+        tis_current=float(tis_result.tis_current),
         decision=decision,
         trust_certificate_id=issued_tc.certificate_id,
         evaluator_identity={
@@ -584,10 +593,10 @@ def _route_off_topic_via_baseline(
         GovernanceEvaluation,
         ResponseArtifact,
     )
-    from tcs.decision_engine import map_decision
+    from tcs.decision_engine import map_decision_versioned
     from tcs.policy_profiles import load_profile
-    from tcs.tis_engine import TISInput, compute_tis
-    from tcs.trust_certificate import generate_certificate
+    from tcs.tis_engine import TISInput, compute_tis_v2
+    from tcs.trust_certificate import generate_certificate_v2
 
     # Resolve the active pack profile_id for audit reference, then
     # use baseline-no-pack for actual scoring.
@@ -622,30 +631,32 @@ def _route_off_topic_via_baseline(
     # Build a TISInput with baseline-no-pack and neutral signals.
     # The LLM was called; we record an honest pass-through scoring.
     if llm_error is not None:
-        dim_scores = {"B": 1.0, "A": 0.50, "C": 1.0, "K": 0.10}
+        dim_scores = {"B": Decimal("1.0000"), "A": Decimal("0.50"),
+                      "C": Decimal("1.0000"), "K": Decimal("0.10")}
     else:
         # Allow-by-default for baseline; baseline's K isn't gated and
         # B/A/C/K = 0.80 all clear baseline's 0.70-0.75 thresholds.
-        dim_scores = {"B": 1.0, "A": 0.80, "C": 1.0, "K": 0.80}
+        dim_scores = {"B": Decimal("1.0000"), "A": Decimal("0.80"),
+                      "C": Decimal("1.0000"), "K": Decimal("0.80")}
 
     inp = TISInput(
         subject_id=str(_uuid.uuid4()),
         subject_type="off_topic_routed_query",
         policy_profile=profile,
         dimension_scores=dim_scores,
-        sub_factor_scores={"C": {"C3": 1.0}},
+        sub_factor_scores={"C": {"C3": Decimal("1.0000")}},
         context_metadata={
             "routed_via_baseline_off_topic": True,
             "original_active_pack_profile_id": original_profile_id,
             "off_topic_max_similarity": round(max_similarity, 4),
             "off_topic_threshold": float(threshold),
             "n_gaps": 0,
-            "context_age_hours": 0.1,
-            "novelty_score": 0.0,
+            "context_age_hours": "0.1",
+            "novelty_score": "0.0",
             "days_since_review": 1,
             "is_policy_sensitive": False,
         },
-        elapsed_hours=0.0,
+        elapsed_hours=Decimal("0.0000"),
         is_valid=1,
         invalidation_event=None,
         evaluation_time=datetime.now(timezone.utc).replace(microsecond=0),
@@ -655,9 +666,12 @@ def _route_off_topic_via_baseline(
     # composed pack. The active pack is recorded in
     # ``original_active_pack_profile_id`` for audit.
 
-    result = compute_tis(inp)
-    decision, requires = map_decision(inp, result)
-    tc = generate_certificate(inp, result, decision, requires)
+    # tis-v2 activation (Commit 5b): Decimal-native producer values flow
+    # straight into the canonical v2 pipeline and become
+    # component_scores_raw.
+    result = compute_tis_v2(inp)
+    decision, requires = map_decision_versioned(inp, result)
+    tc = generate_certificate_v2(inp, result, decision, requires)
     # Tag blocking_reason informationally so the frontend can detect
     # the rerouting case. For Allow we still set this marker (it doesn't
     # block, just labels the path); for Hold/Stop we prefix the engine's
@@ -725,13 +739,16 @@ def _route_off_topic_via_baseline(
             selected_standards=[],  # baseline-no-pack has no standards
             enabled_controls=[],
             rule_matches=None,
+            # DISPLAY tier (declared float on the model) — the
+            # authoritative canonical Decimals live on the v2 TC and in
+            # governance_input_snapshot (lossless Decimal round-trip).
             component_scores={
-                k: round(v, 4) for k, v in inp.dimension_scores.items()
+                k: float(v) for k, v in inp.dimension_scores.items()
             },
             gate_results=dict(result.gate_results_by_dim),
-            s_base=round(result.s_base, 4),
-            s_adjusted=round(result.s_adj, 4),
-            tis_current=round(result.tis_current, 4),
+            s_base=float(result.s_base),
+            s_adjusted=float(result.s_adj),
+            tis_current=float(result.tis_current),
             decision=decision,
             trust_certificate_id=issued_tc.certificate_id,
             evaluator_identity={
@@ -759,7 +776,7 @@ def _route_off_topic_via_baseline(
         tis_current=issued_tc.tis_current,
         tis_raw=issued_tc.tis_raw,
         s_base=issued_tc.s_base,
-        gate_passed=issued_tc.gate_passed,
+        gate_result=gate_result_of(issued_tc),
         blocking_reason=tc.blocking_reason,
         requires_human_review=requires,
         retrieval_chunks=[],  # baseline routing: no chunks delivered to UI
@@ -801,10 +818,10 @@ def _run_query_via_trace(
     (API, MCP, agent chain) plugs into the same orchestrator with
     no change to the engine, decision logic, or TC schema.
     """
-    from tcs.decision_engine import map_decision
+    from tcs.decision_engine import map_decision_versioned
     from tcs.governed_context import assemble_context_from_trace
-    from tcs.tis_engine import compute_tis
-    from tcs.trust_certificate import generate_certificate
+    from tcs.tis_engine import compute_tis_v2
+    from tcs.trust_certificate import generate_certificate_v2
     from tcs.workflow import (
         GovernedNode,
         NodeType,
@@ -904,7 +921,7 @@ def _run_query_via_trace(
             certificate_id=None,
             tis_current=None,
             tis_raw=None,
-            gate_passed=None,
+            gate_result=None,
             blocking_reason=f"LLM provider error: {llm_event.error}",
             requires_human_review=False,
             retrieval_chunks=[],
@@ -920,9 +937,14 @@ def _run_query_via_trace(
     # generate_certificate() carries it onto the issued TC.
     if composer_metadata:
         tis_input.context_metadata["composer_metadata"] = dict(composer_metadata)
-    tis_result = compute_tis(tis_input)
-    decision, requires_review = map_decision(tis_input, tis_result)
-    tc = generate_certificate(tis_input, tis_result, decision, requires_review)
+    # tis-v2 activation (Commit 5b): Decimal-native producer values flow
+    # straight into the canonical v2 pipeline and become
+    # component_scores_raw.
+    tis_result = compute_tis_v2(tis_input)
+    decision, requires_review = map_decision_versioned(tis_input, tis_result)
+    tc = generate_certificate_v2(
+        tis_input, tis_result, decision, requires_review
+    )
     issued_tc = store.issue(tc)
     latency["governance_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     latency["total_ms"] = round((time.perf_counter() - t_total) * 1000, 1)
@@ -993,7 +1015,7 @@ def _run_query_via_trace(
         tis_current=issued_tc.tis_current,
         tis_raw=issued_tc.tis_raw,
         s_base=issued_tc.s_base,
-        gate_passed=issued_tc.gate_passed,
+        gate_result=gate_result_of(issued_tc),
         blocking_reason=issued_tc.blocking_reason,
         requires_human_review=requires_review,
         retrieval_chunks=rag_chunks_payload,
@@ -1084,7 +1106,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
             certificate_id=None,
             tis_current=None,
             tis_raw=None,
-            gate_passed=None,
+            gate_result=None,
             blocking_reason=str(e),
             requires_human_review=False,
             retrieval_chunks=[],
@@ -1115,7 +1137,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
                 certificate_id=None,
                 tis_current=None,
                 tis_raw=None,
-                gate_passed=None,
+                gate_result=None,
                 blocking_reason=f"Workflow trace path error: {e}",
                 requires_human_review=False,
                 retrieval_chunks=[],
@@ -1159,7 +1181,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
             certificate_id=None,
             tis_current=None,
             tis_raw=None,
-            gate_passed=None,
+            gate_result=None,
             blocking_reason=f"LLM provider error: {error_msg}",
             requires_human_review=False,
             retrieval_chunks=[],
@@ -1176,7 +1198,7 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
         certificate_id=result.certificate_id,
         tis_current=result.tis_current,
         tis_raw=result.tis_raw,
-        gate_passed=result.gate_passed,
+        gate_result=result.gate_result,
         blocking_reason=result.blocking_reason,
         requires_human_review=result.requires_human_review,
         retrieval_chunks=result.retrieval_chunks[:5],

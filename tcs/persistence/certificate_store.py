@@ -45,7 +45,18 @@ from typing import Any, Dict, Iterator, List, Optional, Union
 from tcs.trust_certificate import (
     AuditIntegrity,
     TrustCertificate,
+    classify_certificate_schema_version,
+    compute_legacy_raw_tc_hash,
+    compute_raw_stored_tc_hash,
     compute_tc_hash,
+    gate_result_from_serialized,
+    wire_number,
+    tc_from_dict_v2,
+    validate_v2_certificate_for_sealing,
+)
+from tcs.canonical import (
+    CertificateInvariantError,
+    UnsupportedCertificateSchemaVersion,
 )
 from tcs.persistence.db import (
     AppendOnlyViolation,
@@ -65,6 +76,18 @@ class ChainSequenceError(RuntimeError):
 
 class CertificateNotFoundError(LookupError):
     """Raised when ``get()`` cannot find a certificate_id in the store."""
+
+
+class IssuanceVersionRegressionError(RuntimeError):
+    """The store-wide monotonic issuance floor (tis-v2 Commit 5a,
+    owner correction 6).
+
+    Once ANY schema-v2 certificate has been issued into a store, new
+    schema-v1 issuance is rejected — reverting the activation call
+    sites must fail closed rather than silently resume legacy
+    calculation semantics. Reading, replaying, and verifying historical
+    v1 certificates remains permitted; only NEW v1 issuance is barred.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -226,7 +249,29 @@ class CertificateStore:
 
             # Recompute the hash over the full to_dict() — this is stable
             # because compute_tc_hash drops the "audit_integrity" key.
-            final_hash = compute_tc_hash(issued_tc.to_dict())
+            #
+            # SEALING BOUNDARY (tis-v2 Commit 4): for schema version 2,
+            # the COMPLETE validation-and-replay contract runs here,
+            # explicitly, immediately before the hash is finalized and
+            # the certificate is persisted. compute_tc_hash's v2 payload
+            # path runs the same contract, so the guarantee holds even
+            # for callers that bypass the store — but the store states
+            # it at the persistence boundary rather than relying on the
+            # hash path alone.
+            serialized = issued_tc.to_dict()
+            schema_version = classify_certificate_schema_version(serialized)
+            if schema_version == 2:
+                validate_v2_certificate_for_sealing(serialized)
+            elif self._store_has_v2_certificate(conn):
+                # Monotonic issuance floor (owner correction 6): once a
+                # v2 certificate exists here, new v1 issuance fails
+                # closed. Historical v1 reads/replay are unaffected.
+                raise IssuanceVersionRegressionError(
+                    "this store has issued schema-v2 certificates; new "
+                    "schema-v1 issuance is rejected (historical v1 "
+                    "records remain readable and verifiable)"
+                )
+            final_hash = compute_tc_hash(serialized)
             issued_tc.audit_integrity = AuditIntegrity(
                 tc_hash=final_hash,
                 previous_tc_hash=new_previous_hash,
@@ -557,7 +602,11 @@ class CertificateStore:
             cs = tc.component_scores
             if cs:
                 for dim in ("B", "A", "C", "K"):
-                    sums[dim] += cs.get(dim, 0.0)
+                    # Display-tier mean: v2 rows rehydrate component
+                    # scores as canonical Decimals; v1 rows as floats.
+                    # This dashboard metric converts at the read
+                    # boundary — the authoritative values stay on the TC.
+                    sums[dim] += float(cs.get(dim, 0.0))
                 n += 1
         if n == 0:
             return sums
@@ -587,46 +636,102 @@ class CertificateStore:
         """
         Walk the chain and verify:
 
-            a. each stored tc_hash equals compute_tc_hash(stored content)
+            a. each stored tc_hash equals the hash of the RAW persisted
+               content (verified from the original stored dictionary,
+               BEFORE rehydration — a field injected into stored
+               content_json changes the payload and fails here, where
+               rehydrate-then-recompute would silently drop it)
             b. each previous_tc_hash equals the prior row's tc_hash
             c. chain_sequence is 1, 2, 3, ... with no gaps
 
         Returns True only if all three conditions hold for every TC in
         the chain. Returns True on an empty chain (nothing to verify).
+
+        Stored content carrying ``certificate_schema_version`` does not
+        match the historical v1 wire shape and fails verification (v2
+        raw verification lands with the v2 wire format in Commit 4+).
         """
-        tcs = self.list_chain(chain_id)
-        if not tcs:
+        raws = self._list_chain_raw(chain_id)
+        if not raws:
             return True
 
         prev_hash: Optional[str] = None
         expected_seq = 1
-        for tc in tcs:
-            ai = tc.audit_integrity
-            if ai is None:
+        for raw in raws:
+            ai = raw.get("audit_integrity")
+            if not ai:
                 return False
 
-            # (a) content hash stable under recompute
-            if compute_tc_hash(tc.to_dict()) != ai.tc_hash:
+            # (a) content hash verified from the raw persisted dict.
+            # Version-dispatched (tis-v2 Commit 4): absence of
+            # certificate_schema_version -> frozen legacy raw path;
+            # explicit 2 -> the validating v2 payload (exact-schema
+            # check detects injected fields); anything else does not
+            # match either wire contract and fails verification.
+            try:
+                recomputed = compute_raw_stored_tc_hash(raw)
+            except (CertificateInvariantError,
+                    UnsupportedCertificateSchemaVersion):
+                return False
+            if recomputed != ai.get("tc_hash"):
                 return False
 
             # (b) previous_tc_hash linkage
             if expected_seq == 1:
-                if ai.previous_tc_hash is not None:
+                if ai.get("previous_tc_hash") is not None:
                     return False
             else:
-                if ai.previous_tc_hash != prev_hash:
+                if ai.get("previous_tc_hash") != prev_hash:
                     return False
 
             # (c) monotonic sequence
-            if ai.chain_sequence != expected_seq:
+            if ai.get("chain_sequence") != expected_seq:
                 return False
 
-            prev_hash = ai.tc_hash
+            prev_hash = ai.get("tc_hash")
             expected_seq += 1
 
         return True
 
+    def _list_chain_raw(self, chain_id: str) -> List[Dict[str, Any]]:
+        """
+        Return every stored content dict in a chain, ordered by
+        chain_sequence, parsed from content_json WITHOUT rehydration.
+
+        Internal-only: exists to support integrity verification against
+        the original persisted representation. Raw certificate contents
+        must never be exposed through an API response.
+        """
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT content_json FROM trust_certificates "
+                "WHERE chain_id = ? ORDER BY chain_sequence ASC",
+                (chain_id,),
+            ).fetchall()
+        return [json.loads(r["content_json"]) for r in rows]
+
     # ---- Internal helpers ----------------------------------------------- #
+
+    def _store_has_v2_certificate(self, conn: sqlite3.Connection) -> bool:
+        """True once any schema-v2 certificate is persisted here.
+
+        The substring probe is sound because the key
+        ``certificate_schema_version`` can never appear in a v1 wire
+        payload (absence IS the v1 wire contract — proven by the frozen
+        fixtures) and no serializer emits it inside string content.
+        The flag is cached once True: the floor is monotonic.
+        """
+        if getattr(self, "_v2_floor_reached", False):
+            return True
+        row = conn.execute(
+            "SELECT 1 FROM trust_certificates "
+            "WHERE content_json LIKE ? LIMIT 1",
+            ('%"certificate_schema_version"%',),
+        ).fetchone()
+        if row is not None:
+            self._v2_floor_reached = True
+            return True
+        return False
 
     def _last_in_chain_locked(
         self,
@@ -840,8 +945,29 @@ def _tc_from_json(content_json: str) -> TrustCertificate:
     This round-trip fidelity is sufficient for:
         - verify_chain() (needs audit_integrity + content hash)
         - get() returning a TC that to_dict() reproduces identically
+
+    Schema-version dispatch (tis-v2 Commit 3/4): absence of
+    ``certificate_schema_version`` means v1 — never a model default.
+    Explicit integer 1 is accepted as internal dispatch metadata and
+    deliberately stripped before the legacy constructor. Version 2
+    routes to the strict v2 deserializer (which validates the complete
+    sealing contract before parsing). Anything else is unsupported.
     """
     d = json.loads(content_json)
+
+    if "certificate_schema_version" in d:
+        version = d["certificate_schema_version"]
+        if isinstance(version, bool) or not isinstance(version, int) \
+                or version not in (1, 2):
+            raise UnsupportedCertificateSchemaVersion(
+                f"certificate_schema_version must be int 1 or 2, "
+                f"got {version!r}"
+            )
+        if version == 2:
+            return tc_from_dict_v2(d)
+        # version == 1: dispatch metadata only — continue on the
+        # legacy path with the key stripped.
+        d.pop("certificate_schema_version")
 
     return TrustCertificate(
         # Identity
@@ -1258,7 +1384,7 @@ def _gate_failure_details(
 
     for r in rows:
         d = json.loads(r["content_json"])
-        if d.get("gate_passed", True):
+        if gate_result_from_serialized(d) == 1:
             continue
         total += 1
 
@@ -1387,19 +1513,22 @@ def _telemetry_stream(
             "tis_raw": round(float(d.get("tis_raw", 0.0)), 4),
             "tis_adjusted": round(float(d.get("tis_adjusted", 0.0)), 4),
             "tis_current": float(r["tis_current"]),
-            "B": round(cs.get("B", 0.0), 4),
-            "A": round(cs.get("A", 0.0), 4),
-            "C": round(cs.get("C", 0.0), 4),
+            "B": round(wire_number(cs.get("B")), 4),
+            "A": round(wire_number(cs.get("A")), 4),
+            "C": round(wire_number(cs.get("C")), 4),
             # Read-side legacy fallback: archived TCs written before the
             # BACU -> BACK migration may have "U" instead of "K". This is
             # NOT a translation layer — new writes always use K end-to-end.
-            "K": round(cs.get("K", cs.get("U", 0.0)), 4),
-            "gate_passed": d.get("gate_passed", True),
-            "P_cb": round(pb.get("P_cb", 0.0), 4),
-            "P_d": round(pb.get("P_d", 0.0), 4),
-            "P_n": round(pb.get("P_n", 0.0), 4),
-            "P_h": round(pb.get("P_h", 0.0), 4),
-            "P_ps": round(pb.get("P_ps", 0.0), 4),
+            "K": round(wire_number(cs.get("K", cs.get("U"))), 4),
+            # Single gate vocabulary at the read boundary (5a): v1 rows
+            # derive once from gate_passed; v2 rows carry gate_result.
+            "gate_result": gate_result_from_serialized(d),
+            # v2 wire uses canonical lowercase penalty keys.
+            "P_cb": round(wire_number(pb.get("P_cb", pb.get("cb"))), 4),
+            "P_d": round(wire_number(pb.get("P_d", pb.get("d"))), 4),
+            "P_n": round(wire_number(pb.get("P_n", pb.get("n"))), 4),
+            "P_h": round(wire_number(pb.get("P_h", pb.get("h"))), 4),
+            "P_ps": round(wire_number(pb.get("P_ps", pb.get("ps"))), 4),
             "penalty_aggregate": round(float(d.get("penalty_aggregate", 0.0)), 4),
             "governance_ms": d.get("governance_ms"),
             "profile_id": d.get("policy_set_id", ""),

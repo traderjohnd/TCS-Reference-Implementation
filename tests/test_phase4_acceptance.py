@@ -135,7 +135,7 @@ class TestCriterion4_WorkflowTraceFiveConnectors:
             def retrieve(self, q, k=5):
                 return [{
                     "chunk_id": "c1", "source_doc": "guideline.md", "version": "2026-01",
-                    "content": "Sample.", "similarity_score": 0.92, "tags": [],
+                    "content": "Sample.", "similarity_score": "0.92", "tags": [],
                 }]
 
         class _StubProvider:
@@ -249,8 +249,9 @@ class TestCriterion7_TCSelfDocuments:
         assert tc["policy_set_id"] == deployed_pack["pack_id"]
         # Score
         assert "s_base" in tc and "tis_current" in tc
-        # Gates
-        assert "gate_passed" in tc and "gate_results" in tc
+        # Gates — tis-v2 wire uses the single gate_result vocabulary
+        # (0|1 int) plus per-dimension gate_results.
+        assert "gate_result" in tc and "gate_results" in tc
         # Decision
         assert tc["decision"] in ("Allow", "Observe", "Hold", "Escalate", "Stop")
         # Standards composition (Slice 4 self-documentation)

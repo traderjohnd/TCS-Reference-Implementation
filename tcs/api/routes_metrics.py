@@ -237,7 +237,7 @@ def get_telemetry(
         k_scores = [r["K"] for r in records]
         tis_scores = [r["tis_current"] for r in records]
         penalties = [r["penalty_aggregate"] for r in records]
-        gate_fails = sum(1 for r in records if not r["gate_passed"])
+        gate_fails = sum(1 for r in records if r["gate_result"] == 0)
 
         k_mean = round(sum(k_scores) / len(k_scores), 4)
         k_min = round(min(k_scores), 4)

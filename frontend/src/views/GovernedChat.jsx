@@ -3,6 +3,10 @@ import { Link } from 'react-router-dom';
 import { apiPost, useApi } from '../hooks/useApi';
 import { useConnections } from '../hooks/useConnections';
 import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
+import {
+  displayGoverned,
+  parseProtectedMetadataError,
+} from '../lib/governedDecimal';
 
 // ─── Sample queries by active pack domain ──────────────────────────────────
 // Each list is curated to demonstrate the three governance outcomes (Allow
@@ -136,7 +140,47 @@ function _parseInvalidationEvent(blocking_reason) {
   return event || null;
 }
 
+// Protected-metadata violation notice (HTTP 422 with the structured
+// `protected_metadata_keys` envelope under `detail`). Shows the
+// explanatory message and the rejected key NAMES — never values. An
+// ordinary validation 422 does NOT render through this component.
+export function ProtectedMetadataNotice({ violation }) {
+  if (!violation) return null;
+  return (
+    <div
+      role="alert"
+      className="rounded-md border px-3 py-2 text-xs bg-amber-900/20 border-amber-800 text-amber-200"
+    >
+      <div className="font-semibold mb-1">
+        Request rejected — protected governance metadata
+      </div>
+      <div className="mb-1.5">{violation.message}</div>
+      {violation.rejectedKeys.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {violation.rejectedKeys.map((k) => (
+            <span
+              key={k}
+              className="font-mono bg-amber-900/40 border border-amber-800 rounded px-1.5 py-0.5"
+            >
+              {k}
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="text-[10px] text-amber-300/70 mt-1.5">
+        Remove these keys from extra metadata; risk tier, action class,
+        connection type, and identity attestations travel only as typed
+        request fields.
+      </div>
+    </div>
+  );
+}
+
 function DecisionReason({ r }) {
+  // Protected-metadata violation gets its dedicated notice.
+  if (r?.protected_metadata) {
+    return <ProtectedMetadataNotice violation={r.protected_metadata} />;
+  }
   if (r?.decision === 'Allow' || r?.decision === 'Observe') return null;
 
   // Invalidation special case: a Stop driven by an invalidation event
@@ -282,20 +326,20 @@ function CertificateSummary({ r }) {
         {r.s_base != null && (
           <div>
             <span className="text-gray-500">S_base:</span>{' '}
-            <span className="font-mono text-gray-300">{r.s_base.toFixed(4)}</span>
+            <span className="font-mono text-gray-300">{displayGoverned(r.s_base)}</span>
           </div>
         )}
         {r.tis_current != null && (
           <div>
             <span className="text-gray-500">TIS_current:</span>{' '}
-            <span className="font-mono text-gray-300">{r.tis_current.toFixed(4)}</span>
+            <span className="font-mono text-gray-300">{displayGoverned(r.tis_current)}</span>
           </div>
         )}
-        {r.gate_passed != null && (
+        {(r.gate_result === 0 || r.gate_result === 1) && (
           <div>
             <span className="text-gray-500">Gate:</span>{' '}
-            <span className={`font-mono ${r.gate_passed ? 'text-green-400' : 'text-red-400 font-semibold'}`}>
-              {r.gate_passed ? 'PASS' : 'FAIL'}
+            <span className={`font-mono ${r.gate_result === 1 ? 'text-green-400' : 'text-red-400 font-semibold'}`}>
+              {r.gate_result === 1 ? 'PASS' : 'FAIL'}
             </span>
           </div>
         )}
@@ -344,11 +388,11 @@ function GovernancePanel({ r, defaultOpen }) {
           <span className="text-gray-600">{open ? '▾' : '▸'}</span>
           <span>{open ? 'Hide governance' : 'Show governance'}</span>
           {!open && r?.s_base != null && (
-            <span className="font-mono text-gray-500">· S_base {r.s_base.toFixed(3)}</span>
+            <span className="font-mono text-gray-500">· S_base {displayGoverned(r.s_base, 3)}</span>
           )}
-          {!open && r?.gate_passed != null && (
-            <span className={r.gate_passed ? 'text-green-500' : 'text-red-400'}>
-              · gate {r.gate_passed ? 'pass' : 'fail'}
+          {!open && (r?.gate_result === 0 || r?.gate_result === 1) && (
+            <span className={r.gate_result === 1 ? 'text-green-500' : 'text-red-400'}>
+              · gate {r.gate_result === 1 ? 'pass' : 'fail'}
             </span>
           )}
         </span>
@@ -400,7 +444,14 @@ function ChatMessage({ message }) {
           <GovernanceBadge decision={decision} />
         </div>
 
+        {/* Protected-metadata violation — dedicated notice with the
+            explanatory message and rejected key names (never values). */}
+        {r?.protected_metadata && (
+          <ProtectedMetadataNotice violation={r.protected_metadata} />
+        )}
+
         {/* Response bubble — clean for Allow, blocking notice for non-Allow */}
+        {!r?.protected_metadata && (
         <div className={`rounded-2xl rounded-bl-md px-4 py-3 ${
           isBlocked ? 'bg-red-900/15 border border-red-900/60' : 'bg-gray-800 border border-gray-700'
         }`}>
@@ -416,15 +467,19 @@ function ChatMessage({ message }) {
                 {decision === 'Hold' && 'A reviewer must approve this response before delivery.'}
                 {decision === 'Stop' && 'This response did not meet the governance requirements.'}
                 {decision === 'Escalate' && 'The composite score is below the escalation threshold.'}
+                {decision === 'Error' && (r?.blocking_reason || 'The request failed.')}
               </p>
             </div>
           ) : (
             <p className="text-sm text-gray-100 whitespace-pre-wrap">{r?.response || 'No response'}</p>
           )}
         </div>
+        )}
 
         {/* Governance evidence — collapsed for Allow, surfaced for non-Allow */}
-        <GovernancePanel r={r} defaultOpen={expandByDefault} />
+        {!r?.protected_metadata && (
+          <GovernancePanel r={r} defaultOpen={expandByDefault} />
+        )}
       </div>
     </div>
   );
@@ -529,10 +584,18 @@ export default function GovernedChat() {
       });
       setMessages((prev) => [...prev, { role: 'assistant', content: result.response, data: result }]);
     } catch (err) {
+      // Discriminate the protected-metadata violation (structured 422
+      // envelope under `detail`) from ordinary errors. The chat stays
+      // usable after either — the input re-enables below.
+      const violation = parseProtectedMetadataError(err?.detail);
       setMessages((prev) => [...prev, {
         role: 'assistant',
         content: null,
-        data: { blocked: true, decision: 'Error', blocking_reason: err.message, response: null },
+        data: violation
+          ? { blocked: true, decision: 'Error', response: null,
+              protected_metadata: violation }
+          : { blocked: true, decision: 'Error',
+              blocking_reason: err.message, response: null },
       }]);
     }
     setLoading(false);

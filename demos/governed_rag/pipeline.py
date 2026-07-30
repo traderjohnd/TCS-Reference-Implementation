@@ -39,7 +39,7 @@ class GovernedQueryResult:
     certificate_id: Optional[str]
     tis_current: Optional[float]
     tis_raw: Optional[float]
-    gate_passed: Optional[bool]
+    gate_result: Optional[int]   # 0|1 — single gate vocabulary (5a)
     blocked: bool
     blocking_reason: Optional[str]
     requires_human_review: bool = False
@@ -277,7 +277,7 @@ class GovernedRAGPipeline:
             "source_doc": "llm-generation",
             "version": "live",
             "content": raw_response,
-            "similarity_score": 1.0,
+            "similarity_score": "1.0",
         }]
         t0 = time.perf_counter()
         gov_result = self.client.govern(
@@ -300,7 +300,7 @@ class GovernedRAGPipeline:
             certificate_id=gov_result.certificate_id,
             tis_current=gov_result.tis_current,
             tis_raw=gov_result.tis_raw,
-            gate_passed=gov_result.gate_passed,
+            gate_result=gov_result.gate_result,
             blocked=gov_result.blocked,
             blocking_reason=gov_result.blocking_reason,
             requires_human_review=gov_result.requires_human_review,

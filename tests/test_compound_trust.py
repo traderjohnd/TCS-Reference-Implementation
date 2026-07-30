@@ -130,7 +130,7 @@ def _credential_chunk(chunk_id: str) -> Dict[str, Any]:
         "source_doc": "leaked_config.md",
         "version": "2026-01",
         "content": "Use this: API_KEY=sk-proj-abc123def456ghi789 for the call.",
-        "similarity_score": 0.95,
+        "similarity_score": "0.95",
         "tags": [],
     }
 
@@ -509,7 +509,7 @@ class TestScenarioF_AgentChainCompoundingK:
         # CT-8 wins as dominant CT (chain dominates RAG).
         assert tis_input.context_metadata["connection_type"] == "CT-8"
         # K_chain = 0.95 * 0.90 * 0.85 = 0.72675 -> 0.7268
-        assert tis_input.dimension_scores["K"] == pytest.approx(0.7268, abs=1e-3)
+        assert float(tis_input.dimension_scores["K"]) == pytest.approx(0.7268, abs=1e-3)
         assert tis_input.context_metadata.get("chain_depth") == 3
         # K gate fails at the r3 threshold of 0.80.
         assert tis_result.gate_result == 0
@@ -533,7 +533,7 @@ class TestScenarioF_AgentChainCompoundingK:
         ]
         trace, tis_input, tis_result, decision, _ = _run(steps)
 
-        assert tis_input.dimension_scores["K"] == pytest.approx(0.9412, abs=1e-3)
+        assert float(tis_input.dimension_scores["K"]) == pytest.approx(0.9412, abs=1e-3)
         assert tis_result.gate_result == 1
         assert decision == "Allow"
 

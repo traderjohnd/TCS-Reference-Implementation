@@ -58,7 +58,7 @@ def _make_artifact(**overrides) -> ResponseArtifact:
         rag_context="Retrieved chunks here.",
         retrieved_sources=[
             {"chunk_id": "c1", "source_doc": "clinical_protocols.md",
-             "version": "v2026-01", "similarity_score": 0.917},
+             "version": "v2026-01", "similarity_score": "0.917"},
         ],
         generation_identity={
             "requesting_identity": "user-1",

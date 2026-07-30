@@ -185,7 +185,19 @@ class RAGConnector(GovernedConnector):
         gaps = int(meta.get("n_gaps", 0) or 0)
 
         # Attribution: fraction of chunks with complete metadata.
+        # Decimal-native (5a): the ratio of two integers is computed
+        # exactly in Decimal and declared at 6dp — no float ancestor.
+        from decimal import Decimal, localcontext
+        from tcs.canonical import TIS_DECIMAL_CONTEXT
         a_score = 1.0 if chunk_count == 0 else complete / chunk_count
+        if chunk_count == 0:
+            a_decimal = "1"
+        else:
+            with localcontext(TIS_DECIMAL_CONTEXT):
+                a_decimal = str(
+                    (Decimal(complete) / Decimal(chunk_count)).quantize(
+                        Decimal("0.000001"))
+                )
 
         attribution = AttributionSignal(
             source_count=chunk_count,
@@ -194,6 +206,7 @@ class RAGConnector(GovernedConnector):
             timestamp_present=True,
             chain_of_custody_complete=(gaps == 0),
             score_contribution=a_score,
+            score_contribution_decimal=a_decimal,
         )
 
         # Known: similarity drives a novelty heuristic. Mean similarity
@@ -208,6 +221,10 @@ class RAGConnector(GovernedConnector):
             confidence_calibrated=not novelty_flagged,
             novelty_score=round(1.0 - mean_sim, 4),
             score_contribution=k_score,
+            # Declared decimal measurement at the connector boundary
+            # (the similarity instrument is float-internal; the governed
+            # value is this declared fixed-precision decimal).
+            score_contribution_decimal=f"{k_score:.6f}",
         )
 
         # Boundedness: RAG retrieval makes no scope claim.
@@ -220,14 +237,32 @@ class RAGConnector(GovernedConnector):
         credential_detected = bool(meta.get("credential_detected", False))
         cred_pattern = meta.get("credential_pattern")
         if credential_detected:
+            # Structured C3 provenance (5a): map the credential pattern
+            # source to its stable versioned id when it is one of the
+            # registered patterns; the generic detail code covers
+            # producer-declared detections either way.
+            from tcs.provenance import (
+                ACTIVE_CREDENTIAL_PATTERN_SET_VERSION,
+                CREDENTIAL_PATTERN_IDS_BY_VERSION,
+            )
+            cred_map = CREDENTIAL_PATTERN_IDS_BY_VERSION[
+                ACTIVE_CREDENTIAL_PATTERN_SET_VERSION]
+            pattern_id = cred_map.get(str(cred_pattern) if cred_pattern else "")
             compliance = ComplianceSignal(
                 c3_violation=True,
                 c3_pattern=f"credential_detected:{cred_pattern}",
                 policy_violations=("credential_in_governed_context",),
                 score_contribution=0.0,
+                score_contribution_decimal="0",
+                c3_pattern_id=pattern_id,
+                c3_pattern_set_version=(
+                    ACTIVE_CREDENTIAL_PATTERN_SET_VERSION
+                    if pattern_id else None
+                ),
+                c3_detail_code="credential_in_governed_context",
             )
         else:
-            compliance = ComplianceSignal()
+            compliance = ComplianceSignal(score_contribution_decimal="1")
 
         return GovernanceEvent(
             event_id=str(uuid.uuid4()),

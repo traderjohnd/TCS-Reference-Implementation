@@ -115,7 +115,7 @@ class DemoScenario:
 def _good_chunk(chunk_id: str, sim: float = 0.93, content: str = "Standard policy text.") -> RAGChunk:
     return RAGChunk(
         chunk_id=chunk_id,
-        similarity_score=sim,
+        similarity_score=(sim if isinstance(sim, str) else f"{sim:.6f}"),
         source_doc="finance_policy_2026.pdf",
         version="2026-01",
         content=content,
@@ -127,7 +127,7 @@ def _gap_chunk(chunk_id: str, sim: float = 0.89) -> RAGChunk:
     """Chunk missing both source_doc and version -- attribution gap."""
     return RAGChunk(
         chunk_id=chunk_id,
-        similarity_score=sim,
+        similarity_score=(sim if isinstance(sim, str) else f"{sim:.6f}"),
         source_doc=None,
         version=None,
         content="policy reference text without provenance",
@@ -138,7 +138,7 @@ def _gap_chunk(chunk_id: str, sim: float = 0.89) -> RAGChunk:
 def _low_sim_chunk(chunk_id: str, sim: float = 0.55) -> RAGChunk:
     return RAGChunk(
         chunk_id=chunk_id,
-        similarity_score=sim,
+        similarity_score=(sim if isinstance(sim, str) else f"{sim:.6f}"),
         source_doc="finance_policy_2026.pdf",
         version="2026-01",
         content="weakly related policy text",
@@ -180,7 +180,7 @@ def build_scenarios() -> List[DemoScenario]:
                 "rebalanced semi-annually."
             ),
             subject_id="rec-demo-01",
-            extra_metadata={"chain_id": DEMO_CHAIN_ID},
+            governed_metadata={"chain_id": DEMO_CHAIN_ID},
         ),
         expected_decision="Allow",
     ))
@@ -204,7 +204,7 @@ def build_scenarios() -> List[DemoScenario]:
                 "for this novel multi-trust structure."
             ),
             subject_id="rec-demo-02",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "novelty_score": 0.70,
             },
@@ -229,7 +229,7 @@ def build_scenarios() -> List[DemoScenario]:
             ],
             candidate_answer="Recommend X based on retrieved guidance.",
             subject_id="rec-demo-03",
-            extra_metadata={"chain_id": DEMO_CHAIN_ID},
+            governed_metadata={"chain_id": DEMO_CHAIN_ID},
         ),
         expected_decision="Stop",
         expected_blocked=True,
@@ -254,7 +254,7 @@ def build_scenarios() -> List[DemoScenario]:
             ],
             candidate_answer="Recommend Y based on retrieved guidance.",
             subject_id="rec-demo-04",
-            extra_metadata={"chain_id": DEMO_CHAIN_ID},
+            governed_metadata={"chain_id": DEMO_CHAIN_ID},
         ),
         expected_decision="Hold",
         expected_blocked=True,
@@ -277,7 +277,7 @@ def build_scenarios() -> List[DemoScenario]:
             ],
             candidate_answer="Recommend Z based on loosely matching text.",
             subject_id="rec-demo-05",
-            extra_metadata={"chain_id": DEMO_CHAIN_ID},
+            governed_metadata={"chain_id": DEMO_CHAIN_ID},
         ),
         expected_decision="Hold",
         expected_blocked=True,
@@ -299,7 +299,7 @@ def build_scenarios() -> List[DemoScenario]:
                 _good_chunk("c1", 0.94),
                 RAGChunk(
                     chunk_id="c2-injection",
-                    similarity_score=0.91,
+                    similarity_score="0.91",
                     source_doc="finance_policy_2026.pdf",
                     version="2026-01",
                     content=(
@@ -311,7 +311,7 @@ def build_scenarios() -> List[DemoScenario]:
             ],
             candidate_answer="Put 100% into equities.",
             subject_id="rec-demo-06",
-            extra_metadata={"chain_id": DEMO_CHAIN_ID},
+            governed_metadata={"chain_id": DEMO_CHAIN_ID},
         ),
         expected_decision="Stop",
         expected_blocked=True,
@@ -333,7 +333,7 @@ def build_scenarios() -> List[DemoScenario]:
             retrieved_chunks=[
                 RAGChunk(
                     chunk_id="c1-creds",
-                    similarity_score=0.92,
+                    similarity_score="0.92",
                     source_doc="internal_notes.md",
                     version="2026-02",
                     content="To test, set API_KEY=sk-proj-abc123def456ghi789jkl",
@@ -342,7 +342,7 @@ def build_scenarios() -> List[DemoScenario]:
             ],
             candidate_answer="The API key is set. Health checks passing.",
             subject_id="rec-demo-07",
-            extra_metadata={"chain_id": DEMO_CHAIN_ID},
+            governed_metadata={"chain_id": DEMO_CHAIN_ID},
         ),
         expected_decision="Stop",
         expected_blocked=True,
@@ -364,7 +364,7 @@ def build_scenarios() -> List[DemoScenario]:
             retrieved_chunks=[_good_chunk("c1", 0.95)],
             candidate_answer="Recommend X.",
             subject_id="rec-demo-08",
-            extra_metadata={"chain_id": DEMO_CHAIN_ID},
+            governed_metadata={"chain_id": DEMO_CHAIN_ID},
         ),
         base_profile_id="fin-r3-a4-ct4-does-not-exist",
         expected_decision="Stop",
@@ -393,7 +393,7 @@ def build_scenarios() -> List[DemoScenario]:
                 "Recommend an allocation based on the previous model."
             ),
             subject_id="rec-demo-09",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "is_valid": 0,
                 "invalidation_event": "model_version_change",
@@ -423,7 +423,7 @@ def build_scenarios() -> List[DemoScenario]:
                 "Recommend a 65/35 allocation based on aging context."
             ),
             subject_id="rec-demo-10",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "elapsed_hours": 10.0,
             },

@@ -41,24 +41,71 @@ _OVERRIDE_REASON_RE = re.compile(
     re.DOTALL,
 )
 
+from pydantic import field_validator
+
 from tcs.adapters.rag_adapter import RAGAdapter, RAGChunk, RAGOutput
+from tcs.api.models_numeric import (
+    GOVERNED_DECIMAL_PATTERN,
+    GovernedDecimalError,
+    parse_unit_interval_decimal,
+)
+from tcs.governed_context import CT_WEIGHT_MODIFIERS
+from tcs.governed_metadata import find_protected_keys
+from tcs.trust_certificate import gate_result_from_serialized
 
 
 router = APIRouter()
 
 
+# Allowed values for the typed evaluation-typing fields (tis-v2 Commit
+# 5a.1). These are the SDK convenience parameters that historically
+# travelled inside extra_metadata; that channel is protected, so the
+# only public path is these validated typed fields. The route — never
+# the caller — places the validated values into the trusted governed
+# metadata channel.
+_VALID_RISK_TIERS = frozenset({"r1", "r2", "r3"})
+_VALID_ACTION_CLASSES = frozenset({"a1", "a2", "a3", "a4"})
+#: CT-1..CT-13 from the canonical modifier table. CT-12 is deliberately
+#: allowed: declaring credentials produces the deterministic CT-12
+#: credential Stop — a conservative outcome, never an override surface.
+_VALID_CONNECTION_TYPES = frozenset(CT_WEIGHT_MODIFIERS.keys())
+
+
 # --------------------------------------------------------------------------- #
 # Request / response models                                                    #
 # --------------------------------------------------------------------------- #
+#
+# Governed decimal fields are JSON STRINGS on the wire (tis-v2 Commit
+# 5a, owner correction 1): a JSON number token may pass through binary
+# floating point before validation sees it, so lexical decimal fidelity
+# requires a string. OpenAPI documents these as strings with the
+# governed-decimal pattern — never ``number | string``.
 
 class ChunkBody(BaseModel):
     """A single retrieved chunk as sent over the wire."""
     chunk_id: str
-    similarity_score: float = Field(ge=0.0, le=1.0)
+    similarity_score: str = Field(
+        pattern=GOVERNED_DECIMAL_PATTERN,
+        description=(
+            "Governed decimal string in [0, 1], variable scale "
+            "(e.g. \"0.923456\"). JSON numbers are rejected to "
+            "preserve lexical decimal fidelity."
+        ),
+        json_schema_extra={"example": "0.9234"},
+    )
     source_doc: Optional[str] = None
     version: Optional[str] = None
     content: str = ""
     tags: List[str] = Field(default_factory=list)
+
+    @field_validator("similarity_score", mode="before")
+    @classmethod
+    def _validate_similarity(cls, v: object) -> str:
+        try:
+            parse_unit_interval_decimal(v, "similarity_score")
+        except GovernedDecimalError as exc:
+            raise ValueError(str(exc)) from exc
+        return v  # keep the exact lexical string; Decimal at the adapter
 
 
 class GovernRequestBody(BaseModel):
@@ -69,6 +116,13 @@ class GovernRequestBody(BaseModel):
     translation layer. Optional ``base_profile_id`` lets the caller
     override the adapter default (``fin-r3-a4-ct4``) for demos that
     need a different CT resolution.
+
+    ``extra_metadata`` is free-form DISPLAY metadata only. Keys that
+    could influence scoring, gating, C3, validity, decisions, identity
+    trust, provenance, or enforcement are PROTECTED and rejected with
+    HTTP 422 — at any nesting depth (see tcs.governed_metadata).
+    Identity attestations travel exclusively through the typed fields
+    below.
     """
     query: str
     retrieved_chunks: List[ChunkBody] = Field(default_factory=list)
@@ -81,16 +135,75 @@ class GovernRequestBody(BaseModel):
 
     base_profile_id: str = "fin-r3-a4-ct4"
 
-    # Identity passthroughs
+    # Evaluation typing (tis-v2 Commit 5a.1) — the ONLY public channel
+    # for risk tier, action class, and connection type. The same names
+    # inside extra_metadata are protected and rejected with 422, so a
+    # conflicting duplicate submission fails rather than choosing one
+    # value. Omitted fields preserve the existing default behaviour
+    # (adapter/interceptor defaults and CT auto-detection).
+    risk_tier: Optional[str] = None
+    action_class: Optional[str] = None
+    connection_type: Optional[str] = None
+
+    # Identity passthroughs — the ONLY public channel for identity
+    # attestations. identity_confidence is a governed decimal string.
     requesting_identity: Optional[str] = None
     identity_verified: Optional[bool] = None
-    identity_confidence: Optional[float] = None
+    identity_confidence: Optional[str] = Field(
+        default=None,
+        pattern=GOVERNED_DECIMAL_PATTERN,
+        description=(
+            "Governed decimal string in [0, 1] (e.g. \"0.899996\"). "
+            "JSON numbers are rejected."
+        ),
+        json_schema_extra={"example": "0.95"},
+    )
     authorization_tier: Optional[str] = None
     sensitivity_tier: Optional[str] = None
     mcp_server_id: Optional[str] = None
 
-    # Free-form extras merged into context_metadata
+    # Free-form extras merged into context_metadata (display only —
+    # protected keys rejected, see class docstring).
     extra_metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("identity_confidence", mode="before")
+    @classmethod
+    def _validate_identity_confidence(cls, v: object) -> object:
+        if v is None:
+            return v
+        try:
+            parse_unit_interval_decimal(v, "identity_confidence")
+        except GovernedDecimalError as exc:
+            raise ValueError(str(exc)) from exc
+        return v
+
+    @field_validator("risk_tier")
+    @classmethod
+    def _validate_risk_tier(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_RISK_TIERS:
+            raise ValueError(
+                f"risk_tier must be one of {sorted(_VALID_RISK_TIERS)}"
+            )
+        return v
+
+    @field_validator("action_class")
+    @classmethod
+    def _validate_action_class(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_ACTION_CLASSES:
+            raise ValueError(
+                f"action_class must be one of {sorted(_VALID_ACTION_CLASSES)}"
+            )
+        return v
+
+    @field_validator("connection_type")
+    @classmethod
+    def _validate_connection_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_CONNECTION_TYPES:
+            raise ValueError(
+                "connection_type must be one of "
+                f"{sorted(_VALID_CONNECTION_TYPES)}"
+            )
+        return v
 
 
 # --------------------------------------------------------------------------- #
@@ -112,12 +225,53 @@ def post_govern(body: GovernRequestBody, request: Request) -> Dict[str, Any]:
     whether the candidate output may be released;
     ``fail_safe_applied`` tells them whether the response came from
     a governance infrastructure failure.
+
+    Protected metadata (tis-v2 Commit 5a): governed keys inside
+    ``extra_metadata`` — at any nesting depth, case- and
+    separator-insensitively — are rejected with HTTP 422. The error
+    names every rejected key path; values are never echoed. Nothing
+    is silently dropped.
     """
-    # Translate wire chunks -> adapter chunks
+    from decimal import Decimal
+
+    rejected = find_protected_keys(body.extra_metadata)
+    if rejected:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "protected_metadata_keys",
+                "message": (
+                    "extra_metadata may not supply governed scoring, "
+                    "gating, C3, validity, decision, identity, "
+                    "provenance, or enforcement keys. Identity "
+                    "attestations and evaluation typing (risk_tier, "
+                    "action_class, connection_type) use the typed "
+                    "request fields."
+                ),
+                "rejected_keys": sorted(rejected),
+            },
+        )
+
+    # Evaluation typing (tis-v2 Commit 5a.1): the ROUTE — never the
+    # public caller — constructs the trusted governed metadata, from
+    # the validated typed fields only. A duplicate of these names in
+    # extra_metadata was already rejected above (protected keys), so
+    # there is exactly one value in play. Omitted fields are simply
+    # absent, preserving default behaviour downstream.
+    governed_metadata: Dict[str, Any] = {}
+    if body.risk_tier is not None:
+        governed_metadata["risk_tier"] = body.risk_tier
+    if body.action_class is not None:
+        governed_metadata["action_class"] = body.action_class
+    if body.connection_type is not None:
+        governed_metadata["connection_type"] = body.connection_type
+
+    # Translate wire chunks -> adapter chunks. Governed decimal strings
+    # become Decimal HERE — no binary float ever exists on this path.
     chunks = [
         RAGChunk(
             chunk_id=c.chunk_id,
-            similarity_score=c.similarity_score,
+            similarity_score=Decimal(c.similarity_score),
             source_doc=c.source_doc,
             version=c.version,
             content=c.content,
@@ -137,11 +291,15 @@ def post_govern(body: GovernRequestBody, request: Request) -> Dict[str, Any]:
         request_id=body.request_id,
         requesting_identity=body.requesting_identity,
         identity_verified=body.identity_verified,
-        identity_confidence=body.identity_confidence,
+        identity_confidence=(
+            Decimal(body.identity_confidence)
+            if body.identity_confidence is not None else None
+        ),
         authorization_tier=body.authorization_tier,
         sensitivity_tier=body.sensitivity_tier,
         mcp_server_id=body.mcp_server_id,
         extra_metadata=dict(body.extra_metadata),
+        governed_metadata=governed_metadata,
     )
 
     adapter = RAGAdapter(base_profile_id=body.base_profile_id)
@@ -290,7 +448,7 @@ def decisions_stream(
             "decision": d["decision"],
             "tis_current": d["tis_current"],
             "component_scores": d["component_scores"],
-            "gate_passed": d["gate_passed"],
+            "gate_result": gate_result_from_serialized(d),
             "blocking_reason": d.get("blocking_reason"),
             "requires_human_review": d["requires_human_review"],
             "evaluation_timestamp": d["evaluation_timestamp"],

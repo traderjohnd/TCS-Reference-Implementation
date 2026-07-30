@@ -196,9 +196,9 @@ class TestSerialization:
             rag_context="Retrieved chunks here.",
             retrieved_sources=[
                 {"chunk_id": "c1", "source_doc": "clinical_protocols.md",
-                 "version": "v2026-01", "similarity_score": 0.917},
+                 "version": "v2026-01", "similarity_score": "0.917"},
                 {"chunk_id": "c2", "source_doc": "drug_interactions.md",
-                 "version": "v2026-01", "similarity_score": 0.893},
+                 "version": "v2026-01", "similarity_score": "0.893"},
             ],
             workflow_trace_id="trace-abc",
             workflow_trace={"nodes": [{"id": "rag"}, {"id": "llm"}]},

@@ -105,7 +105,7 @@ class TestVectorStore:
         results = vs.retrieve("municipal bond allocation for conservative client", k=5)
         assert len(results) == 5
         # Top result should have nonzero similarity.
-        assert results[0]["similarity_score"] > 0.0
+        assert float(results[0]["similarity_score"]) > 0.0
         # Results should be sorted by similarity descending.
         sims = [r["similarity_score"] for r in results]
         assert sims == sorted(sims, reverse=True)
@@ -115,7 +115,7 @@ class TestVectorStore:
         vs.ingest_directory(_DOCS_DIR)
         results = vs.retrieve("investment guidelines", k=5)
         for r in results:
-            assert 0.0 <= r["similarity_score"] <= 1.0
+            assert 0.0 <= float(r["similarity_score"]) <= 1.0
 
 
 # --------------------------------------------------------------------------- #

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { usePolling } from '../hooks/useApi';
+import { displayGoverned } from '../lib/governedDecimal';
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar,
   ScatterChart, Scatter,
@@ -373,21 +374,31 @@ export default function Telemetry() {
                       {r.decision}
                     </span>
                   </td>
+                  {/* Telemetry rows are the documented DISPLAY-tier
+                      float stream — the store converts at the read
+                      boundary (5a); authoritative Decimals live on the
+                      certificates. displayGoverned formats floats and
+                      would pass canonical strings through verbatim. */}
                   <td className="py-1.5 pr-2 text-gray-400 font-mono truncate max-w-[120px]">{r.subject_id}</td>
-                  <td className="py-1.5 pr-2 font-mono text-gray-300">{r.tis_current?.toFixed(4)}</td>
-                  <td className={`py-1.5 pr-2 font-mono ${r.B >= 0.80 ? 'text-gray-300' : 'text-red-400'}`}>{r.B?.toFixed(2)}</td>
-                  <td className={`py-1.5 pr-2 font-mono ${r.A >= 0.80 ? 'text-gray-300' : 'text-red-400'}`}>{r.A?.toFixed(2)}</td>
-                  <td className={`py-1.5 pr-2 font-mono ${r.C >= 0.80 ? 'text-gray-300' : 'text-red-400'}`}>{r.C?.toFixed(2)}</td>
+                  <td className="py-1.5 pr-2 font-mono text-gray-300">{displayGoverned(r.tis_current)}</td>
+                  <td className={`py-1.5 pr-2 font-mono ${r.B >= 0.80 ? 'text-gray-300' : 'text-red-400'}`}>{displayGoverned(r.B, 2)}</td>
+                  <td className={`py-1.5 pr-2 font-mono ${r.A >= 0.80 ? 'text-gray-300' : 'text-red-400'}`}>{displayGoverned(r.A, 2)}</td>
+                  <td className={`py-1.5 pr-2 font-mono ${r.C >= 0.80 ? 'text-gray-300' : 'text-red-400'}`}>{displayGoverned(r.C, 2)}</td>
                   <td className={`py-1.5 pr-2 font-mono font-bold ${r.K >= 0.85 ? 'text-emerald-400' : r.K >= 0.70 ? 'text-yellow-400' : 'text-red-400'}`}>
-                    {r.K?.toFixed(2)}
+                    {displayGoverned(r.K, 2)}
                   </td>
                   <td className={`py-1.5 pr-2 font-mono ${r.penalty_aggregate > 0.01 ? 'text-yellow-400' : 'text-gray-500'}`}>
-                    {r.penalty_aggregate?.toFixed(4)}
+                    {displayGoverned(r.penalty_aggregate)}
                   </td>
                   <td className="py-1.5 pr-2">
-                    {r.gate_passed
+                    {/* Single gate vocabulary (5a): the stream carries
+                        gate_result 0|1 — gate_passed is v1-only and is
+                        never used as a fallback here. */}
+                    {r.gate_result === 1
                       ? <span className="text-green-500">PASS</span>
-                      : <span className="text-red-400 font-bold">FAIL</span>
+                      : r.gate_result === 0
+                        ? <span className="text-red-400 font-bold">FAIL</span>
+                        : <span className="text-gray-600">—</span>
                     }
                   </td>
                 </tr>

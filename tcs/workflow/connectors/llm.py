@@ -189,10 +189,31 @@ class LLMConnector(GovernedConnector):
                 break
         c3_violation = c3_pattern is not None
 
+        # Structured C3 provenance (tis-v2 5a): stable pattern id from
+        # the versioned llm-response mapping; the lexical pattern stays
+        # as explanatory metadata only.
+        from tcs.provenance import (
+            ACTIVE_LLM_RESPONSE_PATTERN_SET_VERSION,
+            LLM_RESPONSE_PATTERN_IDS_BY_VERSION,
+        )
+        c3_pattern_id = (
+            LLM_RESPONSE_PATTERN_IDS_BY_VERSION[
+                ACTIVE_LLM_RESPONSE_PATTERN_SET_VERSION
+            ][c3_pattern]
+            if c3_violation else None
+        )
+
         compliance = ComplianceSignal(
             c3_violation=c3_violation,
             c3_pattern=c3_pattern,
             score_contribution=0.0 if c3_violation else 1.0,
+            score_contribution_decimal="0" if c3_violation else "1",
+            c3_pattern_id=c3_pattern_id,
+            c3_pattern_set_version=(
+                ACTIVE_LLM_RESPONSE_PATTERN_SET_VERSION
+                if c3_violation else None
+            ),
+            c3_detail_code="llm_response_injection" if c3_violation else None,
         )
 
         # K: full calibration if the response came through; reduced

@@ -108,7 +108,7 @@ def _clinical_chunk(
 ) -> RAGChunk:
     return RAGChunk(
         chunk_id=chunk_id,
-        similarity_score=sim,
+        similarity_score=(sim if isinstance(sim, str) else f"{sim:.6f}"),
         source_doc=source_doc,
         version=version,
         content=content,
@@ -124,7 +124,7 @@ def _unversioned_chunk(
     """Chunk missing version — attribution gap."""
     return RAGChunk(
         chunk_id=chunk_id,
-        similarity_score=sim,
+        similarity_score=(sim if isinstance(sim, str) else f"{sim:.6f}"),
         source_doc=None,
         version=None,
         content=content,
@@ -135,7 +135,7 @@ def _unversioned_chunk(
 def _low_sim_chunk(chunk_id: str, sim: float = 0.55) -> RAGChunk:
     return RAGChunk(
         chunk_id=chunk_id,
-        similarity_score=sim,
+        similarity_score=(sim if isinstance(sim, str) else f"{sim:.6f}"),
         source_doc="clinical_guidelines_2026.pdf",
         version="2026-03",
         content="Weakly related clinical reference text.",
@@ -172,7 +172,7 @@ def build_scenarios() -> List[DemoScenario]:
             ),
             subject_id="rec-clinical-01",
             pipeline_id="healthcare-rag-v1",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "physician_review_eligible": False,
             },
@@ -211,13 +211,13 @@ def build_scenarios() -> List[DemoScenario]:
             ),
             subject_id="rec-clinical-02",
             pipeline_id="healthcare-rag-v1",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "sensitivity_tier": "T3",
                 "aggregation_detected": True,
                 "aggregation_components": ["T1_chief_complaint", "T2_lab_values", "T2_imaging"],
                 # Elevate B score to simulate B gate pressure from aggregation
-                "B_score": 0.82,
+                "B_score": "0.82",
             },
         ),
         # Paper-aligned ladder: gate=0 + S_base < kappa -> Stop
@@ -252,11 +252,11 @@ def build_scenarios() -> List[DemoScenario]:
             ),
             subject_id="rec-clinical-03",
             pipeline_id="healthcare-rag-v1",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "missing_clinical_provenance": True,
                 # A score degraded below 0.85 gate due to unversioned sources
-                "A_score": 0.82,
+                "A_score": "0.82",
             },
         ),
         # Paper-aligned ladder: gate=0 + S_base < kappa -> Stop.
@@ -293,7 +293,7 @@ def build_scenarios() -> List[DemoScenario]:
             ),
             subject_id="rec-clinical-04",
             pipeline_id="healthcare-rag-v1",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "treatment_initiation_before_confirmation": True,
             },
@@ -327,7 +327,7 @@ def build_scenarios() -> List[DemoScenario]:
             ),
             subject_id="rec-clinical-05",
             pipeline_id="healthcare-rag-v1",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "sensitivity_tier": "T3",
                 "phi_detected": True,
@@ -367,7 +367,7 @@ def build_scenarios() -> List[DemoScenario]:
             ),
             subject_id="rec-clinical-06",
             pipeline_id="healthcare-rag-v1",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "low_diagnostic_confidence": True,
             },
@@ -402,7 +402,7 @@ def build_scenarios() -> List[DemoScenario]:
             ),
             subject_id="rec-clinical-07",
             pipeline_id="healthcare-rag-v1",
-            extra_metadata={
+            governed_metadata={
                 "chain_id": DEMO_CHAIN_ID,
                 "authorization_tier": "T2",
                 "requested_action_tier": "T3",
@@ -433,7 +433,7 @@ def build_scenarios() -> List[DemoScenario]:
             candidate_answer="Recommend standard treatment protocol.",
             subject_id="rec-clinical-08",
             pipeline_id="healthcare-rag-v1",
-            extra_metadata={"chain_id": DEMO_CHAIN_ID},
+            governed_metadata={"chain_id": DEMO_CHAIN_ID},
         ),
         base_profile_id="healthcare-r3-a4-ct4-does-not-exist",
         expected_decision="Stop",
