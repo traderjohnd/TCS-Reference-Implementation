@@ -47,10 +47,16 @@ def list_certificates(
     ``TrustCertificate.to_dict()`` shape.
     """
     store = request.app.state.store
-    tcs = store.list_recent(limit=limit)
+    # Tolerant list boundary (D2): a malformed stored row is excluded
+    # and identified (names only) — never served as an ordinary
+    # certificate and never fatal to the archive feed. The strict
+    # fail-closed path remains on GET /certificates/{id}.
+    tcs, excluded = store.list_recent_with_integrity(limit=limit)
     return {
         "count": len(tcs),
         "certificates": [tc.to_dict() for tc in tcs],
+        "excluded_malformed_count": len(excluded),
+        "integrity_warnings": excluded[:10],
     }
 
 

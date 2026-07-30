@@ -349,6 +349,54 @@ class CertificateStore:
             ).fetchall()
         return [_tc_from_json(r["content_json"]) for r in rows]
 
+    def list_recent_with_integrity(self, limit: int = 20):
+        """Tolerant list boundary (release-blocker fix D2).
+
+        Returns ``(tcs, excluded)`` — valid TrustCertificates in recency
+        order plus bounded sanitized integrity records for any rows that
+        failed rehydration. One malformed row must never make the whole
+        feed unavailable; it is excluded and identified, never repaired
+        or served as an ordinary certificate.
+        """
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT content_json FROM trust_certificates "
+                "ORDER BY evaluation_timestamp DESC, chain_sequence DESC "
+                "LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        tcs: List[TrustCertificate] = []
+        excluded: List[Dict[str, Any]] = []
+        for r in rows:
+            tc, problem = tolerant_tc_from_json(r["content_json"])
+            if tc is not None:
+                tcs.append(tc)
+            else:
+                excluded.append(problem)
+        return tcs, excluded
+
+    def integrity_scan(self, max_details: int = 10) -> Dict[str, Any]:
+        """Archive-wide malformed-record census for health/metrics.
+
+        Separates record integrity from service availability: feeds stay
+        served while this reports how many stored records fail
+        rehydration and (bounded) which ones. Values are never echoed.
+        """
+        with self._read():
+            rows = self._conn.execute(
+                "SELECT content_json FROM trust_certificates"
+            ).fetchall()
+        excluded: List[Dict[str, Any]] = []
+        for r in rows:
+            tc, problem = tolerant_tc_from_json(r["content_json"])
+            if tc is None:
+                excluded.append(problem)
+        return {
+            "malformed_record_count": len(excluded),
+            "excluded_record_count": len(excluded),
+            "excluded": excluded[:max_details],
+        }
+
     # ---- Windowed queries (Phase 3 dynamics) ------------------------------ #
 
     def _compute_window_cutoff(self, window_hours: float) -> str:
@@ -598,7 +646,12 @@ class CertificateStore:
         sums: Dict[str, float] = {"B": 0.0, "A": 0.0, "C": 0.0, "K": 0.0}
         n = 0
         for r in rows:
-            tc = _tc_from_json(r["content_json"])
+            # Tolerant per-record boundary (D2): a malformed stored row
+            # is excluded from the mean — never substituted, never fatal
+            # to the whole dashboard metric.
+            tc, _problem = tolerant_tc_from_json(r["content_json"])
+            if tc is None:
+                continue
             cs = tc.component_scores
             if cs:
                 for dim in ("B", "A", "C", "K"):
@@ -936,6 +989,70 @@ def _build_override_record(d: Optional[Dict[str, Any]]) -> Optional[OverrideReco
             d.get("override_creates_tc_amendment", False)
         ),
     )
+
+
+def _sanitize_error_detail(exc: Exception) -> str:
+    """Strip any trailing ': <value>' tail from a validation message so
+    integrity warnings carry field names and failure reasons — never the
+    untrusted malformed values themselves."""
+    return str(exc).split(":")[0].strip()
+
+
+def _invalid_fields_from_error(exc: Exception) -> List[str]:
+    """Best-effort field-name extraction: validation messages lead with
+    the offending field ('s_base is not a canonical ...')."""
+    head = _sanitize_error_detail(exc)
+    token = head.split()[0].strip("'\"") if head else ""
+    return [token] if token else []
+
+
+def tolerant_tc_from_json(content_json: str):
+    """Per-record tolerant rehydration for LIST/dashboard boundaries.
+
+    Returns ``(tc, None)`` on success or ``(None, excluded)`` where
+    ``excluded`` is a bounded, sanitized integrity record:
+
+        {certificate_id, failure_category, invalid_fields,
+         detail, excluded: True}
+
+    The malformed record is NEVER repaired, substituted, or returned as
+    an ordinary certificate — it is excluded and identified. Authoritative
+    single-record reads (``get``), chain rehydration for verification,
+    and replay deliberately do NOT use this helper: they keep the strict
+    fail-closed path.
+    """
+    cid = None
+    try:
+        d = json.loads(content_json)
+        if isinstance(d, dict):
+            raw_cid = d.get("certificate_id")
+            cid = str(raw_cid) if isinstance(raw_cid, str) else None
+    except (TypeError, ValueError):
+        return None, {
+            "certificate_id": None,
+            "failure_category": "unreadable_json",
+            "invalid_fields": [],
+            "detail": "stored content_json is not valid JSON",
+            "excluded": True,
+        }
+    try:
+        return _tc_from_json(content_json), None
+    except UnsupportedCertificateSchemaVersion as exc:
+        return None, {
+            "certificate_id": cid,
+            "failure_category": "unsupported_schema",
+            "invalid_fields": ["certificate_schema_version"],
+            "detail": _sanitize_error_detail(exc),
+            "excluded": True,
+        }
+    except Exception as exc:  # noqa: BLE001 — invariant/score/shape errors
+        return None, {
+            "certificate_id": cid,
+            "failure_category": "invalid_certificate",
+            "invalid_fields": _invalid_fields_from_error(exc),
+            "detail": _sanitize_error_detail(exc),
+            "excluded": True,
+        }
 
 
 def _tc_from_json(content_json: str) -> TrustCertificate:
@@ -1495,17 +1612,39 @@ def _telemetry_stream(
 
     This powers the Telemetry view — dimension score trends,
     K calibration sparkline, penalty pressure over time.
+
+    Returns ``(records, excluded_count)`` — malformed stored rows are
+    skipped and counted (D2), never fatal to the feed.
     """
     rows = self.query_window(window_hours)
     if not rows:
-        return []
+        return [], 0
 
     records = []
+    excluded = 0
     for r in rows[-limit:]:  # most recent N
-        d = json.loads(r["content_json"])
-        cs = d.get("component_scores", {})
-        pb = d.get("penalty_breakdown", {})
-        records.append({
+        # Tolerant per-record boundary (D2): one malformed stored row is
+        # skipped and counted, never fatal to the telemetry feed and
+        # never substituted with invented values.
+        # Full certificate validation per row — a tampered record must
+        # not silently render as ordinary telemetry either.
+        tc, _problem = tolerant_tc_from_json(r["content_json"])
+        if tc is None:
+            excluded += 1
+            continue
+        try:
+            d = json.loads(r["content_json"])
+            cs = d.get("component_scores", {})
+            pb = d.get("penalty_breakdown", {})
+            records.append(_telemetry_record(r, d, cs, pb))
+        except Exception:  # noqa: BLE001 — malformed governed values
+            excluded += 1
+            continue
+    return records, excluded
+
+
+def _telemetry_record(r, d, cs, pb):
+    return dict({
             "t": r["evaluation_timestamp"],
             "certificate_id": d.get("certificate_id", ""),
             "subject_id": d.get("subject_id", ""),
@@ -1533,7 +1672,6 @@ def _telemetry_stream(
             "governance_ms": d.get("governance_ms"),
             "profile_id": d.get("policy_set_id", ""),
         })
-    return records
 
 
 CertificateStore.timeseries_buckets = _timeseries_buckets

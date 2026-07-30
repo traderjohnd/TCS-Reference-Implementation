@@ -270,6 +270,12 @@ function BackScoresPanel({ r }) {
           const failed = result === 'fail';
           const notApplicable = result === 'not_applicable';
           const barColor = failed ? 'bg-red-500' : (notApplicable ? 'bg-gray-600' : 'bg-blue-500');
+          // Defensive display hardening (D1 class): text renders via the
+          // governed boundary; the bar geometry uses numbers only and
+          // degrades to 0-width rather than throwing if a wire value
+          // ever arrives as a string.
+          const scoreBar = typeof score === 'number' && Number.isFinite(score) ? score : 0;
+          const thrBar = typeof thr === 'number' && Number.isFinite(thr) ? thr : null;
           return (
             <div key={dim} className="text-xs">
               <div className="flex justify-between items-baseline mb-0.5">
@@ -278,13 +284,13 @@ function BackScoresPanel({ r }) {
                   <span className="text-gray-600 ml-1">{dimNames[dim]}</span>
                 </span>
                 <span className={`font-mono ${failed ? 'text-red-400 font-semibold' : 'text-gray-300'}`}>
-                  {score.toFixed(3)}
+                  {displayGoverned(score, 3)}
                 </span>
               </div>
               <div className="relative w-full h-1.5 bg-gray-800 rounded">
-                <div className={`absolute top-0 left-0 h-1.5 rounded ${barColor}`} style={{ width: `${Math.min(100, score * 100)}%` }} />
-                {thr != null && (
-                  <div className="absolute top-[-2px] h-2.5 w-px bg-gray-400" style={{ left: `${Math.min(100, thr * 100)}%` }} title={`threshold ${thr}`} />
+                <div className={`absolute top-0 left-0 h-1.5 rounded ${barColor}`} style={{ width: `${Math.min(100, scoreBar * 100)}%` }} />
+                {thrBar != null && (
+                  <div className="absolute top-[-2px] h-2.5 w-px bg-gray-400" style={{ left: `${Math.min(100, thrBar * 100)}%` }} title={`threshold ${thr}`} />
                 )}
               </div>
               <div className="text-[10px] text-gray-500 mt-0.5">
@@ -364,7 +370,10 @@ function ProvenancePanel({ r }) {
                 {c.source_doc || <span className="text-yellow-400">⚠ no source_doc</span>}
                 {c.version && <span className="text-gray-500 ml-2">v{c.version}</span>}
               </span>
-              <span className="font-mono text-gray-400 text-[11px]">sim {c.similarity_score?.toFixed(3) ?? '—'}</span>
+              {/* D1 fix: similarity arrives as a decimal STRING on the
+                  v2 wire — render through the governed display boundary,
+                  never .toFixed() on a wire value. */}
+              <span className="font-mono text-gray-400 text-[11px]">sim {displayGoverned(c.similarity_score, 3)}</span>
             </div>
           );
         })}

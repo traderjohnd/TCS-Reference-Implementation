@@ -65,6 +65,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 # identical across surfaces. This is the only cross-module dependency
 # in this file.
 from tcs.api.routes_govern import _parse_override_reason
+from tcs.persistence.certificate_store import tolerant_tc_from_json
 
 
 router = APIRouter()
@@ -520,7 +521,15 @@ def top_rules(
 
     # rule_id → {"name": ..., "fires": int, "decisions": Counter, "policies": Counter}
     accum: Dict[str, Dict[str, Any]] = {}
+    excluded_malformed = 0
     for r in rows:
+        # Tolerant per-record boundary (D2): a stored row that fails
+        # certificate validation must not silently contribute to
+        # aggregates as though it were valid — exclude and count it.
+        tc, _problem = tolerant_tc_from_json(r["content_json"])
+        if tc is None:
+            excluded_malformed += 1
+            continue
         try:
             blob = json.loads(r["content_json"]) or {}
         except (TypeError, ValueError):
@@ -557,7 +566,11 @@ def top_rules(
             "top_pack_name":     labels.get(top_policy[0][0]) if top_policy else None,
         })
     flat.sort(key=lambda x: x["fires"], reverse=True)
-    return {"window": window, "rules": flat[:limit]}
+    return {
+        "window": window,
+        "rules": flat[:limit],
+        "excluded_malformed_count": excluded_malformed,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -606,7 +619,14 @@ def failed_back_dimensions(
 
     fail = Counter()
     evaluated = Counter()
+    excluded_malformed = 0
     for r in rows:
+        # Tolerant per-record boundary (D2): rows failing certificate
+        # validation are excluded from aggregates and counted.
+        tc, _problem = tolerant_tc_from_json(r["content_json"])
+        if tc is None:
+            excluded_malformed += 1
+            continue
         try:
             blob = json.loads(r["content_json"]) or {}
         except (TypeError, ValueError):
@@ -627,7 +647,11 @@ def failed_back_dimensions(
         }
         for dim in _BACK_DIMS
     ]
-    return {"window": window, "dims": dims}
+    return {
+        "window": window,
+        "dims": dims,
+        "excluded_malformed_count": excluded_malformed,
+    }
 
 
 # --------------------------------------------------------------------------- #

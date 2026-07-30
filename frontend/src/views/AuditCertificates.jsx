@@ -818,6 +818,18 @@ export default function AuditCertificates() {
       <div className="flex gap-6">
         <div className={`${selectedTc ? 'w-1/2' : 'w-full'} transition-all`}>
           <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
+            {(data?.excluded_malformed_count || 0) > 0 && (
+              <div
+                role="alert"
+                className="mb-3 bg-red-900/20 border border-red-800 rounded p-2 text-xs text-red-200"
+              >
+                {data.excluded_malformed_count} stored record
+                {data.excluded_malformed_count === 1 ? '' : 's'} failed
+                integrity validation and {data.excluded_malformed_count === 1 ? 'was' : 'were'} excluded
+                from this archive listing. Chain verification reports the
+                underlying problem truthfully.
+              </div>
+            )}
             <div className="flex justify-between items-center mb-3">
               <h3 className="text-sm font-medium text-gray-400">TC Archive ({data?.count || 0})</h3>
               <select

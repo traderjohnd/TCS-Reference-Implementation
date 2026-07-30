@@ -104,6 +104,11 @@ def get_metrics_live(request: Request) -> Dict[str, Any]:
         "chain_intact": store.all_chains_verify(),
         "dimension_means": store.dimension_means(),
         "dominant_failure_dimension": store.dominant_failure_dimension(),
+        # Record-integrity census (D2): SEPARATE from service
+        # availability and from chain integrity. A malformed stored
+        # record degrades this block (and chain_intact where its chain
+        # is affected) without making read feeds unavailable.
+        "record_integrity": store.integrity_scan(),
         "snapshot_at": datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ),
@@ -230,7 +235,9 @@ def get_telemetry(
     """
     store = request.app.state.store
     window_hours = _parse_window(window)
-    records = store.telemetry_stream(window_hours, limit)
+    # Tolerant per-record boundary (D2): malformed stored rows are
+    # skipped and counted, never fatal to the telemetry feed.
+    records, excluded_malformed = store.telemetry_stream(window_hours, limit)
 
     # Compute summary statistics for the window
     if records:
@@ -276,9 +283,13 @@ def get_telemetry(
             "gate_failure_rate": 0,
         }
 
+    # Valid displayed records vs excluded malformed rows, distinguished.
+    summary["excluded_malformed_count"] = excluded_malformed
+
     return {
         "records": records,
         "summary": summary,
+        "excluded_malformed_count": excluded_malformed,
         "window": window,
         "snapshot_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -308,12 +319,20 @@ def get_health(request: Request) -> Dict[str, Any]:
     """
     store = request.app.state.store
     chain_intact = store.all_chains_verify()
+    # Record-integrity census (D2): reported SEPARATELY from service
+    # availability and chain integrity. Malformed stored records
+    # degrade status truthfully, but read feeds stay available (they
+    # exclude and flag the affected records).
+    integrity = store.integrity_scan(max_details=0)
+    malformed = int(integrity.get("malformed_record_count", 0))
     start = getattr(
         request.app.state, "start_time", datetime.now(timezone.utc)
     )
     uptime = (datetime.now(timezone.utc) - start).total_seconds()
     return {
-        "status": "ok" if chain_intact else "degraded",
+        "status": "ok" if (chain_intact and malformed == 0) else "degraded",
+        "malformed_record_count": malformed,
+        "excluded_record_count": malformed,
         "api_version": getattr(request.app.state, "api_version", "unknown"),
         "policy_version": getattr(
             request.app.state, "policy_version", "unknown"
