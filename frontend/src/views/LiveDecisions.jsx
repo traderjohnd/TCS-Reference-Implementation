@@ -396,15 +396,27 @@ export default function LiveDecisions() {
   const escalations = escData?.escalations || [];
   // Malformed-record exclusions reported by the tolerant list
   // boundaries (D2): valid rows stay displayed; excluded rows are
-  // surfaced as a bounded, names-only integrity notice.
-  const excludedTotal =
-    (data?.excluded_malformed_count || 0)
-    + (holdData?.excluded_malformed_count || 0)
-    + (escData?.excluded_malformed_count || 0);
-  const integrityWarnings = (data?.integrity_warnings || [])
+  // surfaced as a bounded, names-only integrity notice. The same
+  // malformed record is reported by each feed that would have carried
+  // it, so warnings are DEDUPED by certificate id before counting —
+  // one damaged record is one damaged record, not three.
+  const allWarnings = (data?.integrity_warnings || [])
     .concat(holdData?.integrity_warnings || [])
-    .concat(escData?.integrity_warnings || [])
-    .slice(0, 10);
+    .concat(escData?.integrity_warnings || []);
+  const seenIds = new Set();
+  const integrityWarnings = allWarnings.filter((w) => {
+    const key = w?.certificate_id;
+    if (!key) return true;              // unidentifiable rows can't dedupe
+    if (seenIds.has(key)) return false;
+    seenIds.add(key);
+    return true;
+  }).slice(0, 10);
+  const excludedTotal = Math.max(
+    integrityWarnings.length,
+    data?.excluded_malformed_count || 0,
+    holdData?.excluded_malformed_count || 0,
+    escData?.excluded_malformed_count || 0,
+  );
 
   // Common "refresh everything" after an override — the override
   // affects the stream (badge appears), the source queue (TC drops
