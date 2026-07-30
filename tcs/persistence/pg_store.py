@@ -51,6 +51,7 @@ from tcs.persistence.certificate_store import (
     CertificateNotFoundError,
     IssuanceVersionRegressionError,
     _tc_from_json,
+    tolerant_tc_from_json,
 )
 from tcs.canonical import (
     CertificateInvariantError,
@@ -264,6 +265,42 @@ class PostgresCertificateStore:
             (int(limit),),
         ).fetchall()
         return [_tc_from_json(r["content_json"]) for r in rows]
+
+    def list_recent_with_integrity(self, limit: int = 20):
+        """Tolerant list boundary (release-blocker fix D2) — same
+        contract as CertificateStore.list_recent_with_integrity."""
+        rows = self._conn.execute(
+            "SELECT content_json FROM trust_certificates "
+            "ORDER BY evaluation_timestamp DESC, chain_sequence DESC "
+            "LIMIT %s",
+            (int(limit),),
+        ).fetchall()
+        tcs: List[TrustCertificate] = []
+        excluded: List[Dict[str, Any]] = []
+        for r in rows:
+            tc, problem = tolerant_tc_from_json(r["content_json"])
+            if tc is not None:
+                tcs.append(tc)
+            else:
+                excluded.append(problem)
+        return tcs, excluded
+
+    def integrity_scan(self, max_details: int = 10) -> Dict[str, Any]:
+        """Archive-wide malformed-record census (D2) — same contract as
+        CertificateStore.integrity_scan."""
+        rows = self._conn.execute(
+            "SELECT content_json FROM trust_certificates"
+        ).fetchall()
+        excluded: List[Dict[str, Any]] = []
+        for r in rows:
+            tc, problem = tolerant_tc_from_json(r["content_json"])
+            if tc is None:
+                excluded.append(problem)
+        return {
+            "malformed_record_count": len(excluded),
+            "excluded_record_count": len(excluded),
+            "excluded": excluded[:max_details],
+        }
 
     # ---- Chain IDs --------------------------------------------------------- #
 

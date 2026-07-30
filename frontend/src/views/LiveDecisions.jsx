@@ -394,6 +394,17 @@ export default function LiveDecisions() {
   const decisions = data?.decisions || [];
   const holds = holdData?.holds || [];
   const escalations = escData?.escalations || [];
+  // Malformed-record exclusions reported by the tolerant list
+  // boundaries (D2): valid rows stay displayed; excluded rows are
+  // surfaced as a bounded, names-only integrity notice.
+  const excludedTotal =
+    (data?.excluded_malformed_count || 0)
+    + (holdData?.excluded_malformed_count || 0)
+    + (escData?.excluded_malformed_count || 0);
+  const integrityWarnings = (data?.integrity_warnings || [])
+    .concat(holdData?.integrity_warnings || [])
+    .concat(escData?.integrity_warnings || [])
+    .slice(0, 10);
 
   // Common "refresh everything" after an override — the override
   // affects the stream (badge appears), the source queue (TC drops
@@ -408,6 +419,31 @@ export default function LiveDecisions() {
   return (
     <div className="space-y-6">
       {selectedTc && <TCDetailPanel certificateId={selectedTc} onClose={() => setSelectedTc(null)} />}
+
+      {excludedTotal > 0 && (
+        <div
+          role="alert"
+          className="bg-red-900/20 border border-red-800 rounded-lg p-3 text-xs text-red-200"
+        >
+          <span className="font-semibold">
+            {excludedTotal} stored record{excludedTotal === 1 ? '' : 's'} failed
+            integrity validation and {excludedTotal === 1 ? 'was' : 'were'} excluded
+            from these feeds.
+          </span>{' '}
+          Valid records remain displayed; chain verification reports the
+          underlying problem.
+          {integrityWarnings.length > 0 && (
+            <span className="block mt-1 font-mono text-red-300/80">
+              {integrityWarnings.map((w, i) => (
+                <span key={`${w.certificate_id || 'unknown'}-${i}`} className="mr-2">
+                  {(w.certificate_id || '(unknown id)').slice(0, 14)}…
+                  [{(w.invalid_fields || []).join(', ') || w.failure_category}]
+                </span>
+              ))}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="bg-gray-900 rounded-lg border border-yellow-800 p-4">
         <h3 className="text-sm font-medium text-yellow-400 mb-1">Hold Queue ({holds.length})</h3>

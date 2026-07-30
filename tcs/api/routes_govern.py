@@ -437,7 +437,10 @@ def decisions_stream(
     the override is a separate annotation, never a mutation.
     """
     store = request.app.state.store
-    tcs = store.list_recent(limit=limit)
+    # Tolerant list boundary (D2): malformed stored rows are excluded
+    # and surfaced as bounded integrity warnings — never served as
+    # ordinary certificates, never fatal to the feed.
+    tcs, excluded = store.list_recent_with_integrity(limit=limit)
     overrides = _override_records_by_tc(store, [tc.certificate_id for tc in tcs])
     decisions = []
     for tc in tcs:
@@ -456,7 +459,14 @@ def decisions_stream(
             "risk_tier": d["risk_tier"],
             "override": overrides.get(d["certificate_id"]),
         })
-    return {"count": len(decisions), "decisions": decisions}
+    # `count` counts VALID displayed records; excluded malformed rows
+    # are reported separately and identified by name, never by value.
+    return {
+        "count": len(decisions),
+        "decisions": decisions,
+        "excluded_malformed_count": len(excluded),
+        "integrity_warnings": excluded[:10],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -490,7 +500,8 @@ def hold_queue(
     out of the queue).
     """
     store = request.app.state.store
-    tcs = store.list_recent(limit=limit * 3)  # over-fetch to find holds
+    # Tolerant list boundary (D2) — over-fetch to find holds.
+    tcs, excluded = store.list_recent_with_integrity(limit=limit * 3)
     overridden = _overridden_tc_ids(store)
     holds = []
     for tc in tcs:
@@ -511,7 +522,12 @@ def hold_queue(
         })
         if len(holds) >= limit:
             break
-    return {"count": len(holds), "holds": holds}
+    return {
+        "count": len(holds),
+        "holds": holds,
+        "excluded_malformed_count": len(excluded),
+        "integrity_warnings": excluded[:10],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -633,7 +649,8 @@ def escalation_queue(
     (same exclusion mechanism the Hold Queue uses).
     """
     store = request.app.state.store
-    tcs = store.list_recent(limit=limit * 3)
+    # Tolerant list boundary (D2).
+    tcs, excluded = store.list_recent_with_integrity(limit=limit * 3)
     overridden = _overridden_tc_ids(store)
     escalations = []
     for tc in tcs:
@@ -665,7 +682,12 @@ def escalation_queue(
         })
         if len(escalations) >= limit:
             break
-    return {"count": len(escalations), "escalations": escalations}
+    return {
+        "count": len(escalations),
+        "escalations": escalations,
+        "excluded_malformed_count": len(excluded),
+        "integrity_warnings": excluded[:10],
+    }
 
 
 class EscalationOverrideBody(BaseModel):
