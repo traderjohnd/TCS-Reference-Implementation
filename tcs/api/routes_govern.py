@@ -22,11 +22,24 @@ returned with HTTP 200. The calling application reads
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+
+
+# Override reason format is "{decision}: {justification} (by {actor})".
+# The actor marker is anchored to the END of the string so that a
+# justification that itself contains "(by " (e.g. a quoted user note)
+# cannot be mistaken for the actor segment. Decision is everything up
+# to the first ": "; justification is everything between that and the
+# final actor marker; actor is the contents of the trailing "(by ...)".
+_OVERRIDE_REASON_RE = re.compile(
+    r"^(?P<decision>[^:]+):\s*(?P<justification>.*?)\s*\(by\s+(?P<actor>[^)]+)\)\s*$",
+    re.DOTALL,
+)
 
 from tcs.adapters.rag_adapter import RAGAdapter, RAGChunk, RAGOutput
 
@@ -171,29 +184,80 @@ def _override_records_by_tc(store, tc_ids: list) -> Dict[str, Dict[str, Any]]:
         cid = r["certificate_id"]
         if cid in out:
             continue  # keep the most recent only
-        reason_str = r["reason"] or ""
-        # Parse "{decision}: {justification} (by {actor})"
+        out[cid] = _parse_override_reason(r["reason"] or "", r["occurred_at"])
+    return out
+
+
+def _parse_override_reason(reason_str: str, occurred_at: str) -> Dict[str, Any]:
+    """
+    Parse the lifecycle_events.reason string into the override dict
+    shape consumed by /govern/decisions/stream rows and the
+    override-history endpoint.
+
+    The reason format written by the override endpoints is:
+        "{decision}: {justification} (by {actor})"
+
+    The parser anchors the actor marker to the END of the string,
+    which makes it robust to a justification that itself contains
+    the substring "(by " — e.g. a quoted note like
+    "Approved (by Compliance memo 2026-Q2)." The end-anchored
+    regex finds only the trailing "(by ...)" and treats everything
+    before it as the justification.
+    """
+    m = _OVERRIDE_REASON_RE.match(reason_str)
+    if m:
+        decision = m.group("decision").strip() or None
+        justification = m.group("justification")
+        actor = m.group("actor").strip() or None
+    else:
+        # Fall back to a permissive shape so the audit row still
+        # round-trips even if a future writer produces a non-standard
+        # reason. Callers expect the keys to be present.
         decision = None
         justification = reason_str
         actor = None
-        if ":" in reason_str:
-            decision, _, rest = reason_str.partition(":")
-            decision = decision.strip()
-            rest = rest.strip()
-            if rest.endswith(")") and "(by " in rest:
-                justification, _, by_tail = rest.rpartition("(by ")
-                justification = justification.strip().rstrip()
-                actor = by_tail.rstrip(")").strip()
-            else:
-                justification = rest
-        out[cid] = {
-            "override_decision": decision,
-            "override_actor": actor,
-            "override_at": r["occurred_at"],
-            "override_reason_text": justification,
-            "raw_reason": reason_str,
-        }
-    return out
+    return {
+        "override_decision": decision,
+        "override_actor": actor,
+        "override_at": occurred_at,
+        "override_reason_text": justification,
+        "raw_reason": reason_str,
+    }
+
+
+@router.get("/govern/decisions/{tc_id}/override-history")
+def override_history(tc_id: str, request: Request) -> Dict[str, Any]:
+    """
+    Return every ``override_applied`` lifecycle event for the given TC,
+    most recent first.
+
+    The decisions-stream endpoint surfaces only the latest override
+    per TC (cheap and bounded for the live feed). This endpoint is the
+    audit-grade view: the override badge expands into it so a reviewer
+    can see every event recorded against the certificate.
+
+    Returns 200 with ``count=0`` and an empty list when the TC has no
+    override events (or does not exist). We do not 404 on unknown
+    certificate_id because the UI already shows the override badge
+    only when a corresponding event exists; conflating "TC unknown"
+    with "no overrides" would not improve the audit story.
+    """
+    store = request.app.state.store
+    rows = store._conn.execute(
+        "SELECT reason, occurred_at FROM lifecycle_events "
+        "WHERE certificate_id = ? AND to_state = 'override_applied' "
+        "ORDER BY occurred_at DESC",
+        (tc_id,),
+    ).fetchall()
+    events = [
+        _parse_override_reason(r["reason"] or "", r["occurred_at"])
+        for r in rows
+    ]
+    return {
+        "certificate_id": tc_id,
+        "count": len(events),
+        "events": events,
+    }
 
 
 @router.get("/govern/decisions/stream")

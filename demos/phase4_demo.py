@@ -83,7 +83,7 @@ DEMOS: List[Dict[str, Any]] = [
         # elevated 0.85 MedDev K threshold), while attribution stays
         # clean (every chunk has source_doc + version → S_base stays
         # above κ=0.90). Deterministic HOLD via Priority 4.
-        "query": "Pneumonia treatment guidelines for pediatric patients with respiratory failure and sepsis",
+        "query": "What are the pneumonia treatment guidelines for pediatric patients with respiratory failure and sepsis?",
         "expected_decision": "Hold",
     },
     {
@@ -115,13 +115,24 @@ class _RemoteClient:
         self._requests = __import__("requests")
         self._base = base_url.rstrip("/")
 
+    def _url(self, path: str) -> str:
+        # Routes are mounted at /v2 by app.py. The in-process _Adapter
+        # already prepends "/v2" — match that convention here so the
+        # ``demo["query"]`` payload, route strings, and adapter contracts
+        # are all interchangeable between in-process and --base-url runs.
+        if path.startswith("/v2/"):
+            return self._base + path
+        if path.startswith("/"):
+            return self._base + "/v2" + path
+        return self._base + "/v2/" + path
+
     def post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
-        r = self._requests.post(self._base + path, json=json, timeout=60)
+        r = self._requests.post(self._url(path), json=json, timeout=60)
         r.raise_for_status()
         return r.json()
 
     def get(self, path: str) -> Dict[str, Any]:
-        r = self._requests.get(self._base + path, timeout=60)
+        r = self._requests.get(self._url(path), timeout=60)
         r.raise_for_status()
         return r.json()
 

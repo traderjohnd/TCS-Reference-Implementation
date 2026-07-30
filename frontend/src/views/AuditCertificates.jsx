@@ -1,6 +1,51 @@
 import { useState } from 'react';
 import { useApi, apiFetch, usePolling } from '../hooks/useApi';
 import StatusBadge from '../components/StatusBadge';
+import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
+
+// Canonical BACK dimension order. Any dimension-keyed dict surfaced in
+// the Decision Summary technical sections is reordered to this sequence
+// so the display matches the spec (Boundedness, Attribution, Compliance,
+// Known) regardless of the backend's JSON serialization order.
+const BACK_ORDER = ['B', 'A', 'C', 'K'];
+function reorderBack(dict) {
+  if (!dict || typeof dict !== 'object') return dict;
+  const out = {};
+  for (const k of BACK_ORDER) {
+    if (k in dict) out[k] = dict[k];
+  }
+  // Preserve any non-BACK keys at the end (defensive — current TCs
+  // don't include extra keys but the dataclass schema doesn't forbid
+  // them).
+  for (const k of Object.keys(dict)) {
+    if (!BACK_ORDER.includes(k)) out[k] = dict[k];
+  }
+  return out;
+}
+// Keys in the TC dict whose values are BACK-dimension dicts and should
+// render in canonical BACK order.
+const BACK_KEYED_TC_FIELDS = new Set([
+  'component_scores',
+  'component_weights',
+  'gate_results',
+  'thresholds',
+]);
+
+// Tiny pill used by the Hash Chain Walk to show per-row integrity
+// outcomes (content hash, linkage, sequence). Green check for true,
+// red cross for false. Pure presentation.
+function Check({ label, ok }) {
+  return (
+    <span className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 border ${
+      ok
+        ? 'border-green-800 bg-green-900/30 text-green-300'
+        : 'border-red-800 bg-red-900/30 text-red-300'
+    }`}>
+      <span className="font-mono">{ok ? '✓' : '✗'}</span>
+      <span>{label}</span>
+    </span>
+  );
+}
 
 // ─── GovernanceRuleMatches panel ────────────────────────────────────────────
 //
@@ -269,6 +314,18 @@ export default function AuditCertificates() {
   const { data, refetch } = useApi(`/certificates?limit=${limit}`);
   const [selectedTc, setSelectedTc] = useState(null);
   const [tcDetail, setTcDetail] = useState(null);
+  // The TC's linked ResponseArtifact (Phase 5 path). May be null for
+  // TCs issued through the legacy /v2/govern path or for Phase 4 demo
+  // TCs that pre-date the artifact tier. Used to surface the original
+  // prompt above the plain-language summary.
+  const [tcArtifact, setTcArtifact] = useState(null);
+  // Override events for the selected TC, pulled from
+  // /v2/govern/decisions/{tc_id}/override-history. Drives the
+  // "Human override" section inside PlainLanguageExplanation.
+  const [tcOverrides, setTcOverrides] = useState([]);
+  // Collapsible technical 11-layer dump. Default closed so casual readers
+  // see only the prompt + plain-language summary; auditors expand.
+  const [technicalOpen, setTechnicalOpen] = useState(false);
   const [verifyResult, setVerifyResult] = useState(null);
   const [verifying, setVerifying] = useState(false);
   const [searchId, setSearchId] = useState('');
@@ -276,6 +333,10 @@ export default function AuditCertificates() {
   const [chainSummary, setChainSummary] = useState(null);
   const [chainVerifyResult, setChainVerifyResult] = useState(null);
   const [loadingChain, setLoadingChain] = useState(false);
+  // Chain walk-through (examiner-grade hash-chain audit view). Loaded
+  // when a chain is selected in the Chain Explorer.
+  const [chainWalk, setChainWalk] = useState(null);
+  const [loadingChainWalk, setLoadingChainWalk] = useState(false);
   const { data: liveMetrics } = useApi('/metrics/live');
 
   const certs = data?.certificates || [];
@@ -285,8 +346,33 @@ export default function AuditCertificates() {
       const tc = await apiFetch(`/certificates/${id}`);
       setTcDetail(tc);
       setSelectedTc(id);
+      setTechnicalOpen(false);
+      // Try to fetch the linked artifact. For Phase 5 TCs issued via
+      // /v2/query, tc.subject_id == artifact.artifact_id. For older
+      // TCs the artifact endpoint will 404 and we leave the prompt
+      // panel showing a "not available" message.
+      setTcArtifact(null);
+      if (tc?.subject_id) {
+        try {
+          const art = await apiFetch(`/artifacts/${tc.subject_id}`);
+          setTcArtifact(art);
+        } catch {
+          setTcArtifact(null);
+        }
+      }
+      // Override history: existing endpoint returns 200 with count=0
+      // when the TC has no overrides (or is unknown), so no try/catch
+      // needed for the empty case.
+      try {
+        const hist = await apiFetch(`/govern/decisions/${id}/override-history`);
+        setTcOverrides(hist?.events || []);
+      } catch {
+        setTcOverrides([]);
+      }
     } catch {
       setTcDetail(null);
+      setTcArtifact(null);
+      setTcOverrides([]);
     }
   };
 
@@ -315,7 +401,7 @@ export default function AuditCertificates() {
   const chainIds = liveMetrics?.chain_ids || [];
 
   const loadChainSummary = async (chainId) => {
-    if (!chainId) { setChainSummary(null); return; }
+    if (!chainId) { setChainSummary(null); setChainWalk(null); return; }
     setLoadingChain(true);
     setChainVerifyResult(null);
     try {
@@ -325,6 +411,59 @@ export default function AuditCertificates() {
       setChainSummary(null);
     }
     setLoadingChain(false);
+    // Also fetch the full walk so the examiner-grade hash-chain
+    // panel populates without an extra user click.
+    setLoadingChainWalk(true);
+    try {
+      const walk = await apiFetch(`/certificates/chain/${chainId}/walk`);
+      setChainWalk(walk);
+    } catch {
+      setChainWalk(null);
+    }
+    setLoadingChainWalk(false);
+  };
+
+  const copyWalkJson = async () => {
+    if (!chainWalk) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(chainWalk, null, 2));
+    } catch {
+      // Clipboard API may be unavailable in some browser contexts;
+      // silent failure is fine — the JSON is also visible inline.
+    }
+  };
+
+  const downloadWalkCsv = () => {
+    if (!chainWalk?.rows?.length) return;
+    const header = [
+      'chain_sequence', 'certificate_id', 'decision',
+      'evaluation_timestamp', 'lifecycle_state',
+      'tc_hash', 'previous_tc_hash',
+      'content_hash_ok', 'linkage_ok', 'sequence_ok',
+    ];
+    const lines = [header.join(',')];
+    for (const r of chainWalk.rows) {
+      const cells = header.map((k) => {
+        const v = r[k];
+        if (v === null || v === undefined) return '';
+        const s = String(v);
+        // Escape commas and quotes for CSV safety.
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+          return `"${s.replace(/"/g, '""')}"`;
+        }
+        return s;
+      });
+      lines.push(cells.join(','));
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `chain-${chainWalk.chain_id}-walk.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   const verifySelectedChain = async () => {
@@ -472,6 +611,141 @@ export default function AuditCertificates() {
         )}
       </div>
 
+      {/* ── Examiner-grade Hash Chain Walk ─────────────────────────────── */}
+      {selectedChain && (
+        <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
+          <div className="flex items-baseline justify-between mb-3 gap-3 flex-wrap">
+            <div>
+              <h3 className="text-sm font-medium text-gray-300">
+                Hash Chain Walk —{' '}
+                <span className="font-mono text-xs text-gray-500">{selectedChain}</span>
+              </h3>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                Examiner-grade walk-through. Every TC in the chain in
+                sequence, with content-hash, linkage, and sequence
+                integrity checks per row. Read-only.
+              </p>
+            </div>
+            {chainWalk?.rows?.length > 0 && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={copyWalkJson}
+                  className="text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 px-3 py-1.5 rounded"
+                  title="Copy the full walk payload as JSON"
+                >
+                  Copy JSON
+                </button>
+                <button
+                  onClick={downloadWalkCsv}
+                  className="text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 px-3 py-1.5 rounded"
+                  title="Download the walk as CSV for offline audit"
+                >
+                  Download CSV
+                </button>
+              </div>
+            )}
+          </div>
+
+          {loadingChainWalk && (
+            <p className="text-xs text-gray-500 italic">Loading chain walk…</p>
+          )}
+
+          {!loadingChainWalk && chainWalk && chainWalk.count === 0 && (
+            <p className="text-xs text-gray-500 italic">
+              No TCs in this chain.
+            </p>
+          )}
+
+          {!loadingChainWalk && chainWalk && chainWalk.count > 0 && (
+            <>
+              {/* Top-level chain status banner */}
+              <div className={`mb-3 rounded border px-3 py-2 text-sm flex items-center justify-between ${
+                chainWalk.chain_intact
+                  ? 'bg-green-900/20 border-green-800 text-green-300'
+                  : 'bg-red-900/20 border-red-800 text-red-300'
+              }`}>
+                <span>
+                  Chain integrity:{' '}
+                  <span className="font-semibold">
+                    {chainWalk.chain_intact ? 'VERIFIED ✓' : 'BROKEN ✗'}
+                  </span>
+                </span>
+                <span className="text-xs text-gray-400 font-mono">
+                  {chainWalk.count} TC{chainWalk.count === 1 ? '' : 's'}
+                </span>
+              </div>
+
+              {/* Per-TC walk */}
+              <div className="space-y-3">
+                {chainWalk.rows.map((row, idx) => {
+                  const rowOk = row.content_hash_ok && row.linkage_ok && row.sequence_ok;
+                  const isFirst = idx === 0;
+                  return (
+                    <div key={row.certificate_id || idx}>
+                      <div className={`border rounded p-3 ${
+                        rowOk
+                          ? 'bg-gray-800/40 border-gray-700'
+                          : 'bg-red-900/15 border-red-800'
+                      }`}>
+                        <div className="flex items-baseline justify-between gap-3 flex-wrap mb-2">
+                          <div className="flex items-baseline gap-2">
+                            <span className="text-[11px] uppercase tracking-wide text-gray-500 font-mono">
+                              # {row.chain_sequence ?? '?'}
+                            </span>
+                            <button
+                              onClick={() => viewDetail(row.certificate_id)}
+                              className="text-sm font-mono text-blue-300 hover:text-blue-200 underline-offset-2 hover:underline"
+                              title="Open TC Detail"
+                            >
+                              {(row.certificate_id || '').slice(0, 14)}…
+                            </button>
+                            <StatusBadge decision={row.decision} />
+                          </div>
+                          <div className="text-[11px] text-gray-500 font-mono">
+                            {row.evaluation_timestamp}
+                            {row.lifecycle_state ? <> · {row.lifecycle_state}</> : null}
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
+                          <div>
+                            <div className="text-gray-500">tc_hash</div>
+                            <div className="font-mono text-gray-300 break-all">
+                              {row.tc_hash || '(missing)'}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-gray-500">previous_tc_hash</div>
+                            <div className="font-mono text-gray-300 break-all">
+                              {isFirst
+                                ? <span className="italic text-gray-500">(none — chain start)</span>
+                                : row.previous_tc_hash || '(missing)'}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+                          <Check label="content hash"      ok={row.content_hash_ok} />
+                          <Check label="linkage"           ok={row.linkage_ok} />
+                          <Check label="sequence"          ok={row.sequence_ok} />
+                        </div>
+                      </div>
+
+                      {/* Arrow between rows visualizing the linkage */}
+                      {idx < chainWalk.rows.length - 1 && (
+                        <div className="flex items-center justify-center my-1 text-gray-600 text-xs font-mono">
+                          │ previous_tc_hash ▼
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       <div className="flex gap-6">
         <div className={`${selectedTc ? 'w-1/2' : 'w-full'} transition-all`}>
           <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
@@ -512,40 +786,106 @@ export default function AuditCertificates() {
           <div className="w-1/2">
             <div className="bg-gray-900 rounded-lg border border-gray-800 p-4 sticky top-4">
               <div className="flex justify-between items-center mb-3">
-                <h3 className="text-sm font-medium text-white">TC Detail — All 11 Layers</h3>
-                <button onClick={() => { setSelectedTc(null); setTcDetail(null); }}
+                <div className="flex items-center gap-2">
+                  <StatusBadge decision={tcDetail.decision} />
+                  <h3 className="text-sm font-medium text-white">Decision Summary</h3>
+                </div>
+                <button onClick={() => { setSelectedTc(null); setTcDetail(null); setTcArtifact(null); setTcOverrides([]); }}
                   className="text-gray-400 hover:text-white">&times;</button>
               </div>
               <div className="space-y-3 max-h-[75vh] overflow-y-auto">
-                {TC_LAYERS.map(({ title, fields, key }) => (
-                  <div key={title} className="border border-gray-800 rounded p-2">
-                    <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider mb-1">{title}</h4>
-                    {fields ? (
-                      <dl className="space-y-0.5">
-                        {fields.map((f) => (
-                          <div key={f} className="flex justify-between text-xs">
-                            <dt className="text-gray-500">{f}</dt>
-                            <dd className="text-gray-300 font-mono max-w-[55%] text-right truncate">
-                              {typeof tcDetail[f] === 'object' ? JSON.stringify(tcDetail[f]) : String(tcDetail[f] ?? '')}
-                            </dd>
-                          </div>
-                        ))}
-                      </dl>
-                    ) : key && tcDetail[key] ? (
-                      <pre className="text-xs text-gray-400 font-mono overflow-x-auto">
-                        {JSON.stringify(tcDetail[key], null, 2)}
-                      </pre>
-                    ) : (
-                      <span className="text-xs text-gray-600">N/A</span>
-                    )}
+                {/* ── ① What was asked ─────────────────────────────────── */}
+                <div className="bg-gray-900 border border-gray-700 rounded-lg p-3">
+                  <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-1.5">
+                    What was asked
                   </div>
-                ))}
-                {/* Governance rule evidence — surfaces the rule layer that
-                    influenced this decision, alongside the standards
-                    composer audit and the rest of the TC layers. */}
-                <GovernanceRuleMatches
-                  matches={tcDetail.governance_rule_matches}
+                  {tcArtifact?.prompt ? (
+                    <blockquote className="text-sm text-gray-200 italic border-l-2 border-gray-700 pl-3 whitespace-pre-wrap leading-relaxed">
+                      “{tcArtifact.prompt}”
+                    </blockquote>
+                  ) : tcArtifact?.raw_output && tcArtifact?.generation_mode === 'human_composed' ? (
+                    <div>
+                      <div className="text-[10px] text-gray-500 mb-1">Human-composed draft (no prompt)</div>
+                      <blockquote className="text-sm text-gray-200 italic border-l-2 border-gray-700 pl-3 whitespace-pre-wrap leading-relaxed">
+                        “{tcArtifact.raw_output}”
+                      </blockquote>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-gray-500 italic">
+                      Prompt not available — this certificate predates the
+                      artifact tier or was issued through a non-artifact path.
+                    </p>
+                  )}
+                </div>
+
+                {/* ── ② Plain-language summary ─────────────────────────── */}
+                <PlainLanguageExplanation
+                  tc={tcDetail}
+                  prompt={tcArtifact?.prompt || (tcArtifact?.generation_mode === 'human_composed' ? tcArtifact?.raw_output : null)}
+                  overrides={tcOverrides}
                 />
+
+                {/* ── ③ Collapsible technical detail ───────────────────── */}
+                <div className="border border-gray-800 rounded">
+                  <button
+                    onClick={() => setTechnicalOpen((v) => !v)}
+                    className="w-full flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-blue-400 hover:bg-gray-800/60 transition-colors"
+                    aria-expanded={technicalOpen}
+                  >
+                    <span>Technical Detail (all 11 layers)</span>
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      className={`w-3 h-3 transition-transform ${technicalOpen ? '' : '-rotate-90'}`}
+                    >
+                      <path
+                        fillRule="evenodd"
+                        d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"
+                        clipRule="evenodd"
+                      />
+                    </svg>
+                  </button>
+                  {technicalOpen && (
+                    <div className="space-y-3 p-2 border-t border-gray-800">
+                      {TC_LAYERS.map(({ title, fields, key }) => (
+                        <div key={title} className="border border-gray-800 rounded p-2">
+                          <h4 className="text-xs font-medium text-blue-400 uppercase tracking-wider mb-1">{title}</h4>
+                          {fields ? (
+                            <dl className="space-y-0.5">
+                              {fields.map((f) => (
+                                <div key={f} className="flex justify-between text-xs">
+                                  <dt className="text-gray-500">{f}</dt>
+                                  <dd className="text-gray-300 font-mono max-w-[55%] text-right truncate">
+                                    {typeof tcDetail[f] === 'object' ? JSON.stringify(tcDetail[f]) : String(tcDetail[f] ?? '')}
+                                  </dd>
+                                </div>
+                              ))}
+                            </dl>
+                          ) : key && tcDetail[key] ? (
+                            <pre className="text-xs text-gray-400 font-mono overflow-x-auto">
+                              {JSON.stringify(
+                                BACK_KEYED_TC_FIELDS.has(key)
+                                  ? reorderBack(tcDetail[key])
+                                  : tcDetail[key],
+                                null,
+                                2,
+                              )}
+                            </pre>
+                          ) : (
+                            <span className="text-xs text-gray-600">N/A</span>
+                          )}
+                        </div>
+                      ))}
+                      {/* Governance rule evidence — surfaces the rule layer that
+                          influenced this decision, alongside the standards
+                          composer audit and the rest of the TC layers. */}
+                      <GovernanceRuleMatches
+                        matches={tcDetail.governance_rule_matches}
+                      />
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           </div>

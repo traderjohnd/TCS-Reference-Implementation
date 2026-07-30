@@ -118,6 +118,15 @@ function DimensionTrends({ records }) {
           contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8, fontSize: 12 }}
           labelFormatter={fmt}
           formatter={(v, name) => [v?.toFixed(4), name]}
+          // Pin the hover order to BACK (Boundedness, Attribution,
+          // Compliance, Known). Recharts' default Tooltip orders items
+          // by value descending, which produced an inconsistent reading
+          // order (e.g. ABCK when A happened to score highest). The
+          // dimensions have a canonical order in the spec; enforce it.
+          itemSorter={(item) => {
+            const order = { B: 0, A: 1, C: 2, K: 3 };
+            return order[item.dataKey] ?? 99;
+          }}
         />
         <Legend content={() => (
           <div style={{ display: 'flex', justifyContent: 'center', gap: 16, fontSize: 11, marginTop: 4 }}>

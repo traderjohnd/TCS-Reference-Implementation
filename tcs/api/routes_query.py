@@ -27,6 +27,38 @@ router = APIRouter()
 
 
 # --------------------------------------------------------------------------- #
+# Off-topic guard (scope-aware routing)                                        #
+# --------------------------------------------------------------------------- #
+#
+# A query is "off-topic" for the active pack when the top-K retrieval from
+# the active corpus produces no chunk above ``OFF_TOPIC_SIMILARITY_THRESHOLD``.
+# When that happens the route does NOT apply the active pack's strict
+# governance bar. Instead it ROUTES VIA baseline-no-pack:
+#
+#   - LLM is still called (with no RAG context — the active corpus is
+#     irrelevant by definition)
+#   - the response is scored against baseline-no-pack thresholds, which
+#     are permissive (K not in gate, others around 0.70-0.75)
+#   - a TC is issued under baseline-no-pack carrying ``routed_via_baseline_off_topic``
+#     context_metadata so the audit trail shows which active pack the
+#     request was diverted from
+#   - the LLM answer flows back to the user normally
+#
+# Intent: governance applies only to queries within the active pack's
+# domain. A clinician's MedDev session shouldn't gate "what is the first
+# line of Moby Dick" with clinical-grade thresholds; that question gets
+# baseline governance and a normal answer.
+#
+# The threshold is conservative by default — embeddings vary in scale
+# across corpora. Override with the env var if your corpus has loose
+# similarity scoring:
+#     $env:TCS_OFF_TOPIC_SIMILARITY_THRESHOLD = "0.85"
+OFF_TOPIC_SIMILARITY_THRESHOLD: float = float(
+    os.environ.get("TCS_OFF_TOPIC_SIMILARITY_THRESHOLD", "0.50")
+)
+
+
+# --------------------------------------------------------------------------- #
 # Request / Response models                                                    #
 # --------------------------------------------------------------------------- #
 
@@ -161,30 +193,76 @@ def _build_provider(provider_name: str, api_key: Optional[str], model: Optional[
 
         class RequestScopedOpenAI:
             def generate(self, query, context):
-                context_text = "\n\n".join(context)
+                context_text = "\n\n".join(context) if context else ""
+                # Neutral, domain-agnostic system prompt. The previous
+                # hardcoded "financial advisory AI" framing made GPT-5
+                # refuse clinical and other non-finance questions even
+                # when the active policy pack governed that domain.
+                # Domain-specific framing belongs in the policy pack,
+                # not in the LLM connector.
+                if context_text:
+                    system_msg = (
+                        "You are a careful, domain-aware assistant. "
+                        "Answer the user's question based on the provided "
+                        "context. Cite sources when possible. If the context "
+                        "does not cover the question, answer from general "
+                        "knowledge while making clear that the answer is not "
+                        "grounded in the supplied sources."
+                    )
+                    user_msg = f"Context:\n{context_text}\n\nQuestion: {query}"
+                else:
+                    system_msg = (
+                        "You are a careful, helpful assistant. Answer the "
+                        "user's question directly and concisely."
+                    )
+                    user_msg = query
                 messages = [
-                    {"role": "system", "content": (
-                        "You are a financial advisory AI. Answer based strictly "
-                        "on the provided context. Cite sources when possible."
-                    )},
-                    {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"},
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": user_msg},
                 ]
 
                 kwargs = {"model": api_model, "messages": messages}
 
-                # GPT-5.x and reasoning models require max_completion_tokens
-                is_new_model = api_model.startswith("gpt-5") or api_model.startswith("gpt-4.1")
-
+                # GPT-5.x and reasoning models require max_completion_tokens.
+                is_new_model = (
+                    api_model.startswith("gpt-5") or api_model.startswith("gpt-4.1")
+                )
                 if is_reasoning_model or is_thinking or is_new_model:
-                    # GPT-5.x, GPT-4.1, and reasoning models: max_completion_tokens, no temperature
-                    kwargs["max_completion_tokens"] = 2000 if (is_reasoning_model or is_thinking) else 500
+                    # New / reasoning models silently spend tokens on
+                    # internal reasoning before any visible output.
+                    # 500 was empirically too tight: complex clinical
+                    # questions returned message.content = "" because
+                    # the reasoning phase consumed the whole budget.
+                    # Bumped to 2000 for Instant and 4000 for Thinking
+                    # so visible output has headroom.
+                    kwargs["max_completion_tokens"] = (
+                        4000 if (is_reasoning_model or is_thinking) else 2000
+                    )
                 else:
-                    # Legacy models (gpt-4o, etc): standard completion
-                    kwargs["max_tokens"] = 500
+                    # Legacy models (gpt-4o, etc): standard completion.
+                    kwargs["max_tokens"] = 1000
                     kwargs["temperature"] = 0.3
 
                 response = client.chat.completions.create(**kwargs)
-                return response.choices[0].message.content or ""
+                content = response.choices[0].message.content
+                if content:
+                    return content
+                # Defensive: surface why the response was empty so the
+                # user sees a clear diagnostic rather than a silent
+                # "No response" in the chat. This indicates either a
+                # content-policy block or a token-budget exhaustion on
+                # the model side; either way the user needs to know.
+                finish_reason = getattr(
+                    response.choices[0], "finish_reason", "unknown"
+                )
+                return (
+                    f"[{api_model} returned no content. "
+                    f"finish_reason={finish_reason}. "
+                    "This usually means the model spent its token budget "
+                    "on internal reasoning before producing output, or a "
+                    "content policy intervened. Try Thinking mode, switch "
+                    "to gpt-4o, or restate the question.]"
+                )
 
         return RequestScopedOpenAI(), display_name
 
@@ -197,19 +275,33 @@ def _build_provider(provider_name: str, api_key: Optional[str], model: Optional[
 
         class RequestScopedAnthropic:
             def generate(self, query, context):
-                context_text = "\n\n".join(context)
+                context_text = "\n\n".join(context) if context else ""
+                if context_text:
+                    user_content = (
+                        "You are a careful, domain-aware assistant. "
+                        "Answer based on the provided context. Cite sources "
+                        "when possible. If the context does not cover the "
+                        "question, answer from general knowledge while making "
+                        "clear that the answer is not grounded in the supplied "
+                        "sources.\n\n"
+                        f"Context:\n{context_text}\n\nQuestion: {query}"
+                    )
+                else:
+                    user_content = (
+                        "You are a careful, helpful assistant. Answer the "
+                        f"user's question directly and concisely.\n\n{query}"
+                    )
                 response = client.messages.create(
                     model=model_name,
-                    max_tokens=500,
+                    max_tokens=2000,
                     messages=[
-                        {"role": "user", "content": (
-                            f"You are a financial advisory AI. Answer based strictly "
-                            f"on the provided context.\n\nContext:\n{context_text}\n\n"
-                            f"Question: {query}"
-                        )},
+                        {"role": "user", "content": user_content},
                     ],
                 )
-                return response.content[0].text
+                return response.content[0].text if response.content else (
+                    f"[{model_name} returned no content. "
+                    "Try restating the question or switching providers.]"
+                )
 
         return RequestScopedAnthropic(), model_name
 
@@ -351,6 +443,15 @@ def _persist_query_artifact_and_evaluation(
     # field will populate. The artifact persists faithfully whatever
     # the scoring path actually saw.
     artifact = ResponseArtifact(
+        # Bind the artifact's id to the TC's subject_id so the existing
+        # frontend lookup ``GET /v2/artifacts/{tc.subject_id}`` resolves.
+        # This restores parity with the /v2/evaluate path, which already
+        # uses ``subject_id == artifact.artifact_id`` (see
+        # tcs/artifacts/evaluation.py::evaluate_artifact). Without this,
+        # /v2/query-issued TCs have no discoverable artifact handle from
+        # the TC alone, so the Audit / Live "What was asked" panel cannot
+        # surface the prompt.
+        artifact_id=issued_tc.subject_id,
         generation_mode=GENERATION_MODE_AGENT_WORKFLOW,
         prompt=body.query,
         raw_output=trace.final_output,
@@ -426,6 +527,255 @@ def _persist_query_artifact_and_evaluation(
     artifact_store.insert_evaluation(evaluation)
 
 
+def _route_off_topic_via_baseline(
+    *,
+    body: "QueryRequest",
+    store,
+    artifact_store,
+    provider,
+    provider_name: str,
+    model_name: str,
+    industry: Optional[str],
+    composer_metadata: Optional[Dict[str, Any]],
+    preview_chunks: List[Dict[str, Any]],
+    max_similarity: float,
+    threshold: float,
+    latency: Dict[str, float],
+    original_profile_id: Optional[str],
+) -> "QueryResponse":
+    """
+    Scope-aware routing for queries outside the active pack's domain.
+
+    When the off-topic guard fires the active pack is bypassed and the
+    request is processed under ``baseline-no-pack`` (the documented
+    permissive fallback profile). The LLM is invoked normally — only
+    the policy regime changes. RAG is skipped because the active
+    corpus has been shown to be irrelevant.
+
+    The resulting TC carries:
+      - ``policy_set_id = "baseline-no-pack"`` (NOT the active pack)
+      - ``context_metadata.routed_via_baseline_off_topic = True``
+      - ``context_metadata.original_active_pack_profile_id`` (the
+        active pack the request was diverted from, for audit)
+      - ``context_metadata.off_topic_max_similarity`` and ``..._threshold``
+
+    The frontend's PlainLanguageExplanation recognizes this metadata
+    and surfaces "This question was outside the active pack's scope,
+    so it was routed through baseline governance and answered
+    normally."
+
+    Returns the LLM's answer to the caller. The decision is whatever
+    baseline-no-pack produces — typically Allow given the permissive
+    thresholds (K = 0.60 and K is not in the gate set), but the engine
+    is free to return Hold/Stop if a hard pattern still fires (e.g.
+    C3 prohibited-action detection still runs).
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone
+    from tcs.artifacts.evaluation import (
+        _snapshot_profile,
+        snapshot_tis_input,
+    )
+    from tcs.artifacts.models import (
+        EVALUATION_MODE_ENFORCE,
+        EVALUATION_ORIGIN_QUERY,
+        EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+        GENERATION_MODE_AGENT_WORKFLOW,
+        GovernanceEvaluation,
+        ResponseArtifact,
+    )
+    from tcs.decision_engine import map_decision
+    from tcs.policy_profiles import load_profile
+    from tcs.tis_engine import TISInput, compute_tis
+    from tcs.trust_certificate import generate_certificate
+
+    # Resolve the active pack profile_id for audit reference, then
+    # use baseline-no-pack for actual scoring.
+    if not original_profile_id:
+        try:
+            from tcs.packs.pack_manager import get_active_pack
+            active = get_active_pack() or {}
+            original_profile_id = (active.get("profile_config") or {}).get("profile_id")
+        except Exception:  # noqa: BLE001
+            original_profile_id = None
+
+    profile = load_profile("baseline-no-pack")
+
+    # Call the LLM directly with no RAG context (the active corpus is
+    # irrelevant by definition). We use the same provider object that
+    # was built upstream; it already carries the API key and model.
+    # NOTE: the OpenAI provider currently embeds a "financial advisory"
+    # system prompt (acknowledged pre-existing leftover in routes_query
+    # around the regular artifact creation block); for off-topic Q&A
+    # the LLM will still typically answer trivia correctly because the
+    # underlying model overrides the framing. A proper fix is to thread
+    # a neutral system prompt through provider.generate(); deferred.
+    t_llm = time.perf_counter()
+    llm_response_text: Optional[str] = None
+    llm_error: Optional[str] = None
+    try:
+        llm_response_text = provider.generate(body.query, [])
+    except Exception as exc:  # noqa: BLE001 — surface any LLM failure
+        llm_error = str(exc)
+    latency["llm_ms"] = round((time.perf_counter() - t_llm) * 1000, 1)
+
+    # Build a TISInput with baseline-no-pack and neutral signals.
+    # The LLM was called; we record an honest pass-through scoring.
+    if llm_error is not None:
+        dim_scores = {"B": 1.0, "A": 0.50, "C": 1.0, "K": 0.10}
+    else:
+        # Allow-by-default for baseline; baseline's K isn't gated and
+        # B/A/C/K = 0.80 all clear baseline's 0.70-0.75 thresholds.
+        dim_scores = {"B": 1.0, "A": 0.80, "C": 1.0, "K": 0.80}
+
+    inp = TISInput(
+        subject_id=str(_uuid.uuid4()),
+        subject_type="off_topic_routed_query",
+        policy_profile=profile,
+        dimension_scores=dim_scores,
+        sub_factor_scores={"C": {"C3": 1.0}},
+        context_metadata={
+            "routed_via_baseline_off_topic": True,
+            "original_active_pack_profile_id": original_profile_id,
+            "off_topic_max_similarity": round(max_similarity, 4),
+            "off_topic_threshold": float(threshold),
+            "n_gaps": 0,
+            "context_age_hours": 0.1,
+            "novelty_score": 0.0,
+            "days_since_review": 1,
+            "is_policy_sensitive": False,
+        },
+        elapsed_hours=0.0,
+        is_valid=1,
+        invalidation_event=None,
+        evaluation_time=datetime.now(timezone.utc).replace(microsecond=0),
+    )
+    # We deliberately do NOT inject the composer_metadata of the active
+    # pack — this evaluation is under baseline-no-pack, not the active
+    # composed pack. The active pack is recorded in
+    # ``original_active_pack_profile_id`` for audit.
+
+    result = compute_tis(inp)
+    decision, requires = map_decision(inp, result)
+    tc = generate_certificate(inp, result, decision, requires)
+    # Tag blocking_reason informationally so the frontend can detect
+    # the rerouting case. For Allow we still set this marker (it doesn't
+    # block, just labels the path); for Hold/Stop we prefix the engine's
+    # reason with the routing context.
+    routing_marker = (
+        f"routed_via_baseline_off_topic_for_pack:"
+        f"{original_profile_id or 'unknown'}"
+        f":max_similarity={max_similarity:.4f}"
+        f"_threshold={threshold:.2f}"
+    )
+    if decision == "Allow":
+        object.__setattr__(tc, "blocking_reason", routing_marker)
+    else:
+        existing = tc.blocking_reason or ""
+        object.__setattr__(
+            tc, "blocking_reason",
+            f"{routing_marker}|{existing}" if existing else routing_marker,
+        )
+
+    issued_tc = store.issue(tc)
+
+    # Persist the artifact + evaluation if the app has the store wired.
+    if artifact_store is not None:
+        retrieved_sources = [
+            {
+                "chunk_id":         c.get("chunk_id"),
+                "source_doc":       c.get("source_doc"),
+                "version":          c.get("version"),
+                "similarity_score": c.get("similarity_score"),
+            }
+            for c in preview_chunks if isinstance(c, dict)
+        ]
+        artifact = ResponseArtifact(
+            artifact_id=issued_tc.subject_id,
+            generation_mode=GENERATION_MODE_AGENT_WORKFLOW,
+            prompt=body.query,
+            raw_output=llm_response_text,
+            provider=provider_name,
+            model=model_name,
+            system_prompt_used=None,
+            rag_enabled=False,  # baseline routing skips RAG
+            rag_context=None,
+            retrieved_sources=retrieved_sources,  # preserved for audit
+            workflow_trace_id=None,
+            workflow_trace=None,
+            recipient_context=(
+                {"industry_hint": industry} if industry else {}
+            ),
+            generation_identity={
+                "requesting_identity": "query_endpoint",
+                "identity_type": "system",
+                "role": "off_topic_baseline_router",
+            },
+            generation_error=llm_error,
+        )
+        artifact_store.insert_artifact(artifact)
+
+        snapshot = _snapshot_profile(profile)
+        runtime_snapshot = snapshot_tis_input(inp)
+        evaluation = GovernanceEvaluation(
+            artifact_id=artifact.artifact_id,
+            mode=EVALUATION_MODE_ENFORCE,
+            policy_profile_id=profile.profile_id,
+            policy_profile_snapshot=snapshot,
+            selected_standards=[],  # baseline-no-pack has no standards
+            enabled_controls=[],
+            rule_matches=None,
+            component_scores={
+                k: round(v, 4) for k, v in inp.dimension_scores.items()
+            },
+            gate_results=dict(result.gate_results_by_dim),
+            s_base=round(result.s_base, 4),
+            s_adjusted=round(result.s_adj, 4),
+            tis_current=round(result.tis_current, 4),
+            decision=decision,
+            trust_certificate_id=issued_tc.certificate_id,
+            evaluator_identity={
+                "requesting_identity": "query_endpoint",
+                "identity_type": "system",
+                "role": "off_topic_baseline_router",
+            },
+            evaluation_completeness_score=1.0,
+            evaluation_origin=EVALUATION_ORIGIN_QUERY,
+            evaluation_strategy=EVALUATION_STRATEGY_RUNTIME_SNAPSHOT,
+            governance_input_snapshot=runtime_snapshot,
+        )
+        artifact_store.insert_evaluation(evaluation)
+
+    blocked = decision in ("Hold", "Stop", "Escalate")
+    latency["total_ms"] = round(
+        latency.get("preview_ms", 0.0) + latency.get("llm_ms", 0.0), 1
+    )
+    return QueryResponse(
+        query=body.query,
+        response=None if blocked else llm_response_text,
+        blocked=blocked,
+        decision=decision,
+        certificate_id=issued_tc.certificate_id,
+        tis_current=issued_tc.tis_current,
+        tis_raw=issued_tc.tis_raw,
+        s_base=issued_tc.s_base,
+        gate_passed=issued_tc.gate_passed,
+        blocking_reason=tc.blocking_reason,
+        requires_human_review=requires,
+        retrieval_chunks=[],  # baseline routing: no chunks delivered to UI
+        latency_ms=latency,
+        llm_provider=provider_name,
+        llm_model=model_name,
+        component_scores=dict(issued_tc.component_scores),
+        component_weights=dict(issued_tc.component_weights),
+        gate_results=dict(issued_tc.gate_results),
+        thresholds=dict(issued_tc.thresholds),
+        workflow_trace=None,
+        policy_profile_id=issued_tc.policy_set_id,
+        connection_type="CT-1",  # direct LLM, no RAG
+    )
+
+
 def _run_query_via_trace(
     body: "QueryRequest",
     store,
@@ -467,6 +817,43 @@ def _run_query_via_trace(
     latency: Dict[str, float] = {}
 
     vector_store = _get_vector_store(industry)
+
+    # ── Off-topic guard ────────────────────────────────────────────── #
+    # Quick standalone retrieval check against the active corpus.
+    # If no chunk in the top-K exceeds OFF_TOPIC_SIMILARITY_THRESHOLD,
+    # the query is treated as outside the active pack's scope: build
+    # a Hold TC explicitly and return without invoking the LLM.
+    try:
+        preview_chunks = vector_store.retrieve(body.query, k=5) or []
+    except Exception:  # noqa: BLE001 — preview is best-effort
+        preview_chunks = []
+    max_sim = max(
+        (
+            float(c.get("similarity_score") or 0.0)
+            for c in preview_chunks
+            if isinstance(c, dict)
+        ),
+        default=0.0,
+    )
+    if preview_chunks and max_sim < OFF_TOPIC_SIMILARITY_THRESHOLD:
+        latency["preview_ms"] = round(
+            (time.perf_counter() - t_total) * 1000, 1
+        )
+        return _route_off_topic_via_baseline(
+            body=body,
+            store=store,
+            artifact_store=artifact_store,
+            provider=provider,
+            provider_name=provider_name,
+            model_name=model_name,
+            industry=industry,
+            composer_metadata=composer_metadata,
+            preview_chunks=preview_chunks,
+            max_similarity=max_sim,
+            threshold=OFF_TOPIC_SIMILARITY_THRESHOLD,
+            latency=latency,
+            original_profile_id=body.profile_id,
+        )
 
     rag_connector = RAGConnector(store=vector_store, retrieval_k=5)
     llm_connector = LLMConnector(

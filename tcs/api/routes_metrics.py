@@ -87,10 +87,15 @@ def get_metrics_live(request: Request) -> Dict[str, Any]:
         }
     """
     store = request.app.state.store
+    chain_ids = store.list_chain_ids()
     return {
         "total_evaluations": store.count(),
         "total_certificates": store.count(),
-        "chain_count": len(store.list_chain_ids()),
+        "chain_count": len(chain_ids),
+        # The Audit Chain Explorer dropdown reads this list. Without
+        # it the frontend has only the count and can't populate the
+        # picker.
+        "chain_ids": chain_ids,
         "decisions": store.decision_counts(),
         "decision_counts": store.decision_counts(),
         "tis_distribution": store.tis_distribution(),

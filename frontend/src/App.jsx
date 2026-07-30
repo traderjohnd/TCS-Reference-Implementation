@@ -16,6 +16,7 @@ import AdminPanel from './views/AdminPanel';
 import Telemetry from './views/Telemetry';
 import Archives from './views/Archives';
 import GovernanceReplay from './views/GovernanceReplay';
+import GovernanceReporting from './views/GovernanceReporting';
 
 function ProtectedRoute({ children, view }) {
   const { user, canAccessView } = useAuth();
@@ -52,6 +53,7 @@ function AppRoutes() {
         <Route path="/archives" element={<ProtectedRoute view="archives"><Archives /></ProtectedRoute>} />
         <Route path="/admin" element={<ProtectedRoute view="admin"><AdminPanel /></ProtectedRoute>} />
         <Route path="/replay" element={<ProtectedRoute view="replay"><GovernanceReplay /></ProtectedRoute>} />
+        <Route path="/reporting" element={<ProtectedRoute view="reporting"><GovernanceReporting /></ProtectedRoute>} />
         <Route path="/" element={<Navigate to="/connections" replace />} />
         <Route path="*" element={<Navigate to="/connections" replace />} />
       </Route>

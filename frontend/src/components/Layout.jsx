@@ -42,6 +42,7 @@ const NAV_SECTIONS = [
     items: [
       { path: '/audit',     label: 'Certificates',        short: 'Ce', view: 'audit' },
       { path: '/replay',    label: 'Governance Replay',   short: 'GR', view: 'replay' },
+      { path: '/reporting', label: 'Reporting',           short: 'Rp', view: 'reporting' },
       { path: '/archives',  label: 'Archives',            short: 'Ar', view: 'archives' },
     ],
   },

@@ -53,6 +53,7 @@ from tcs.api.routes_evaluate import router as evaluate_router
 from tcs.api.routes_replay import router as replay_router
 from tcs.api.routes_connections import router as connections_router
 from tcs.api.routes_archive import router as archive_router
+from tcs.api.routes_reporting import router as reporting_router
 
 
 #: Version surfaced via /v2/health. Bumped when the API contract or
@@ -211,6 +212,7 @@ def create_app(
     app.include_router(replay_router, prefix="/v2", tags=["replay"])
     app.include_router(connections_router, prefix="/v2", tags=["connections"])
     app.include_router(archive_router, prefix="/v2", tags=["archives"])
+    app.include_router(reporting_router, prefix="/v2", tags=["reporting"])
 
     # --- Static file serving for frontend build output ------------------- #
     _frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
