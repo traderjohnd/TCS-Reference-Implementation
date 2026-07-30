@@ -181,100 +181,19 @@ def _get_vector_store(industry: Optional[str] = None):
 
 
 def _build_provider(provider_name: str, api_key: Optional[str], model: Optional[str]):
-    """Build an LLM provider from the request parameters."""
-    from demos.governed_rag.pipeline import MockProvider
+    """Build an LLM provider from the request parameters.
 
-    if provider_name == "openai":
-        if not api_key:
-            raise ValueError("OpenAI API key is required")
-        import openai
-        client = openai.OpenAI(api_key=api_key)
+    mock and openai construct through the provider-neutral layer
+    (tcs.providers.build_provider), which returns objects implementing
+    the ProviderResult contract — the workflow trace lifts their
+    normalized provenance. The inline anthropic branch remains here
+    until Commit 3 moves it behind the same contract.
 
-        # Parse model name and mode: "gpt-5.5 (Thinking)" -> model=gpt-5.5, thinking=True
-        raw_model = model or "gpt-5.5 (Instant)"
-        is_thinking = "(Thinking)" in raw_model
-        api_model = raw_model.replace(" (Instant)", "").replace(" (Thinking)", "").strip()
-        display_name = raw_model
-
-        # Reasoning models (o3, o4-mini, etc.) always use thinking mode
-        is_reasoning_model = api_model.startswith("o3") or api_model.startswith("o4")
-
-        class RequestScopedOpenAI:
-            def generate(self, query, context):
-                context_text = "\n\n".join(context) if context else ""
-                # Neutral, domain-agnostic system prompt. The previous
-                # hardcoded "financial advisory AI" framing made GPT-5
-                # refuse clinical and other non-finance questions even
-                # when the active policy pack governed that domain.
-                # Domain-specific framing belongs in the policy pack,
-                # not in the LLM connector.
-                if context_text:
-                    system_msg = (
-                        "You are a careful, domain-aware assistant. "
-                        "Answer the user's question based on the provided "
-                        "context. Cite sources when possible. If the context "
-                        "does not cover the question, answer from general "
-                        "knowledge while making clear that the answer is not "
-                        "grounded in the supplied sources."
-                    )
-                    user_msg = f"Context:\n{context_text}\n\nQuestion: {query}"
-                else:
-                    system_msg = (
-                        "You are a careful, helpful assistant. Answer the "
-                        "user's question directly and concisely."
-                    )
-                    user_msg = query
-                messages = [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ]
-
-                kwargs = {"model": api_model, "messages": messages}
-
-                # GPT-5.x and reasoning models require max_completion_tokens.
-                is_new_model = (
-                    api_model.startswith("gpt-5") or api_model.startswith("gpt-4.1")
-                )
-                if is_reasoning_model or is_thinking or is_new_model:
-                    # New / reasoning models silently spend tokens on
-                    # internal reasoning before any visible output.
-                    # 500 was empirically too tight: complex clinical
-                    # questions returned message.content = "" because
-                    # the reasoning phase consumed the whole budget.
-                    # Bumped to 2000 for Instant and 4000 for Thinking
-                    # so visible output has headroom.
-                    kwargs["max_completion_tokens"] = (
-                        4000 if (is_reasoning_model or is_thinking) else 2000
-                    )
-                else:
-                    # Legacy models (gpt-4o, etc): standard completion.
-                    kwargs["max_tokens"] = 1000
-                    kwargs["temperature"] = 0.3
-
-                response = client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content
-                if content:
-                    return content
-                # Defensive: surface why the response was empty so the
-                # user sees a clear diagnostic rather than a silent
-                # "No response" in the chat. This indicates either a
-                # content-policy block or a token-budget exhaustion on
-                # the model side; either way the user needs to know.
-                finish_reason = getattr(
-                    response.choices[0], "finish_reason", "unknown"
-                )
-                return (
-                    f"[{api_model} returned no content. "
-                    f"finish_reason={finish_reason}. "
-                    "This usually means the model spent its token budget "
-                    "on internal reasoning before producing output, or a "
-                    "content policy intervened. Try Thinking mode, switch "
-                    "to gpt-4o, or restate the question.]"
-                )
-
-        return RequestScopedOpenAI(), display_name
-
-    elif provider_name == "anthropic":
+    Unknown provider names raise ValueError instead of silently falling
+    back to the scripted mock: a scripted response must never be able
+    to masquerade as live provider output.
+    """
+    if provider_name == "anthropic":
         if not api_key:
             raise ValueError("Anthropic API key is required")
         import anthropic
@@ -313,8 +232,8 @@ def _build_provider(provider_name: str, api_key: Optional[str], model: Optional[
 
         return RequestScopedAnthropic(), model_name
 
-    else:
-        return MockProvider(), "deterministic"
+    from tcs.providers import build_provider
+    return build_provider(provider_name, api_key, model)
 
 
 # --------------------------------------------------------------------------- #

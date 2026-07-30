@@ -153,15 +153,24 @@ function ConnectionCard({ conn, isActive, onSetActive, onTest, onDelete, onUpdat
 
 // ─── Add Connection Form ────────────────────────────────────────────────────
 
+// Sentinel select value for operator-typed model IDs. The catalog is a
+// convenience, not a hard dependency — any model ID can be entered and
+// is passed through verbatim. An unavailable model is never silently
+// replaced; the provider's own error surfaces on Test Connection.
+const CUSTOM_MODEL_OPTION = '__custom__';
+
 function AddConnectionForm({ providerCatalog, onAdd, onCancel }) {
   const realProviders = providerCatalog.filter((p) => p.requires_key);
   const [provider, setProvider] = useState(realProviders[0]?.id || 'openai');
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('');
+  const [customModel, setCustomModel] = useState('');
   const [name, setName] = useState('');
 
   const currentProvider = realProviders.find((p) => p.id === provider);
   const models = currentProvider?.models || [];
+  const isCustomModel = model === CUSTOM_MODEL_OPTION;
+  const effectiveModel = isCustomModel ? customModel.trim() : model;
 
   // Set default model when provider changes
   const handleProviderChange = (e) => {
@@ -176,12 +185,12 @@ function AddConnectionForm({ providerCatalog, onAdd, onCancel }) {
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (!apiKey.trim()) return;
+    if (!apiKey.trim() || !effectiveModel) return;
     onAdd({
       category: 'llm',
       type: provider,
       name: name.trim() || `${currentProvider?.name || provider} Connection`,
-      config: { model, apiKey: apiKey.trim() },
+      config: { model: effectiveModel, apiKey: apiKey.trim() },
     });
   };
 
@@ -212,9 +221,29 @@ function AddConnectionForm({ providerCatalog, onAdd, onCancel }) {
             {models.map((m) => (
               <option key={m} value={m}>{m}</option>
             ))}
+            <option value={CUSTOM_MODEL_OPTION}>Custom model ID…</option>
           </select>
         </div>
       </div>
+
+      {isCustomModel && (
+        <div>
+          <label className="block text-[11px] text-gray-500 mb-1">Custom Model ID</label>
+          <input
+            type="text"
+            value={customModel}
+            onChange={(e) => setCustomModel(e.target.value)}
+            placeholder={provider === 'openai' ? 'e.g. gpt-5.5-turbo-preview' : 'e.g. claude-sonnet-4-5'}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm placeholder-gray-600 focus:outline-none focus:border-blue-500 font-mono"
+            required
+          />
+          <p className="mt-1 text-[10px] text-gray-600">
+            Sent to the provider exactly as typed. If the model is unavailable,
+            the provider&apos;s own error is shown — it is never replaced with a
+            different model.
+          </p>
+        </div>
+      )}
 
       <div>
         <label className="block text-[11px] text-gray-500 mb-1">API Key</label>
@@ -242,7 +271,7 @@ function AddConnectionForm({ providerCatalog, onAdd, onCancel }) {
       <div className="flex gap-2 pt-1">
         <button
           type="submit"
-          disabled={!apiKey.trim()}
+          disabled={!apiKey.trim() || !effectiveModel}
           className="text-xs px-4 py-2 rounded bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white font-medium transition-colors"
         >
           Add Connection
