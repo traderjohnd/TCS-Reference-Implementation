@@ -136,33 +136,51 @@ class LLMConnector(GovernedConnector):
         try:
             response_text = self.provider.generate(request.query, context_chunks)
         except Exception as exc:
+            raw_metadata = {
+                "provider": self.provider_name,
+                "model": self.model,
+                "exception_type": type(exc).__name__,
+            }
+            self._lift_provider_provenance(raw_metadata)
             return ConnectorResult(
                 payload=None,
                 output_text=None,
-                raw_metadata={
-                    "provider": self.provider_name,
-                    "model": self.model,
-                    "exception_type": type(exc).__name__,
-                },
+                raw_metadata=raw_metadata,
                 latency_ms=round((time.perf_counter() - t0) * 1000, 2),
                 error=str(exc),
             )
 
+        raw_metadata = {
+            "provider": self.provider_name,
+            "model": self.model,
+            "context_chunk_count": len(context_chunks),
+            # Carry the query into raw_metadata so to_governance_event
+            # can scan it for prohibited-action / drug-interaction
+            # patterns (C3 detection covers BOTH the user's request
+            # and the model's response).
+            "query_text": request.query,
+        }
+        self._lift_provider_provenance(raw_metadata)
         return ConnectorResult(
             payload={"response_text": response_text},
             output_text=response_text,
-            raw_metadata={
-                "provider": self.provider_name,
-                "model": self.model,
-                "context_chunk_count": len(context_chunks),
-                # Carry the query into raw_metadata so to_governance_event
-                # can scan it for prohibited-action / drug-interaction
-                # patterns (C3 detection covers BOTH the user's request
-                # and the model's response).
-                "query_text": request.query,
-            },
+            raw_metadata=raw_metadata,
             latency_ms=round((time.perf_counter() - t0) * 1000, 2),
         )
+
+    def _lift_provider_provenance(self, raw_metadata: dict) -> None:
+        """Lift the provider's normalized ProviderResult provenance into
+        the governed trace event. Providers outside the neutral contract
+        simply contribute nothing — the connector never reaches into
+        provider payloads."""
+        last = getattr(self.provider, "last_result", None)
+        summary = getattr(last, "provenance_summary", None)
+        if callable(summary):
+            try:
+                raw_metadata["provider_provenance"] = summary()
+            except Exception:
+                # Provenance must never break the governed call path.
+                pass
 
     def to_governance_event(
         self,

@@ -22,6 +22,11 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request
 
+from tcs.operating_mode import (
+    ExternalCallBlockedError,
+    enforce_external_call,
+    execution_mode_for,
+)
 from tcs.trust_certificate import gate_result_of
 from pydantic import BaseModel
 
@@ -176,140 +181,19 @@ def _get_vector_store(industry: Optional[str] = None):
 
 
 def _build_provider(provider_name: str, api_key: Optional[str], model: Optional[str]):
-    """Build an LLM provider from the request parameters."""
-    from demos.governed_rag.pipeline import MockProvider
+    """Build an LLM provider from the request parameters.
 
-    if provider_name == "openai":
-        if not api_key:
-            raise ValueError("OpenAI API key is required")
-        import openai
-        client = openai.OpenAI(api_key=api_key)
+    All providers (mock, openai, anthropic) construct through the
+    provider-neutral layer (tcs.providers.build_provider), which
+    returns objects implementing the ProviderResult contract — the
+    workflow trace lifts their normalized provenance.
 
-        # Parse model name and mode: "gpt-5.5 (Thinking)" -> model=gpt-5.5, thinking=True
-        raw_model = model or "gpt-5.5 (Instant)"
-        is_thinking = "(Thinking)" in raw_model
-        api_model = raw_model.replace(" (Instant)", "").replace(" (Thinking)", "").strip()
-        display_name = raw_model
-
-        # Reasoning models (o3, o4-mini, etc.) always use thinking mode
-        is_reasoning_model = api_model.startswith("o3") or api_model.startswith("o4")
-
-        class RequestScopedOpenAI:
-            def generate(self, query, context):
-                context_text = "\n\n".join(context) if context else ""
-                # Neutral, domain-agnostic system prompt. The previous
-                # hardcoded "financial advisory AI" framing made GPT-5
-                # refuse clinical and other non-finance questions even
-                # when the active policy pack governed that domain.
-                # Domain-specific framing belongs in the policy pack,
-                # not in the LLM connector.
-                if context_text:
-                    system_msg = (
-                        "You are a careful, domain-aware assistant. "
-                        "Answer the user's question based on the provided "
-                        "context. Cite sources when possible. If the context "
-                        "does not cover the question, answer from general "
-                        "knowledge while making clear that the answer is not "
-                        "grounded in the supplied sources."
-                    )
-                    user_msg = f"Context:\n{context_text}\n\nQuestion: {query}"
-                else:
-                    system_msg = (
-                        "You are a careful, helpful assistant. Answer the "
-                        "user's question directly and concisely."
-                    )
-                    user_msg = query
-                messages = [
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ]
-
-                kwargs = {"model": api_model, "messages": messages}
-
-                # GPT-5.x and reasoning models require max_completion_tokens.
-                is_new_model = (
-                    api_model.startswith("gpt-5") or api_model.startswith("gpt-4.1")
-                )
-                if is_reasoning_model or is_thinking or is_new_model:
-                    # New / reasoning models silently spend tokens on
-                    # internal reasoning before any visible output.
-                    # 500 was empirically too tight: complex clinical
-                    # questions returned message.content = "" because
-                    # the reasoning phase consumed the whole budget.
-                    # Bumped to 2000 for Instant and 4000 for Thinking
-                    # so visible output has headroom.
-                    kwargs["max_completion_tokens"] = (
-                        4000 if (is_reasoning_model or is_thinking) else 2000
-                    )
-                else:
-                    # Legacy models (gpt-4o, etc): standard completion.
-                    kwargs["max_tokens"] = 1000
-                    kwargs["temperature"] = 0.3
-
-                response = client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content
-                if content:
-                    return content
-                # Defensive: surface why the response was empty so the
-                # user sees a clear diagnostic rather than a silent
-                # "No response" in the chat. This indicates either a
-                # content-policy block or a token-budget exhaustion on
-                # the model side; either way the user needs to know.
-                finish_reason = getattr(
-                    response.choices[0], "finish_reason", "unknown"
-                )
-                return (
-                    f"[{api_model} returned no content. "
-                    f"finish_reason={finish_reason}. "
-                    "This usually means the model spent its token budget "
-                    "on internal reasoning before producing output, or a "
-                    "content policy intervened. Try Thinking mode, switch "
-                    "to gpt-4o, or restate the question.]"
-                )
-
-        return RequestScopedOpenAI(), display_name
-
-    elif provider_name == "anthropic":
-        if not api_key:
-            raise ValueError("Anthropic API key is required")
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        model_name = model or "claude-sonnet-4-20250514"
-
-        class RequestScopedAnthropic:
-            def generate(self, query, context):
-                context_text = "\n\n".join(context) if context else ""
-                if context_text:
-                    user_content = (
-                        "You are a careful, domain-aware assistant. "
-                        "Answer based on the provided context. Cite sources "
-                        "when possible. If the context does not cover the "
-                        "question, answer from general knowledge while making "
-                        "clear that the answer is not grounded in the supplied "
-                        "sources.\n\n"
-                        f"Context:\n{context_text}\n\nQuestion: {query}"
-                    )
-                else:
-                    user_content = (
-                        "You are a careful, helpful assistant. Answer the "
-                        f"user's question directly and concisely.\n\n{query}"
-                    )
-                response = client.messages.create(
-                    model=model_name,
-                    max_tokens=2000,
-                    messages=[
-                        {"role": "user", "content": user_content},
-                    ],
-                )
-                return response.content[0].text if response.content else (
-                    f"[{model_name} returned no content. "
-                    "Try restating the question or switching providers.]"
-                )
-
-        return RequestScopedAnthropic(), model_name
-
-    else:
-        return MockProvider(), "deterministic"
+    Unknown provider names raise ValueError instead of silently falling
+    back to the scripted mock: a scripted response must never be able
+    to masquerade as live provider output.
+    """
+    from tcs.providers import build_provider
+    return build_provider(provider_name, api_key, model)
 
 
 # --------------------------------------------------------------------------- #
@@ -338,7 +222,14 @@ def query_status() -> Dict[str, Any]:
             {
                 "id": "anthropic",
                 "name": "Anthropic",
-                "models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
+                # Current supported Claude model IDs (convenience catalog —
+                # the Connections UI also offers a custom model-ID field,
+                # so the catalog is never a hard dependency).
+                "models": [
+                    "claude-opus-5", "claude-sonnet-5",
+                    "claude-opus-4-8", "claude-sonnet-4-6",
+                    "claude-haiku-4-5",
+                ],
                 "requires_key": True,
             },
             {
@@ -397,11 +288,19 @@ def _persist_query_artifact_and_evaluation(
     decision: str,
     issued_tc: Any,
     composer_metadata: Optional[Dict[str, Any]],
+    identity_role: str = "runtime_query_path",
+    recipient_context_extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Best-effort persistence of artifact + evaluation rows for a query.
     Raises are caught at the call site so /v2/query semantics never
     break on a persistence failure.
+
+    ``identity_role`` and ``recipient_context_extra`` let the Commit-4
+    comparison path reuse this helper with its own audit identity and
+    bounded correlation metadata (comparison_id, member id, common
+    prompt/context hashes — never credentials) without changing the
+    default /v2/query behavior.
     """
     from tcs.artifacts import (
         EVALUATION_MODE_ENFORCE,
@@ -466,11 +365,14 @@ def _persist_query_artifact_and_evaluation(
         retrieved_sources=retrieved_sources,
         workflow_trace_id=trace.workflow_id,
         workflow_trace=trace.to_dict(),
-        recipient_context={"industry_hint": industry} if industry else {},
+        recipient_context={
+            **({"industry_hint": industry} if industry else {}),
+            **(recipient_context_extra or {}),
+        },
         generation_identity={
             "requesting_identity": "query_endpoint",
             "identity_type": "system",
-            "role": "runtime_query_path",
+            "role": identity_role,
             "session_id": getattr(trace, "workflow_id", None),
         },
     )
@@ -526,7 +428,7 @@ def _persist_query_artifact_and_evaluation(
         evaluator_identity={
             "requesting_identity": "query_endpoint",
             "identity_type": "system",
-            "role": "runtime_query_path",
+            "role": identity_role,
         },
         evaluation_completeness_score=1.0,
         evaluation_origin=EVALUATION_ORIGIN_QUERY,
@@ -655,6 +557,8 @@ def _route_off_topic_via_baseline(
             "novelty_score": "0.0",
             "days_since_review": 1,
             "is_policy_sensitive": False,
+            # Truthful execution-mode labeling (demo-live branch).
+            "execution_mode": execution_mode_for(provider_name),
         },
         elapsed_hours=Decimal("0.0000"),
         is_valid=1,
@@ -897,6 +801,9 @@ def _run_query_via_trace(
 
     orchestrator = WorkflowOrchestrator()
     t0 = time.perf_counter()
+    # Truthful execution-mode labeling (demo-live branch): scripted
+    # (mock) output must never masquerade as live provider output.
+    execution_mode = execution_mode_for(provider_name)
     trace = orchestrator.execute(
         steps=[
             WorkflowStep(node=rag_node, connector=rag_connector, context_key="rag"),
@@ -905,14 +812,30 @@ def _run_query_via_trace(
         query=body.query,
         base_profile_id=body.profile_id,
         user_identity={"provider": provider_name, "model": model_name},
-        metadata={"source": "routes_query.workflow_trace_path"},
+        metadata={
+            "source": "routes_query.workflow_trace_path",
+            "execution_mode": execution_mode,
+            "llm_provider": provider_name,
+            "llm_model": model_name,
+        },
     )
     latency["workflow_ms"] = round((time.perf_counter() - t0) * 1000, 1)
 
     # Surface any connector-level error directly without persisting a TC.
+    # This includes empty provider output: a response with no usable
+    # model-generated text is a provider-layer failure — the adapter's
+    # diagnostic is a SYSTEM message, never model output, so nothing is
+    # scored, no evaluation is written, and no certificate is issued.
     llm_event = trace.get_node("llm-generate").event
     if llm_event and llm_event.error:
         latency["total_ms"] = round((time.perf_counter() - t_total) * 1000, 1)
+        last = getattr(provider, "last_result", None)
+        is_empty = (
+            last is not None
+            and getattr(last, "error_category", None) == "empty_content"
+        )
+        reason_prefix = ("provider_empty_output" if is_empty
+                         else "LLM provider error")
         return QueryResponse(
             query=body.query,
             response=None,
@@ -922,7 +845,7 @@ def _run_query_via_trace(
             tis_current=None,
             tis_raw=None,
             gate_result=None,
-            blocking_reason=f"LLM provider error: {llm_event.error}",
+            blocking_reason=f"{reason_prefix}: {llm_event.error}",
             requires_human_review=False,
             retrieval_chunks=[],
             latency_ms=latency,
@@ -937,6 +860,9 @@ def _run_query_via_trace(
     # generate_certificate() carries it onto the issued TC.
     if composer_metadata:
         tis_input.context_metadata["composer_metadata"] = dict(composer_metadata)
+    # Execution mode onto the certificate's scope attestation (via the
+    # trusted server-side context — never caller input).
+    tis_input.context_metadata["execution_mode"] = execution_mode
     # tis-v2 activation (Commit 5b): Decimal-native producer values flow
     # straight into the canonical v2 pipeline and become
     # component_scores_raw.
@@ -1093,6 +1019,29 @@ def run_query(body: QueryRequest, request: Request) -> QueryResponse:
     # Stash on app state for downstream consumers / debugging.
     request.app.state._active_composer_metadata = _active_composer_metadata
     request.app.state._active_industry = _active_industry
+
+    # Backend operating-mode enforcement (demo-live branch): DEMO MODE
+    # blocks every external provider call HERE, regardless of frontend
+    # state. Only the deterministic mock provider executes in demo.
+    try:
+        enforce_external_call(request.app.state, body.provider)
+    except ExternalCallBlockedError as e:
+        return QueryResponse(
+            query=body.query,
+            response=None,
+            blocked=True,
+            decision="Error",
+            certificate_id=None,
+            tis_current=None,
+            tis_raw=None,
+            gate_result=None,
+            blocking_reason=f"demo_mode_enforced: {e}",
+            requires_human_review=False,
+            retrieval_chunks=[],
+            latency_ms={},
+            llm_provider=body.provider,
+            llm_model=body.model or "unknown",
+        )
 
     # Build provider from request
     try:

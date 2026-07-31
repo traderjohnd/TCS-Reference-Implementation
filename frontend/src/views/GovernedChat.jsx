@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { apiPost, useApi } from '../hooks/useApi';
 import { useConnections } from '../hooks/useConnections';
+import { useOperatingMode } from '../hooks/useOperatingMode';
 import PlainLanguageExplanation from '../components/PlainLanguageExplanation';
 import {
   displayGoverned,
@@ -524,8 +525,18 @@ function ConnectionStatus({ activeLlm }) {
       {isReady ? (
         <span className={isMock ? 'text-yellow-400' : 'text-green-400'}>
           {isMock
-            ? 'Mock mode — deterministic responses'
-            : `${activeLlm.name} — ${activeLlm.config.model}`}
+            ? 'Mock provider — deterministic scripted responses'
+            : `Live LLM: ${activeLlm.name} — ${activeLlm.config.model}`}
+          {/* Commit 6 hardening: full pre-submission disclosure for
+              Live LLM — provider, exact model, credential presence
+              (in-memory only), corpus state, web disabled, charges. */}
+          {!isMock && (
+            <span className="text-[10px] text-gray-500 font-normal ml-2">
+              provider {activeLlm.type} · key in memory · local corpus
+              retrieval on · external web retrieval disabled · provider
+              charges may apply
+            </span>
+          )}
         </span>
       ) : (
         <>
@@ -559,8 +570,14 @@ export default function GovernedChat() {
   const { data: activePack } = useApi('/packs/active');
   const samples = _pickSamples(activePack?.active ? activePack : null);
 
+  const { isDemo } = useOperatingMode();
   const isMock = activeLlm?.type === 'mock';
-  const canSend = activeLlm && (isMock || activeLlm.config.apiKey);
+  // Demo Mode guard (demo-live branch): an operator cannot accidentally
+  // send a real provider request while DEMO MODE is active — the send
+  // path is disabled here, and the backend enforces the same rule
+  // regardless of frontend state.
+  const demoBlocked = isDemo && activeLlm && !isMock;
+  const canSend = activeLlm && (isMock || activeLlm.config.apiKey) && !demoBlocked;
 
   // Persist on every change so the conversation survives reloads.
   useEffect(() => {
@@ -639,6 +656,19 @@ export default function GovernedChat() {
       {/* Active connection indicator */}
       <div className="mb-4">
         <ConnectionStatus activeLlm={activeLlm} />
+        {demoBlocked && (
+          <div
+            role="alert"
+            className="mt-2 flex items-center gap-2 text-xs bg-amber-900/20 border border-amber-800 rounded-lg px-3 py-2 text-amber-200"
+          >
+            <span className="font-bold tracking-wider">DEMO MODE</span>
+            <span>
+              Live LLM requests to {activeLlm.name} are blocked. Switch to
+              LIVE MODE in the toolbar, or select the Mock provider for
+              deterministic scripted responses.
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Chat messages */}

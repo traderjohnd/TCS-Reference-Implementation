@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 
@@ -40,12 +40,21 @@ class TestConnectionResponse(BaseModel):
     error: Optional[str] = None
 
 
+def _sanitize_error(exc: Exception, api_key: Optional[str]) -> str:
+    """Provider errors can echo request headers; the operator's key must
+    never surface in a response, log, or trace."""
+    text = str(exc)
+    if api_key and api_key in text:
+        text = text.replace(api_key, "[redacted]")
+    return text
+
+
 # --------------------------------------------------------------------------- #
 # POST /v2/connections/test                                                    #
 # --------------------------------------------------------------------------- #
 
 @router.post("/connections/test")
-def test_connection(body: TestConnectionRequest) -> TestConnectionResponse:
+def test_connection(body: TestConnectionRequest, request: Request) -> TestConnectionResponse:
     """
     Test a connection by making a minimal API call.
 
@@ -53,8 +62,25 @@ def test_connection(body: TestConnectionRequest) -> TestConnectionResponse:
     - OpenAI: sends a 1-token completion to verify auth
     - Anthropic: sends a 1-token message to verify auth
     - RAG / External API: stubbed — returns success for now
+
+    DEMO MODE blocks external test calls (backend enforcement): the
+    operator must switch to LIVE MODE before any real provider is
+    contacted, even for a 1-token auth check.
     """
     t0 = time.perf_counter()
+
+    from tcs.operating_mode import ExternalCallBlockedError, enforce_external_call
+    if body.category == "llm":
+        try:
+            enforce_external_call(request.app.state, body.provider)
+        except ExternalCallBlockedError as e:
+            return TestConnectionResponse(
+                success=False,
+                provider=body.provider,
+                model=body.model or "unknown",
+                latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+                error=f"demo_mode_enforced: {e}",
+            )
 
     if body.category != "llm":
         # Stubbed — RAG and external API testing comes later
@@ -108,7 +134,7 @@ def test_connection(body: TestConnectionRequest) -> TestConnectionResponse:
                 success=False, provider="openai",
                 model=body.model or "unknown",
                 latency_ms=round((time.perf_counter() - t0) * 1000, 1),
-                error=str(e),
+                error=_sanitize_error(e, body.api_key),
             )
 
     if body.provider == "anthropic":
@@ -120,8 +146,9 @@ def test_connection(body: TestConnectionRequest) -> TestConnectionResponse:
             )
         try:
             import anthropic
+            from tcs.providers.anthropic_provider import DEFAULT_ANTHROPIC_MODEL
             client = anthropic.Anthropic(api_key=body.api_key)
-            model_name = body.model or "claude-sonnet-4-20250514"
+            model_name = body.model or DEFAULT_ANTHROPIC_MODEL
             client.messages.create(
                 model=model_name, max_tokens=1,
                 messages=[{"role": "user", "content": "ping"}],
@@ -135,7 +162,7 @@ def test_connection(body: TestConnectionRequest) -> TestConnectionResponse:
                 success=False, provider="anthropic",
                 model=body.model or "unknown",
                 latency_ms=round((time.perf_counter() - t0) * 1000, 1),
-                error=str(e),
+                error=_sanitize_error(e, body.api_key),
             )
 
     return TestConnectionResponse(

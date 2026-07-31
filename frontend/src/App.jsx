@@ -2,11 +2,15 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { ThemeProvider } from './hooks/useTheme';
 import { ConnectionsProvider } from './hooks/useConnections';
+import { OperatingModeProvider } from './hooks/useOperatingMode';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import Layout from './components/Layout';
 import Login from './views/Login';
 import Connections from './views/Connections';
 import GovernedChat from './views/GovernedChat';
+import ModelComparison from './views/ModelComparison';
+import LiveWeb from './views/LiveWeb';
+import InvestorDemo from './views/InvestorDemo';
 import TrustOverview from './views/TrustOverview';
 import LiveDecisions from './views/LiveDecisions';
 import DriftMonitoring from './views/DriftMonitoring';
@@ -44,6 +48,9 @@ function AppRoutes() {
       <Route element={<Layout />}>
         <Route path="/connections" element={<ProtectedRoute view="connections"><Connections /></ProtectedRoute>} />
         <Route path="/chat" element={<ProtectedRoute view="chat"><GovernedChat /></ProtectedRoute>} />
+        <Route path="/compare" element={<ProtectedRoute view="compare"><ModelComparison /></ProtectedRoute>} />
+        <Route path="/liveweb" element={<ProtectedRoute view="liveweb"><LiveWeb /></ProtectedRoute>} />
+        <Route path="/demo" element={<ProtectedRoute view="demo"><InvestorDemo /></ProtectedRoute>} />
         <Route path="/overview" element={<ProtectedRoute view="overview"><TrustOverview /></ProtectedRoute>} />
         <Route path="/decisions" element={<ProtectedRoute view="decisions"><LiveDecisions /></ProtectedRoute>} />
         <Route path="/drift" element={<ProtectedRoute view="drift"><DriftMonitoring /></ProtectedRoute>} />
@@ -68,9 +75,11 @@ export default function App() {
       <BrowserRouter>
         <ThemeProvider>
           <AuthProvider>
-            <ConnectionsProvider>
-              <AppRoutes />
-            </ConnectionsProvider>
+            <OperatingModeProvider>
+              <ConnectionsProvider>
+                <AppRoutes />
+              </ConnectionsProvider>
+            </OperatingModeProvider>
           </AuthProvider>
         </ThemeProvider>
       </BrowserRouter>

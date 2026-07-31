@@ -1559,6 +1559,26 @@ def _build_scope_attestation(
         ),
         "upstream_tc_references": list(meta.get("upstream_tc_references", [])),
     }
+    # Execution-mode provenance (demo-live branch): recorded ONLY when
+    # the trusted server-side context supplies it ("scripted_demo" |
+    # "live_provider"), so scripted output can never be presented as
+    # live provider output. Absent on records that predate the mode
+    # system — the key is conditional, never defaulted.
+    exec_mode = meta.get("execution_mode")
+    if isinstance(exec_mode, str) and exec_mode:
+        scope_attestation["execution_mode"] = exec_mode
+    # Governed Live Web provenance (demo-live branch, Commit 5): the
+    # BOUNDED web-retrieval summary — schema version, retrieval mode,
+    # provider/model, counts, retrieval status, web_evidence_digest,
+    # evidence-artifact link. Never the source list, never citation
+    # payloads, never credentials. Conditional key: absent on every
+    # record that did not perform governed web retrieval, so existing
+    # v2 certificates verify unchanged. Because scope_attestation is
+    # inside the hash-covered TC content, tampering with this summary
+    # (or the digest inside it) fails certificate verification.
+    web_retrieval = meta.get("web_retrieval")
+    if isinstance(web_retrieval, dict) and web_retrieval:
+        scope_attestation["web_retrieval"] = dict(web_retrieval)
     return mcp_server_id, scope_attestation
 
 

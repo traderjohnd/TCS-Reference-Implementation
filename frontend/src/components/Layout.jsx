@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import { useTheme } from '../hooks/useTheme';
+import ModeSwitcher from './ModeSwitcher';
 
 // =============================================================================
 // Phase 5 demo-hardening — left-side collapsible nav with grouped sections.
@@ -22,7 +23,10 @@ const NAV_SECTIONS = [
     id: 'run',
     label: 'RUN',
     items: [
+      { path: '/demo',      label: 'Investor Demo', short: 'ID', view: 'demo' },
       { path: '/chat',      label: 'Chat',      short: 'Ch', view: 'chat' },
+      { path: '/compare',   label: 'Model Comparison', short: 'MC', view: 'compare' },
+      { path: '/liveweb',   label: 'Live Web',  short: 'LW', view: 'liveweb' },
       { path: '/decisions', label: 'Live',      short: 'Li', view: 'decisions' },
     ],
   },
@@ -192,6 +196,7 @@ export default function Layout() {
           </div>
           {user && (
             <div className="flex items-center gap-4">
+              <ModeSwitcher />
               <button
                 onClick={toggle}
                 className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border border-gray-700 hover:border-gray-500 transition-colors"
