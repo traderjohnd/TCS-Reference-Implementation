@@ -19,12 +19,15 @@ vi.mock('../../hooks/useApi', async () => {
 });
 
 import { OperatingModeProvider } from '../../hooks/useOperatingMode';
+import { ConnectionsProvider } from '../../hooks/useConnections';
 import ModeSwitcher from '../ModeSwitcher';
 
 function renderSwitcher() {
   return render(
     <OperatingModeProvider>
-      <ModeSwitcher />
+      <ConnectionsProvider>
+        <ModeSwitcher />
+      </ConnectionsProvider>
     </OperatingModeProvider>,
   );
 }
@@ -52,7 +55,13 @@ describe('ModeSwitcher', () => {
     // No API call yet — the dialog gates the switch.
     expect(h.apiPost).not.toHaveBeenCalled();
     const dialog = screen.getByRole('dialog', { name: /switch to live mode/i });
-    expect(dialog).toHaveTextContent('real external provider calls');
+    // Commit 6 hardening: the dialog names every consequence — real
+    // external AI calls, unpredictable responses, provider charges,
+    // and content leaving the local environment.
+    expect(dialog).toHaveTextContent('real external AI provider calls');
+    expect(dialog).toHaveTextContent('unpredictable');
+    expect(dialog).toHaveTextContent('provider charges');
+    expect(dialog).toHaveTextContent('may leave the local environment');
     expect(dialog).toHaveTextContent('live_provider');
 
     h.apiPost.mockResolvedValueOnce({

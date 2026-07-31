@@ -237,8 +237,9 @@ describe('ModelComparison — results', () => {
                response: 'A different governed answer.',
                certificate_id: 'tc-bbbb2222-3333', artifact_id: 'art-2' }),
     ]);
-    expect(await screen.findByText(/Results — same prompt, same retrieved context, same policy/i))
-      .toBeInTheDocument();
+    expect(await screen.findByText(
+      /Same prompt, same retrieved context, same policy — independently governed outputs/i,
+    )).toBeInTheDocument();
     expect(screen.getByText('A governed answer.')).toBeInTheDocument();
     expect(screen.getByText('A different governed answer.')).toBeInTheDocument();
     // Provider/model identity appears in the selection list AND on the

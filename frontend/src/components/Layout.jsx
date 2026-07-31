@@ -23,6 +23,7 @@ const NAV_SECTIONS = [
     id: 'run',
     label: 'RUN',
     items: [
+      { path: '/demo',      label: 'Investor Demo', short: 'ID', view: 'demo' },
       { path: '/chat',      label: 'Chat',      short: 'Ch', view: 'chat' },
       { path: '/compare',   label: 'Model Comparison', short: 'MC', view: 'compare' },
       { path: '/liveweb',   label: 'Live Web',  short: 'LW', view: 'liveweb' },

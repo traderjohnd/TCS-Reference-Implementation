@@ -527,6 +527,16 @@ function ConnectionStatus({ activeLlm }) {
           {isMock
             ? 'Mock provider — deterministic scripted responses'
             : `Live LLM: ${activeLlm.name} — ${activeLlm.config.model}`}
+          {/* Commit 6 hardening: full pre-submission disclosure for
+              Live LLM — provider, exact model, credential presence
+              (in-memory only), corpus state, web disabled, charges. */}
+          {!isMock && (
+            <span className="text-[10px] text-gray-500 font-normal ml-2">
+              provider {activeLlm.type} · key in memory · local corpus
+              retrieval on · external web retrieval disabled · provider
+              charges may apply
+            </span>
+          )}
         </span>
       ) : (
         <>

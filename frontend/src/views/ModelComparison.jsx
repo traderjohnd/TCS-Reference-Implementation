@@ -414,7 +414,8 @@ export default function ModelComparison() {
         <section className="space-y-3">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <h3 className="text-sm font-medium text-white">
-              Results — same prompt, same retrieved context, same policy
+              Same prompt, same retrieved context, same policy — independently
+              governed outputs
             </h3>
             <span className="text-[10px] text-gray-500">
               {okMembers.length} governed · {failedMembers.length} provider

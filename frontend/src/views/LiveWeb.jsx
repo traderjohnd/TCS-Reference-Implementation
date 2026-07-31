@@ -421,6 +421,11 @@ export default function LiveWeb() {
             {showTech && (
               <div className="border-t border-gray-800 p-3 text-[11px] font-mono text-gray-400 space-y-1">
                 <div>web_evidence_digest: {result.web_evidence_digest}</div>
+                <div>
+                  live_access: requested={String(ev?.live_access_requested)}{' '}
+                  · observed={String(ev?.web_search_action_observed)}{' '}
+                  · confirmed={String(ev?.live_access_confirmed)}
+                </div>
                 <div>retrieval_mode: {result.retrieval_mode}</div>
                 <div>local_corpus_used: {String(result.local_corpus_used)}</div>
                 <div>policy_profile: {result.policy_profile_id}</div>

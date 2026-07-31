@@ -8,16 +8,28 @@
 // Returning to Demo Mode is always a single click — the safe direction
 // never needs ceremony.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   DEMO_MODE, LIVE_MODE, useOperatingMode,
 } from '../hooks/useOperatingMode';
+import { useConnections } from '../hooks/useConnections';
 
 export default function ModeSwitcher() {
-  const { isDemo, loaded, switchMode } = useOperatingMode();
+  const { isDemo, loaded, switchMode, refresh } = useOperatingMode();
+  const { clearTransientKeys } = useConnections();
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+
+  // Commit 6 hardening: the backend is the mode authority. Re-sync the
+  // displayed mode whenever the window regains focus so a frontend/
+  // backend disagreement (server restart, second tab) recovers to the
+  // backend truth instead of persisting a stale badge.
+  useEffect(() => {
+    const onFocus = () => refresh();
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [refresh]);
 
   if (!loaded) {
     return (
@@ -34,6 +46,13 @@ export default function ModeSwitcher() {
     } else {
       setBusy(true);
       switchMode(DEMO_MODE)
+        .then(() => {
+          // Commit 6 hardening: returning to Demo immediately clears
+          // transient in-memory credentials and live execution state.
+          // Saved non-secret connection metadata is untouched, and
+          // already-rendered live results keep their truthful labels.
+          if (typeof clearTransientKeys === 'function') clearTransientKeys();
+        })
         .catch((e) => setError(e.message))
         .finally(() => setBusy(false));
     }
@@ -76,9 +95,11 @@ export default function ModeSwitcher() {
           </div>
           <p className="text-xs text-gray-300 leading-snug mb-3">
             Live Mode enables <span className="font-semibold">real external
-            provider calls</span> (Live LLM and, where configured, Live
-            Web). Responses become nondeterministic, external services
-            are contacted, and usage may incur provider costs. Every
+            AI provider calls</span> (Live LLM and, where configured,
+            Live Web). Responses may be unpredictable, provider charges
+            may apply, and <span className="font-semibold">submitted
+            content may leave the local environment</span>. Nothing is
+            submitted or tested automatically by switching. Every
             response still passes through TIS v2 governance and is
             recorded with execution mode <span className="font-mono">live_provider</span>.
           </p>

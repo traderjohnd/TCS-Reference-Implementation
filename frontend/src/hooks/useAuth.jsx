@@ -3,9 +3,9 @@ import { createContext, useContext, useState, useCallback } from 'react';
 const AuthContext = createContext(null);
 
 const ROLE_VIEW_ACCESS = {
-  platform_admin: ['connections', 'overview', 'chat', 'compare', 'liveweb', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives', 'admin', 'replay', 'reporting'],
-  governance_admin: ['connections', 'overview', 'chat', 'compare', 'liveweb', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives', 'replay', 'reporting'],
-  compliance_officer: ['connections', 'overview', 'chat', 'compare', 'liveweb', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives', 'replay', 'reporting'],
+  platform_admin: ['connections', 'overview', 'chat', 'compare', 'liveweb', 'demo', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives', 'admin', 'replay', 'reporting'],
+  governance_admin: ['connections', 'overview', 'chat', 'compare', 'liveweb', 'demo', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives', 'replay', 'reporting'],
+  compliance_officer: ['connections', 'overview', 'chat', 'compare', 'liveweb', 'demo', 'decisions', 'drift', 'policy', 'audit', 'economic', 'telemetry', 'archives', 'replay', 'reporting'],
   policy_editor: ['connections', 'overview', 'chat', 'compare', 'liveweb', 'policy', 'replay', 'reporting'],
   workflow_owner: ['connections', 'chat', 'compare', 'liveweb', 'decisions', 'replay'],
   auditor: ['connections', 'audit', 'telemetry', 'archives', 'replay', 'reporting'],

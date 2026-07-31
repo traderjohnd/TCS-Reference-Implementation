@@ -151,6 +151,23 @@ export function ConnectionsProvider({ children }) {
     }
   }, [connections]);
 
+  // Commit 6 hardening: returning to Demo Mode clears transient
+  // in-memory API keys (they are never persisted anyway — stripKeys
+  // covers localStorage) and marks the connections untested, without
+  // deleting any saved non-secret connection metadata.
+  const clearTransientKeys = useCallback(() => {
+    setConnections((prev) => prev.map((c) => (
+      c.config?.apiKey
+        ? {
+            ...c,
+            config: { ...c.config, apiKey: '' },
+            status: 'disconnected',
+            errorMessage: null,
+          }
+        : c
+    )));
+  }, []);
+
   const setActiveLlm = useCallback((id) => setActiveLlmId(id), []);
   const setActiveRag = useCallback((id) => setActiveRagId(id), []);
   const setActiveApi = useCallback((id) => setActiveApiId(id), []);
@@ -190,6 +207,7 @@ export function ConnectionsProvider({ children }) {
         updateConnection,
         removeConnection,
         testConnection,
+        clearTransientKeys,
         setActiveLlm,
         setActiveRag,
         setActiveApi,
