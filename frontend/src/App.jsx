@@ -9,6 +9,7 @@ import Login from './views/Login';
 import Connections from './views/Connections';
 import GovernedChat from './views/GovernedChat';
 import ModelComparison from './views/ModelComparison';
+import LiveWeb from './views/LiveWeb';
 import TrustOverview from './views/TrustOverview';
 import LiveDecisions from './views/LiveDecisions';
 import DriftMonitoring from './views/DriftMonitoring';
@@ -47,6 +48,7 @@ function AppRoutes() {
         <Route path="/connections" element={<ProtectedRoute view="connections"><Connections /></ProtectedRoute>} />
         <Route path="/chat" element={<ProtectedRoute view="chat"><GovernedChat /></ProtectedRoute>} />
         <Route path="/compare" element={<ProtectedRoute view="compare"><ModelComparison /></ProtectedRoute>} />
+        <Route path="/liveweb" element={<ProtectedRoute view="liveweb"><LiveWeb /></ProtectedRoute>} />
         <Route path="/overview" element={<ProtectedRoute view="overview"><TrustOverview /></ProtectedRoute>} />
         <Route path="/decisions" element={<ProtectedRoute view="decisions"><LiveDecisions /></ProtectedRoute>} />
         <Route path="/drift" element={<ProtectedRoute view="drift"><DriftMonitoring /></ProtectedRoute>} />

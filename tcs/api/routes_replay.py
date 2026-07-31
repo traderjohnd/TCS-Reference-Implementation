@@ -196,6 +196,31 @@ def post_replay(body: ReplayRequest, request: Request) -> ReplayResponse:
     except ArtifactNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
+    # Governed Live Web (demo-live branch, Commit 5): replay of a
+    # web-grounded artifact REPLAYS THE RECORDED RESULT — the stored
+    # final output and stored evidence under captured policy semantics.
+    # No new web request, no new provider request. Before replaying,
+    # the stored evidence must verify against the digest recorded at
+    # issuance; a mismatch means the evidence was altered after the
+    # fact and replay refuses rather than silently proceeding.
+    rc = getattr(artifact, "recipient_context", None) or {}
+    stored_ev = rc.get("web_evidence")
+    stored_digest = rc.get("web_evidence_digest")
+    if stored_ev is not None or stored_digest is not None:
+        from tcs.providers.web_evidence import evidence_dict_digest
+        if (not isinstance(stored_ev, dict) or not stored_digest
+                or evidence_dict_digest(stored_ev) != stored_digest):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "evidence_digest_mismatch",
+                    "message": (
+                        "Stored web evidence does not match the digest "
+                        "recorded at issuance; replay refused."
+                    ),
+                },
+            )
+
     summaries: List[ReplayEvaluationSummary] = []
     cert_store = _certificate_store(request)
 

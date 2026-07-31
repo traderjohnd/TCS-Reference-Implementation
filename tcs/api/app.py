@@ -49,6 +49,7 @@ from tcs.api.routes_admin import router as admin_router
 from tcs.api.routes_auth import router as auth_router
 from tcs.api.routes_query import router as query_router
 from tcs.api.routes_compare import router as compare_router
+from tcs.api.routes_web import router as web_router
 from tcs.api.routes_generate import router as generate_router
 from tcs.api.routes_evaluate import router as evaluate_router
 from tcs.api.routes_replay import router as replay_router
@@ -216,6 +217,7 @@ def create_app(
     app.include_router(auth_router, prefix="/v2", tags=["auth"])
     app.include_router(query_router, prefix="/v2", tags=["query"])
     app.include_router(compare_router, prefix="/v2", tags=["compare"])
+    app.include_router(web_router, prefix="/v2", tags=["web"])
     app.include_router(generate_router, prefix="/v2", tags=["generation"])
     app.include_router(evaluate_router, prefix="/v2", tags=["evaluation"])
     app.include_router(replay_router, prefix="/v2", tags=["replay"])
