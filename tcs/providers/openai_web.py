@@ -11,12 +11,24 @@ selected Live Web:
 
   * the search tool is REQUIRED (``tool_choice`` pins the hosted
     tool), not optional;
-  * live external access is requested explicitly by declaring the
-    hosted web_search tool — the provider executes the retrieval on
-    its infrastructure; TCS does not fetch pages itself;
+  * live external access is requested EXPLICITLY via
+    ``external_web_access: true`` in the tool configuration — never
+    relying on the provider's default, and never a cache-only
+    configuration. The Live Web path has no input that can disable
+    it. The provider executes the retrieval on its infrastructure;
+    TCS does not fetch pages itself;
   * the complete consulted-source list is requested through the
     provider's include mechanism
     (``include=["web_search_call.action.sources"]``).
+
+Evidence-state semantics (fixup after 5209e0b):
+  * ``live_access_requested`` is derived from the OUTBOUND tool
+    configuration (external_web_access is True) — never inferred from
+    an observed search action;
+  * ``web_search_action_observed`` is derived from the response;
+  * ``live_access_confirmed`` follows the documented rule: requested
+    AND at least one search completed successfully. It does not claim
+    per-page freshness proof the provider does not supply.
 
 Truthful outcomes:
   * request completed but NO web_search action occurred ->
@@ -97,7 +109,13 @@ class OpenAIWebProvider:
         from tcs.providers.base import build_messages
         system_msg, user_msg = build_messages(query, context)
 
-        tool_cfg: Dict[str, Any] = {"type": OPENAI_WEB_SEARCH_TOOL}
+        tool_cfg: Dict[str, Any] = {
+            "type": OPENAI_WEB_SEARCH_TOOL,
+            # Live external access is requested EXPLICITLY — never the
+            # provider default, never cache-only. Hardcoded True: the
+            # Live Web path exposes no way to construct it disabled.
+            "external_web_access": True,
+        }
         filters: Dict[str, Any] = {}
         if allowed_domains:
             filters["allowed_domains"] = list(allowed_domains)
@@ -135,7 +153,11 @@ class OpenAIWebProvider:
         evidence = WebRetrievalEvidence(
             provider=self.name,
             model=self.model,
-            live_access_requested=True,
+            # Request-derived: taken from the outbound configuration,
+            # never inferred from the response.
+            live_access_requested=(
+                tool_cfg["external_web_access"] is True
+            ),
             retrieval_started_at=utc_iso(started),
             retrieval_completed_at=utc_iso(completed),
             provider_request_id=getattr(response, "id", None),
@@ -214,7 +236,13 @@ class OpenAIWebProvider:
                 "total_tokens": getattr(u, "total_tokens", None),
             }
 
-        evidence.live_access_confirmed = evidence.successful_search_count > 0
+        # Documented confirmation rule: explicitly requested AND at
+        # least one search completed successfully. Not a per-page
+        # freshness claim.
+        evidence.live_access_confirmed = (
+            evidence.live_access_requested
+            and evidence.successful_search_count > 0
+        )
         evidence.answer_used_web_evidence = bool(evidence.citations)
         evidence.retrieval_status = compute_retrieval_status(
             evidence, final_text,

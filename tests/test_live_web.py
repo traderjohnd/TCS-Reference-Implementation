@@ -237,6 +237,10 @@ class TestOpenAIWebMapping:
         # Current hosted tool, never the legacy preview tool.
         assert k["tools"][0]["type"] == "web_search"
         assert "preview" not in str(k["tools"])
+        # Live external access is EXPLICIT — never the provider default,
+        # never a cache-only configuration. Omission would fail here.
+        assert k["tools"][0]["external_web_access"] is True
+        assert "cache" not in str(k).lower()
         # Live Web REQUIRES the search tool.
         assert k["tool_choice"] == {"type": "web_search"}
         # Complete source list requested via include.
@@ -244,6 +248,52 @@ class TestOpenAIWebMapping:
         assert k["tools"][0]["filters"]["allowed_domains"] == ["example.com"]
         assert k["tools"][0]["user_location"]["type"] == "approximate"
         assert k["model"] == "gpt-4o"  # never substituted
+
+    def test_external_web_access_cannot_be_disabled(self, monkeypatch):
+        # The Live Web path exposes NO input that can construct the
+        # tool with external_web_access false or absent — every
+        # request variation carries the explicit True.
+        responses = _fake_openai_web(monkeypatch,
+                                     response=_openai_web_response())
+        p = OpenAIWebProvider(api_key="sk-w", model="gpt-4o")
+        variations = [
+            {},
+            {"allowed_domains": ["a.com"]},
+            {"blocked_domains": ["b.com"]},
+            {"user_location": {"city": "Paris", "country": "FR"}},
+        ]
+        for kw in variations:
+            p.run_web_query("q", [], **kw)
+            tool = responses.last_kwargs["tools"][0]
+            assert tool["external_web_access"] is True
+            assert tool["type"] == "web_search"
+
+    def test_evidence_distinguishes_requested_observed_confirmed(
+            self, monkeypatch):
+        # Success: all three states true, each with its own derivation.
+        _fake_openai_web(monkeypatch, response=_openai_web_response())
+        p = OpenAIWebProvider(api_key="sk-w", model="gpt-4o")
+        _text, ev = p.run_web_query("q", [])
+        d = ev.to_dict()
+        assert d["live_access_requested"] is True       # request-derived
+        assert d["web_search_action_observed"] is True  # response-derived
+        assert d["live_access_confirmed"] is True       # documented rule
+
+    def test_requested_true_even_when_no_search_observed(
+            self, monkeypatch):
+        # Requested is derived from the outbound configuration — it
+        # stays true even when the provider ran no search, while
+        # observed and confirmed are truthfully false.
+        _fake_openai_web(monkeypatch,
+                         response=_openai_web_response(searches=0,
+                                                       cite=False))
+        p = OpenAIWebProvider(api_key="sk-w", model="gpt-4o")
+        _text, ev = p.run_web_query("q", [])
+        d = ev.to_dict()
+        assert d["live_access_requested"] is True
+        assert d["web_search_action_observed"] is False
+        assert d["live_access_confirmed"] is False
+        assert ev.retrieval_status == "retrieval_not_performed"
 
     def test_success_parsing(self, monkeypatch):
         _fake_openai_web(monkeypatch,

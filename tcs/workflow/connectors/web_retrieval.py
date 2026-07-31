@@ -77,6 +77,7 @@ class WebRetrievalConnector(GovernedConnector):
                 [ev.error_summary] if ev.error_summary else []
             ),
             "live_access_requested": ev.live_access_requested,
+            "web_search_action_observed": ev.web_search_action_observed,
             "live_access_confirmed": ev.live_access_confirmed,
         }
         return ConnectorResult(

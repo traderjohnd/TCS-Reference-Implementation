@@ -204,6 +204,18 @@ class WebRetrievalEvidence:
     model: str
     retrieval_status: str = "retrieval_not_performed"
     retrieval_mode: str = "live_web"
+    # Three distinct truthful states (fixup after 5209e0b):
+    #   live_access_requested  — derived from the OUTBOUND request
+    #       configuration (e.g. OpenAI external_web_access: true);
+    #       never inferred from the response.
+    #   web_search_action_observed — derived from the provider
+    #       RESPONSE: at least one search action was recorded
+    #       (exposed as a derived property below).
+    #   live_access_confirmed  — documented confirmation rule:
+    #       True only when live access was explicitly requested AND at
+    #       least one search action completed successfully. This does
+    #       NOT claim every returned page was freshly fetched — the
+    #       provider supplies no per-page freshness proof.
     live_access_requested: bool = True
     live_access_confirmed: Optional[bool] = None  # None = not knowable
     retrieval_started_at: Optional[str] = None    # utc_iso()
@@ -220,6 +232,13 @@ class WebRetrievalEvidence:
     @property
     def search_call_count(self) -> int:
         return len(self.search_actions)
+
+    @property
+    def web_search_action_observed(self) -> bool:
+        """Response-derived: at least one search action was recorded.
+        Distinct from live_access_requested (request-derived) and from
+        live_access_confirmed (documented confirmation rule)."""
+        return len(self.search_actions) > 0
 
     @property
     def successful_search_count(self) -> int:
@@ -294,6 +313,7 @@ class WebRetrievalEvidence:
             "retrieval_mode": self.retrieval_mode,
             "retrieval_status": self.retrieval_status,
             "live_access_requested": self.live_access_requested,
+            "web_search_action_observed": self.web_search_action_observed,
             "live_access_confirmed": self.live_access_confirmed,
             "retrieval_started_at": self.retrieval_started_at,
             "retrieval_completed_at": self.retrieval_completed_at,

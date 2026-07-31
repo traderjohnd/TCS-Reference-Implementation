@@ -244,8 +244,14 @@ class AnthropicWebProvider:
             evidence.error_summary = self._sanitize(
                 "; ".join(sorted(set(error_codes)))[:500])
 
-        evidence.live_access_confirmed = \
-            evidence.successful_search_count > 0
+        # Same documented confirmation rule as the OpenAI adapter:
+        # requested AND at least one successful search. (The Anthropic
+        # server-side tool is live by definition when declared; the
+        # request configuration is unchanged by the 5209e0b fixup.)
+        evidence.live_access_confirmed = (
+            evidence.live_access_requested
+            and evidence.successful_search_count > 0
+        )
         evidence.answer_used_web_evidence = bool(evidence.citations)
         evidence.retrieval_status = compute_retrieval_status(
             evidence, final_text, paused=paused,
